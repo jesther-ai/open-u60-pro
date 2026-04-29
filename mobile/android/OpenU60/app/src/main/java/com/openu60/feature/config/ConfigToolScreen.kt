@@ -21,6 +21,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.hilt.navigation.compose.hiltViewModel
 import com.openu60.core.model.ConfigHeader
+import com.openu60.core.model.KnownKey
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
