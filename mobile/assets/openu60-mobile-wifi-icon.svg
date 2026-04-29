@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="128" y1="96" x2="896" y2="928" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0EA5E9"/>
+      <stop offset="0.52" stop-color="#2563EB"/>
+      <stop offset="1" stop-color="#14B8A6"/>
+    </linearGradient>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="120%">
+      <feDropShadow dx="0" dy="34" stdDeviation="34" flood-color="#0F172A" flood-opacity="0.22"/>
+    </filter>
+  </defs>
+  <rect width="1024" height="1024" rx="224" fill="url(#bg)"/>
+  <path d="M254 244c148-116 368-116 516 0" fill="none" stroke="#E0F2FE" stroke-width="64" stroke-linecap="round" opacity="0.92"/>
+  <path d="M334 340c100-76 256-76 356 0" fill="none" stroke="#E0F2FE" stroke-width="58" stroke-linecap="round" opacity="0.92"/>
+  <path d="M418 438c54-40 134-40 188 0" fill="none" stroke="#E0F2FE" stroke-width="52" stroke-linecap="round" opacity="0.92"/>
+  <rect x="262" y="448" width="500" height="336" rx="88" fill="#F8FAFC" filter="url(#shadow)"/>
+  <rect x="326" y="536" width="372" height="94" rx="47" fill="#0F172A"/>
+  <circle cx="386" cy="583" r="24" fill="#22C55E"/>
+  <rect x="440" y="558" width="112" height="50" rx="25" fill="#38BDF8"/>
+  <rect x="574" y="558" width="64" height="50" rx="25" fill="#14B8A6"/>
+  <rect x="344" y="680" width="56" height="34" rx="17" fill="#CBD5E1"/>
+  <rect x="484" y="680" width="56" height="34" rx="17" fill="#CBD5E1"/>
+  <rect x="624" y="680" width="56" height="34" rx="17" fill="#CBD5E1"/>
+</svg>
