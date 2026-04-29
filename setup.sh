@@ -34,6 +34,7 @@ REMOTE_BIN=/data/zte-agent
 STARTUP_SCRIPT=/data/local/tmp/start_zte_agent.sh
 BINARY_CHANGED=false
 DOWNLOAD_URL="https://github.com/jesther-ai/open-u60-pro/releases/latest/download/zte-agent"
+COOKIE_JAR="$(mktemp -t open-u60-pro-cookies.XXXXXX)"
 
 # ── Binary source menu ──────────────────────────────────────────────
 echo ""
@@ -225,6 +226,10 @@ ubus_call() {
     ts=$(date +%s)
     curl -sf "http://$GATEWAY/ubus/?t=$ts" \
         -H 'Content-Type: application/json' \
+        -H "Origin: http://$GATEWAY" \
+        -H "Referer: http://$GATEWAY/" \
+        -b "$COOKIE_JAR" \
+        -c "$COOKIE_JAR" \
         -d "[{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"call\",\"params\":[\"$session\",\"$object\",\"$method\",$params]}]"
 }
 
