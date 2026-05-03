@@ -35,6 +35,7 @@ STARTUP_SCRIPT=/data/local/tmp/start_zte_agent.sh
 BINARY_CHANGED=false
 DOWNLOAD_URL="https://github.com/jesther-ai/open-u60-pro/releases/latest/download/zte-agent"
 COOKIE_JAR="$(mktemp -t open-u60-pro-cookies.XXXXXX)"
+trap 'rm -f "$COOKIE_JAR"' EXIT
 
 # ── Binary source menu ──────────────────────────────────────────────
 echo ""
