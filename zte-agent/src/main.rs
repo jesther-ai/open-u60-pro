@@ -18,6 +18,7 @@ mod sms;
 mod sms_forward;
 mod speedtest;
 mod system;
+mod tailscale;
 mod telephony;
 mod ubus;
 mod usb;
@@ -29,7 +30,9 @@ use event_bus::EventBus;
 use handlers::AppState;
 
 const DEFAULT_BIND: &str = "0.0.0.0:9090";
-const DEFAULT_THREADS: usize = 2;
+// 4 workers: tailscale setup/logout are legitimately slow (up to ~1-2 min
+// against the control plane) and must not starve the rest of the API.
+const DEFAULT_THREADS: usize = 4;
 
 fn main() {
     let bind = std::env::var("ZTE_AGENT_BIND").unwrap_or_else(|_| DEFAULT_BIND.to_string());
@@ -51,12 +54,15 @@ fn main() {
     let charger_rx = event_bus.subscribe("BSP_CHARGER_EVENT");
     let service_rx = event_bus.subscribe("zwrt_servicestatus");
     let wan_status_rx = event_bus.subscribe("router_event_wan_connect_status");
+    let ts_wan_rx = event_bus.subscribe("router_event_wan_connect_status");
     event_bus.start();
 
     state.doh.auto_start();
     state.scheduler.start(Arc::clone(&state));
     state.charge_limit.start(charger_rx);
     state.sms_forward.start(sms_rx, service_rx, wan_status_rx);
+    state.tailscale.auto_start();
+    state.tailscale.start_wan_watch(ts_wan_rx);
 
     server::start(&bind, threads, state);
 }
