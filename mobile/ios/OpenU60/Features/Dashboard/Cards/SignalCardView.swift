@@ -19,7 +19,7 @@ struct SignalCardView: View {
 
                 if showNR {
                     carrierRow(
-                        icon: "antenna.radiowaves.left.and.right", tech: "5G NR",
+                        icon: "cellularbars", tech: "5G NR",
                         band: nrSignal.band, freq: BandConfig.nrFrequency(band: nrSignal.band),
                         technology: .nr, bandwidth: nrSignal.bandwidth,
                         isSCC: false, isPCC: !nrSignal.sccCarriers.isEmpty,
@@ -28,7 +28,7 @@ struct SignalCardView: View {
                     )
                     ForEach(nrSignal.sccCarriers) { scc in
                         carrierRow(
-                            icon: "antenna.radiowaves.left.and.right", tech: "5G NR",
+                            icon: "cellularbars", tech: "5G NR",
                             band: scc.band, freq: BandConfig.nrFrequency(band: scc.band),
                             technology: .nr, bandwidth: scc.bandwidth,
                             isSCC: true, anchorLabel: nil, rsrp: scc.rsrp, sinr: scc.sinr,
@@ -178,7 +178,7 @@ struct SignalCardView: View {
     private var wcdmaRow: some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack {
-                Label("3G WCDMA", systemImage: "antenna.radiowaves.left.and.right.circle")
+                Label("3G WCDMA", systemImage: "cellularbars")
                     .font(.subheadline)
                 Spacer()
             }
