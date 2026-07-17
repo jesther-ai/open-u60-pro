@@ -32,6 +32,15 @@ class AgentClient @Inject constructor() {
         .readTimeout(3, TimeUnit.SECONDS)
         .build()
 
+    // For the handful of endpoints that legitimately block for minutes (tailscale
+    // setup/login-url/logout/disable/config). Separate from httpClient so raising the cap
+    // can't weaken the 15s read timeout every other screen depends on; newBuilder() shares
+    // the connection pool and dispatcher.
+    private val slowClient = httpClient.newBuilder()
+        .readTimeout(240, TimeUnit.SECONDS)
+        .writeTimeout(30, TimeUnit.SECONDS)
+        .build()
+
     var baseURL: String = "http://192.168.0.1:9090"
     var token: String? = null
 
@@ -90,6 +99,18 @@ class AgentClient @Inject constructor() {
         return unwrapResponse(data)
     }
 
+    suspend fun postJSONSlow(path: String, body: Map<String, Any?> = emptyMap()): Map<String, Any?> {
+        val bodyStr = mapToJsonString(body)
+        val data = request("POST", path, bodyStr, slow = true)
+        return unwrapResponse(data)
+    }
+
+    suspend fun putJSONSlow(path: String, body: Map<String, Any?> = emptyMap()): Map<String, Any?> {
+        val bodyStr = mapToJsonString(body)
+        val data = request("PUT", path, bodyStr, slow = true)
+        return unwrapResponse(data)
+    }
+
     // MARK: - Auth
 
     suspend fun login(password: String): String {
@@ -128,6 +149,7 @@ class AgentClient @Inject constructor() {
         path: String,
         body: String?,
         authenticated: Boolean = true,
+        slow: Boolean = false,
     ): String = withContext(Dispatchers.IO) {
         val url = baseURL + path
 
@@ -151,13 +173,14 @@ class AgentClient @Inject constructor() {
         }
 
         try {
-            val response = httpClient.newCall(builder.build()).execute()
+            val client = if (slow) slowClient else httpClient
+            val response = client.newCall(builder.build()).execute()
             val responseBody = response.body?.string() ?: ""
 
             when (response.code) {
                 in 200..299 -> responseBody
                 401 -> throw AgentError.Unauthorized()
-                else -> throw AgentError.ServerError(responseBody.ifEmpty { "HTTP ${response.code}" })
+                else -> throw parseApiError(response.code, responseBody)
             }
         } catch (e: AgentError) {
             throw e
@@ -168,6 +191,16 @@ class AgentClient @Inject constructor() {
         } catch (e: Exception) {
             throw AgentError.NetworkError(e.message ?: "Unknown", e)
         }
+    }
+
+    /** Lifts the envelope's `error` so callers get a clean message and the status code. */
+    private fun parseApiError(code: Int, body: String): AgentError {
+        val msg = try {
+            Json.parseToJsonElement(body).jsonObject["error"]?.jsonPrimitive?.contentOrNull
+        } catch (_: Exception) {
+            null
+        }
+        return AgentError.ApiError(code, msg?.ifEmpty { null } ?: body.ifEmpty { "HTTP $code" })
     }
 
     @PublishedApi

@@ -102,6 +102,11 @@ struct RouterSettingsListView: View {
                         Label("VPN Passthrough", systemImage: "lock.shield")
                     }
 
+                    NavigationLink {
+                        TailscaleView(viewModel: TailscaleViewModel(client: client, authManager: authManager))
+                    } label: {
+                        Label("Tailscale", systemImage: "network.badge.shield.half.filled")
+                    }
                 }
 
                 Section("Quality") {
