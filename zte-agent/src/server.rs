@@ -16,6 +16,7 @@ use crate::sim;
 use crate::sms;
 use crate::sms_forward;
 use crate::speedtest;
+use crate::tailscale;
 use crate::telephony;
 use crate::usb;
 use crate::wifi;
@@ -269,6 +270,15 @@ pub fn route(method: &Method, path: &str, state: &AppState, body: &[u8]) -> (u16
         (&Method::Post, "/api/doh/disable") => doh_disable(state),
         (&Method::Get, "/api/doh/cache") => doh_cache_list(state),
         (&Method::Post, "/api/doh/cache/clear") => doh_cache_clear(state),
+        // Tailscale remote management
+        (&Method::Get, "/api/tailscale/status") => tailscale::status(state),
+        (&Method::Post, "/api/tailscale/setup") => tailscale::setup(state, body),
+        (&Method::Post, "/api/tailscale/login-url") => tailscale::login_url(state),
+        (&Method::Post, "/api/tailscale/enable") => tailscale::enable(state),
+        (&Method::Post, "/api/tailscale/disable") => tailscale::disable(state),
+        (&Method::Put, "/api/tailscale/config") => tailscale::config_set(state, body),
+        (&Method::Post, "/api/tailscale/logout") => tailscale::logout(state),
+        (&Method::Post, "/api/tailscale/update") => tailscale::update(state, body),
         // LAN test (download/upload handled above before body read)
         (&Method::Get, "/api/lan/ping") => lan_test::ping(),
         // Speed test
