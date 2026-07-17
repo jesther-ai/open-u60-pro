@@ -37,6 +37,7 @@ import com.openu60.feature.router.stk.STKScreen
 import com.openu60.feature.router.qos.QoSScreen
 import com.openu60.feature.router.telemetry.TelemetryBlockerScreen
 import com.openu60.feature.router.vpn.VPNPassthroughScreen
+import com.openu60.feature.router.tailscale.TailscaleScreen
 import com.openu60.feature.router.dns.DNSSettingsScreen
 import com.openu60.feature.router.dns.DoHCacheInspectorScreen
 import com.openu60.feature.router.wifi.GuestWiFiSettingsScreen
@@ -116,6 +117,7 @@ sealed class Screen(val route: String) {
     data object SignalDetect : Screen("router/signal_detect")
     data object ScheduleReboot : Screen("router/schedule_reboot")
     data object DoHCache : Screen("router/doh_cache")
+    data object Tailscale : Screen("router/tailscale")
 
     // SMS Forwarding
     data object SMSForwardConfig : Screen("sms/forward/config")
@@ -216,6 +218,7 @@ fun AppNavigation() {
                     onNavigateToFirewall = { navController.navigate(Screen.Firewall.route) },
                     onNavigateToTelemetryBlocker = { navController.navigate(Screen.TelemetryBlocker.route) },
                     onNavigateToVPNPassthrough = { navController.navigate(Screen.VPNPassthrough.route) },
+                    onNavigateToTailscale = { navController.navigate(Screen.Tailscale.route) },
                     onNavigateToQoS = { navController.navigate(Screen.QoS.route) },
                     onNavigateToDeviceControl = { navController.navigate(Screen.DeviceControl.route) },
                     onNavigateToScheduleReboot = { navController.navigate(Screen.ScheduleReboot.route) },
@@ -347,6 +350,9 @@ fun AppNavigation() {
             }
             composable(Screen.VPNPassthrough.route) {
                 VPNPassthroughScreen(onBack = { navController.popBackStack() })
+            }
+            composable(Screen.Tailscale.route) {
+                TailscaleScreen(onBack = { navController.popBackStack() })
             }
             composable(Screen.QoS.route) {
                 QoSScreen(onBack = { navController.popBackStack() })

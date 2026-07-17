@@ -8,12 +8,24 @@ final class AgentClient {
     var token: String?
 
     private let session: URLSession
+    private let slowSession: URLSession
 
     init(baseURL: String = "http://192.168.0.1:9090") {
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = 10
         config.timeoutIntervalForResource = 15
         self.session = URLSession(configuration: config)
+
+        // For endpoints that legitimately block for minutes (tailscale setup /
+        // logout / config / disable). A separate session is mandatory:
+        // timeoutIntervalForResource is a session-level total-load cap that
+        // URLRequest.timeoutInterval cannot override, and raising it on the
+        // shared session would let a slow response hang every other screen.
+        let slowConfig = URLSessionConfiguration.default
+        slowConfig.timeoutIntervalForRequest = 240
+        slowConfig.timeoutIntervalForResource = 300
+        self.slowSession = URLSession(configuration: slowConfig)
+
         self.baseURL = baseURL
     }
 
@@ -89,6 +101,33 @@ final class AgentClient {
         return json["data"] as? [String: Any] ?? [:]
     }
 
+    /// POST with a raw dict body on the long-timeout session. For endpoints that
+    /// legitimately block for minutes.
+    func postJSONSlow(_ path: String, body: [String: Any] = [:]) async throws -> [String: Any] {
+        let bodyData = try JSONSerialization.data(withJSONObject: body)
+        let data = try await request(method: "POST", path: path, body: bodyData, slow: true)
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw AgentError.decodingError("Expected JSON object")
+        }
+        guard let ok = json["ok"] as? Bool, ok else {
+            throw AgentError.serverError(json["error"] as? String ?? "Unknown error")
+        }
+        return json["data"] as? [String: Any] ?? [:]
+    }
+
+    /// PUT with a raw dict body on the long-timeout session.
+    func putJSONSlow(_ path: String, body: [String: Any] = [:]) async throws -> [String: Any] {
+        let bodyData = try JSONSerialization.data(withJSONObject: body)
+        let data = try await request(method: "PUT", path: path, body: bodyData, slow: true)
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw AgentError.decodingError("Expected JSON object")
+        }
+        guard let ok = json["ok"] as? Bool, ok else {
+            throw AgentError.serverError(json["error"] as? String ?? "Unknown error")
+        }
+        return json["data"] as? [String: Any] ?? [:]
+    }
+
     /// DELETE with a raw dict body and return the `data` field as a raw dictionary.
     func deleteJSON(_ path: String, body: [String: Any] = [:]) async throws -> [String: Any] {
         let bodyData = try JSONSerialization.data(withJSONObject: body)
@@ -141,7 +180,7 @@ final class AgentClient {
 
     // MARK: - Internal
 
-    private func request(method: String, path: String, body: Data?, authenticated: Bool = true) async throws -> Data {
+    private func request(method: String, path: String, body: Data?, authenticated: Bool = true, slow: Bool = false) async throws -> Data {
         guard let url = URL(string: baseURL + path) else {
             throw AgentError.serverUnreachable
         }
@@ -160,7 +199,7 @@ final class AgentClient {
         let data: Data
         let response: URLResponse
         do {
-            (data, response) = try await session.data(for: req)
+            (data, response) = try await (slow ? slowSession : session).data(for: req)
         } catch let error as URLError where error.code == .timedOut {
             throw AgentError.timeout
         } catch let error as URLError where error.code == .cannotConnectToHost || error.code == .notConnectedToInternet {
@@ -179,8 +218,14 @@ final class AgentClient {
         case 401:
             throw AgentError.unauthorized
         default:
-            let message = String(data: data, encoding: .utf8) ?? "HTTP \(httpResponse.statusCode)"
-            throw AgentError.serverError(message)
+            // Lift the envelope's error so callers get a clean message AND the
+            // status code. Falls back to the raw body.
+            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let message = json["error"] as? String, !message.isEmpty {
+                throw AgentError.apiError(status: httpResponse.statusCode, message: message)
+            }
+            let raw = String(data: data, encoding: .utf8) ?? "HTTP \(httpResponse.statusCode)"
+            throw AgentError.apiError(status: httpResponse.statusCode, message: raw)
         }
     }
 

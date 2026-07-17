@@ -32,6 +32,7 @@ fun RouterSettingsListScreen(
     onNavigateToFirewall: () -> Unit,
     onNavigateToTelemetryBlocker: () -> Unit,
     onNavigateToVPNPassthrough: () -> Unit,
+    onNavigateToTailscale: () -> Unit,
     onNavigateToQoS: () -> Unit,
     onNavigateToDeviceControl: () -> Unit,
     onNavigateToScheduleReboot: () -> Unit,
@@ -76,6 +77,7 @@ fun RouterSettingsListScreen(
             SettingsItem(Icons.Default.Shield, "Firewall", onClick = onNavigateToFirewall)
             SettingsItem(Icons.Default.VisibilityOff, "Telemetry Blocker", onClick = onNavigateToTelemetryBlocker)
             SettingsItem(Icons.Default.VpnKey, "VPN Passthrough", onClick = onNavigateToVPNPassthrough)
+            SettingsItem(Icons.Default.Cloud, "Tailscale", onClick = onNavigateToTailscale)
 
             Spacer(modifier = Modifier.height(8.dp))
 
