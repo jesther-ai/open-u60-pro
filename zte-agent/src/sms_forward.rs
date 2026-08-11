@@ -404,12 +404,11 @@ fn forward_to(
                 "sms_time": format_sms_time(),
                 "id": "-1",
             });
-            let resp = ubus::call(
-                "zwrt_wms",
-                "zte_libwms_send_sms",
-                Some(&params.to_string()),
-            )
-            .map_err(|e| format!("sms forward: {e}"))?;
+            // Goes through sms::send_via_ubus rather than calling ubus directly:
+            // firmware from the 2025-12 build requires `number` and
+            // `message_body` to be encrypted (see web_crypto).
+            let resp = crate::sms::send_via_ubus(&params)
+                .map_err(|e| format!("sms forward: {e}"))?;
             check_sms_send_result(&resp)?;
 
             // Auto-delete the forwarded outgoing SMS to prevent conversation clutter

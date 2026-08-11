@@ -22,6 +22,7 @@ mod tailscale;
 mod telephony;
 mod ubus;
 mod usb;
+mod web_crypto;
 mod wifi;
 
 use std::sync::Arc;

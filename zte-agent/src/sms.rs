@@ -25,15 +25,61 @@ pub fn sms_capacity(_state: &AppState) -> (u16, Value) {
     }
 }
 
+/// Send an SMS.
+///
+/// Firmware from the 2025-12 build requires `number` and `message_body` to be
+/// encrypted (see `web_crypto`). Clients keep posting plaintext and the
+/// encryption is applied here, so the HTTP API is unchanged.
+///
+/// The device-side key is global and gets overwritten by any web UI login,
+/// hence the single retry with a fresh handshake.
 pub fn sms_send(_state: &AppState, body: &[u8]) -> (u16, Value) {
     let parsed: Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(_) => return (400, json!({"ok": false, "error": "invalid JSON"})),
     };
-    match ubus::call("zwrt_wms", "zte_libwms_send_sms", Some(&parsed.to_string())) {
+
+    match send_via_ubus(&parsed) {
         Ok(data) => (200, json!({"ok": true, "data": data})),
         Err(e) => (503, json!({"ok": false, "error": e})),
     }
+}
+
+/// Send an SMS through ubus with encrypted parameters.
+///
+/// Public because both `/api/sms/send` and SMS forwarding use it. `params`
+/// are passed in plaintext; this function applies the encryption.
+pub fn send_via_ubus(params: &Value) -> Result<Value, String> {
+    match send_encrypted(params) {
+        Ok(data) => Ok(data),
+        Err(first) => {
+            // Any web UI login overwrites the key — one retry with a fresh
+            // handshake before giving up.
+            crate::web_crypto::global().invalidate();
+            send_encrypted(params).map_err(|second| format!("{second} (first attempt: {first})"))
+        }
+    }
+}
+
+fn send_encrypted(parsed: &Value) -> Result<Value, String> {
+    let mut params = parsed.clone();
+    let obj = params
+        .as_object_mut()
+        .ok_or_else(|| "body must be an object".to_string())?;
+
+    for field in ["number", "message_body"] {
+        let plain = obj
+            .get(field)
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("missing '{field}'"))?
+            .to_string();
+        // An already-encrypted value would get encrypted twice, but clients
+        // always post plaintext so that shouldn't happen.
+        let enc = crate::web_crypto::encrypt_field(&plain)?;
+        obj.insert(field.to_string(), Value::String(enc));
+    }
+
+    ubus::call("zwrt_wms", "zte_libwms_send_sms", Some(&params.to_string()))
 }
 
 /// Delete one or more SMS by id.
