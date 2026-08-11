@@ -59,6 +59,8 @@ pub struct TailscaleManager {
     last_update: Mutex<Option<Value>>,
     login_url: Mutex<Option<String>>,
     wakelock_held: AtomicBool,
+    /// Descriptor returned by createWakelock; destroyWakelock requires it.
+    wakelock_fd: Mutex<Option<String>>,
 }
 
 fn unix_now() -> i64 {
@@ -149,6 +151,7 @@ impl TailscaleManager {
             last_update: Mutex::new(None),
             login_url: Mutex::new(None),
             wakelock_held: AtomicBool::new(false),
+            wakelock_fd: Mutex::new(None),
         }
     }
 
@@ -688,9 +691,29 @@ impl TailscaleManager {
 
     // --- Wakelock ---
 
+    /// `ubus -v list zwrt_zte_sleep_faw.wakelock` on 2025-12 firmware:
+    ///   "createWakelock":{"lockName":"String"}
+    ///   "destroyWakelock":{"fd":"String"}
+    /// Calling either with an empty object fails with "Invalid command", and
+    /// `destroy` needs the descriptor that `create` hands back.
     fn acquire_wakelock(&self) {
-        match ubus::call("zwrt_zte_sleep_faw.wakelock", "createWakelock", Some("{}")) {
-            Ok(_) => self.wakelock_held.store(true, Ordering::SeqCst),
+        match ubus::call(
+            "zwrt_zte_sleep_faw.wakelock",
+            "createWakelock",
+            Some(r#"{"lockName":"zte-agent"}"#),
+        ) {
+            Ok(resp) => {
+                // Depending on the firmware, fd arrives as a number or a string.
+                let fd = resp
+                    .get("fd")
+                    .map(|v| match v {
+                        serde_json::Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    })
+                    .unwrap_or_default();
+                *self.wakelock_fd.lock().unwrap() = if fd.is_empty() { None } else { Some(fd) };
+                self.wakelock_held.store(true, Ordering::SeqCst);
+            }
             Err(e) => eprintln!("[tailscale] createWakelock: {e}"),
         }
     }
@@ -699,8 +722,21 @@ impl TailscaleManager {
         if !self.wakelock_held.load(Ordering::SeqCst) {
             return;
         }
-        match ubus::call("zwrt_zte_sleep_faw.wakelock", "destroyWakelock", Some("{}")) {
-            Ok(_) => self.wakelock_held.store(false, Ordering::SeqCst),
+        let fd = self.wakelock_fd.lock().unwrap().clone();
+        let params = match fd {
+            Some(fd) => format!(r#"{{"fd":"{fd}"}}"#),
+            // Without an fd there is nothing to release; clear the flag so the
+            // next acquire starts from a clean lock.
+            None => {
+                self.wakelock_held.store(false, Ordering::SeqCst);
+                return;
+            }
+        };
+        match ubus::call("zwrt_zte_sleep_faw.wakelock", "destroyWakelock", Some(&params)) {
+            Ok(_) => {
+                self.wakelock_held.store(false, Ordering::SeqCst);
+                *self.wakelock_fd.lock().unwrap() = None;
+            }
             Err(e) => eprintln!("[tailscale] destroyWakelock: {e}"),
         }
     }
