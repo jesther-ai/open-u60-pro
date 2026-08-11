@@ -165,11 +165,19 @@ pub fn sms_send(_state: &AppState, body: &[u8]) -> (u16, Value) {
     }
 }
 
-/// Send an SMS through ubus with encrypted parameters.
+/// Send an SMS through ubus.
 ///
-/// Public because both `/api/sms/send` and SMS forwarding use it. `params`
-/// are passed in plaintext; this function applies the encryption.
+/// Public because both `/api/sms/send` and SMS forwarding use it.
+///
+/// Plaintext is tried first whenever the firmware says it is acceptable, since
+/// the encrypted path needs a handshake — and that handshake logs into the web
+/// UI, kicking out whoever is using it. Encryption stays as the fallback for
+/// firmware that demands it.
 pub fn send_via_ubus(params: &Value) -> Result<Value, String> {
+    if let Some(data) = try_plaintext_send(params) {
+        return Ok(data);
+    }
+
     match send_encrypted(params) {
         Ok(data) => Ok(data),
         Err(first) => {
@@ -177,6 +185,41 @@ pub fn send_via_ubus(params: &Value) -> Result<Value, String> {
             // handshake before giving up.
             crate::web_crypto::global().invalidate();
             send_encrypted(params).map_err(|second| format!("{second} (first attempt: {first})"))
+        }
+    }
+}
+
+/// Try sending without encryption by flipping the firmware's own opt-out.
+///
+/// `zwrt_wms.config.sms_no_need_encryption_flag` is the switch behind the
+/// daemon's "Don not require encryption!" path. Setting it to 1 makes the
+/// firmware accept plaintext `number`/`message_body`, which avoids the
+/// handshake entirely — and the handshake is worth avoiding, because it logs
+/// into the web UI and kicks out whoever is using it.
+///
+/// Two details make this safe:
+///   * `uci set` without `uci commit` is enough, so nothing is written to
+///     flash; `uci revert` drops the staged change afterwards.
+///   * the firmware resets the flag to 0 by itself after each send, so it is
+///     effectively a per-message opt-out rather than a persistent setting.
+///
+/// Returns `None` if anything goes wrong, leaving the caller to fall back to
+/// the encrypted path.
+fn try_plaintext_send(params: &Value) -> Option<Value> {
+    const FLAG: &str = "zwrt_wms.config.sms_no_need_encryption_flag";
+
+    if ubus::uci_set_no_commit(FLAG, "1").is_err() {
+        return None;
+    }
+
+    let result = ubus::call("zwrt_wms", "zte_libwms_send_sms", Some(&params.to_string()));
+    let _ = ubus::uci_revert("zwrt_wms");
+
+    match result {
+        Ok(data) => Some(data),
+        Err(e) => {
+            eprintln!("[sms] plaintext send rejected ({e}), falling back to encryption");
+            None
         }
     }
 }
