@@ -954,7 +954,7 @@ fn fetch_sms_both_stores(tags: u64, page: u64, count: u64, order: &str) -> Vec<V
         if let Ok(mut data) = ubus::call("zwrt_wms", "zte_libwms_get_sms_data", Some(&params.to_string())) {
             // Firmware that has a key established returns number/content
             // encrypted; decrypt before any of the parsing below runs.
-            crate::sms::decrypt_message_fields(&mut data);
+            crate::sms::resolve_message_fields(&mut data);
             if let Some(arr) = data["messages"].as_array() {
                 for item in arr {
                     let id = item["id"]

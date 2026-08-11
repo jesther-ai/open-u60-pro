@@ -85,6 +85,11 @@ impl WebCrypto {
 
     /// Best-effort decryption — anything that is not a well-formed ciphertext
     /// under the current key comes back untouched.
+    ///
+    /// Retries once with a fresh handshake, because any other client (the web
+    /// UI, a second tool) replaces the device-side key and silently invalidates
+    /// the cached one. Without the retry the failure is indistinguishable from
+    /// plaintext and callers would store ciphertext.
     pub fn maybe_decrypt(&self, value: &str) -> String {
         if !looks_encrypted(value) {
             return value.to_string();
@@ -92,7 +97,15 @@ impl WebCrypto {
         let Ok(key_hex) = self.ensure_key() else {
             return value.to_string();
         };
-        decrypt_with(&key_hex, value).unwrap_or_else(|_| value.to_string())
+        if let Ok(plain) = decrypt_with(&key_hex, value) {
+            return plain;
+        }
+
+        self.invalidate();
+        let Ok(fresh) = self.ensure_key() else {
+            return value.to_string();
+        };
+        decrypt_with(&fresh, value).unwrap_or_else(|_| value.to_string())
     }
 
     fn ensure_key(&self) -> Result<String, String> {
