@@ -7,14 +7,39 @@ use crate::ubus;
 
 const SMS_DB_PATH: &str = "/etc_rw/ztembb/ztesms/sms_db/sms.db";
 
+/// List SMS.
+///
+/// Once a key has been established on the device, the firmware returns
+/// `number` and `content` encrypted (see `web_crypto`). They are decrypted
+/// here so clients keep seeing the UCS-2 hex they always got. Devices that
+/// return plaintext are unaffected — `maybe_decrypt` passes those through.
 pub fn sms_list(_state: &AppState, body: &[u8]) -> (u16, Value) {
     let parsed: Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(_) => return (400, json!({"ok": false, "error": "invalid JSON"})),
     };
     match ubus::call("zwrt_wms", "zte_libwms_get_sms_data", Some(&parsed.to_string())) {
-        Ok(data) => (200, json!({"ok": true, "data": data})),
+        Ok(mut data) => {
+            decrypt_message_fields(&mut data);
+            (200, json!({"ok": true, "data": data}))
+        }
         Err(e) => (503, json!({"ok": false, "error": e})),
+    }
+}
+
+/// Decrypt `number`/`content` in every entry of a `messages` array in place.
+pub fn decrypt_message_fields(data: &mut Value) {
+    let Some(messages) = data.get_mut("messages").and_then(|m| m.as_array_mut()) else {
+        return;
+    };
+    for msg in messages {
+        for field in ["number", "content"] {
+            let Some(raw) = msg.get(field).and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let decrypted = crate::web_crypto::maybe_decrypt(raw);
+            msg[field] = Value::String(decrypted);
+        }
     }
 }
 

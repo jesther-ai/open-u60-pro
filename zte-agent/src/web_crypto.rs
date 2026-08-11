@@ -55,6 +55,17 @@ pub fn encrypt_field(value: &str) -> Result<String, String> {
     global().encrypt_field(value)
 }
 
+/// Decrypt a field if it looks encrypted, otherwise return it unchanged.
+///
+/// Once a key exists on the device, `zte_libwms_get_sms_data` returns `number`
+/// and `content` encrypted with it, using the same
+/// `base64( IV || tag || ciphertext )` framing as outgoing parameters. Firmware
+/// that has never seen a handshake returns plaintext, and so does an agent
+/// without `ZTE_ROUTER_PASSWORD` — hence the passthrough on any failure.
+pub fn maybe_decrypt(value: &str) -> String {
+    global().maybe_decrypt(value)
+}
+
 impl WebCrypto {
     pub fn new() -> Self {
         Self {
@@ -70,6 +81,18 @@ impl WebCrypto {
     pub fn encrypt_field(&self, value: &str) -> Result<String, String> {
         let key_hex = self.ensure_key()?;
         encrypt_with(&key_hex, value)
+    }
+
+    /// Best-effort decryption — anything that is not a well-formed ciphertext
+    /// under the current key comes back untouched.
+    pub fn maybe_decrypt(&self, value: &str) -> String {
+        if !looks_encrypted(value) {
+            return value.to_string();
+        }
+        let Ok(key_hex) = self.ensure_key() else {
+            return value.to_string();
+        };
+        decrypt_with(&key_hex, value).unwrap_or_else(|_| value.to_string())
     }
 
     fn ensure_key(&self) -> Result<String, String> {
@@ -135,6 +158,52 @@ fn encrypt_with(key_hex: &str, value: &str) -> Result<String, String> {
     out.extend_from_slice(tag);
     out.extend_from_slice(body);
     Ok(base64_encode(&out))
+}
+
+/// Cheap pre-filter so plaintext fields never trigger a handshake.
+///
+/// UCS-2 hex (what unencrypted `number`/`content` look like) is all hex digits
+/// with a length divisible by four, so it is excluded explicitly — otherwise a
+/// long hex string could decode as valid base64 and waste a decrypt attempt.
+fn looks_encrypted(value: &str) -> bool {
+    let v = value.trim();
+    if v.len() < 40 || v.len() % 4 != 0 {
+        return false;
+    }
+    if v.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return false;
+    }
+    v.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=')
+}
+
+fn decrypt_with(key_hex: &str, b64: &str) -> Result<String, String> {
+    let raw = base64_decode(b64.trim())?;
+    if raw.len() < 12 + 16 {
+        return Err("ciphertext too short".into());
+    }
+    let key = hex_decode(key_hex)?;
+    let cipher = Aes256Gcm::new_from_slice(&key).map_err(|e| format!("AES key: {e}"))?;
+
+    let (iv, rest) = raw.split_at(12);
+    let (tag, body) = rest.split_at(16);
+
+    // aes-gcm wants ciphertext || tag, the wire format is IV || tag || ciphertext.
+    let mut buf = Vec::with_capacity(body.len() + tag.len());
+    buf.extend_from_slice(body);
+    buf.extend_from_slice(tag);
+
+    let plain = cipher
+        .decrypt(
+            Nonce::from_slice(iv),
+            Payload {
+                msg: &buf,
+                aad: b"",
+            },
+        )
+        .map_err(|e| format!("AES-GCM decrypt: {e}"))?;
+
+    String::from_utf8(plain).map_err(|e| format!("utf8: {e}"))
 }
 
 // --- web ubus ---
@@ -285,6 +354,33 @@ fn base64_encode(data: &[u8]) -> String {
         });
     }
     out
+}
+
+fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity(s.len() / 4 * 3);
+    let mut acc: u32 = 0;
+    let mut bits = 0u32;
+    for b in s.bytes() {
+        if b == b'=' {
+            break;
+        }
+        let v = match b {
+            b'A'..=b'Z' => b - b'A',
+            b'a'..=b'z' => b - b'a' + 26,
+            b'0'..=b'9' => b - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'\n' | b'\r' => continue,
+            _ => return Err("invalid base64".into()),
+        } as u32;
+        acc = (acc << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Ok(out)
 }
 
 /// RNG backed by `/dev/urandom`, so the agent doesn't need the `rand` crate
