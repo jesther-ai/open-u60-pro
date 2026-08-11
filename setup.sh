@@ -338,6 +338,21 @@ rpush() {
     fi
 }
 
+# Remote test that works over both transports.
+#
+# `adb shell` does not propagate the remote exit code (it reports the exit
+# status of adb itself), so `if rcmd "grep -q ..."` was always true and the
+# script happily reported files as present when they were not. Echo a marker
+# and inspect the output instead.
+rtest() {
+    local out
+    out=$(rcmd "if $1; then echo __RTEST_YES__; else echo __RTEST_NO__; fi" 2>/dev/null)
+    case "$out" in
+        *__RTEST_YES__*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 # ── Step 3: Get zte-agent binary ─────────────────────────────────────
 if [ "$BUILD_CHOICE" = "1" ]; then
     info "Downloading zte-agent from GitHub releases..."
@@ -378,7 +393,7 @@ fi
 # Escape single quotes for safe embedding in sh single-quoted string
 SAFE_PASSWORD=$(printf '%s' "$AGENT_PASSWORD" | sed "s/'/'\\\\''/g")
 
-if rcmd "grep -qF '${SAFE_PASSWORD}' $STARTUP_SCRIPT 2>/dev/null"; then
+if rtest "grep -qF '${SAFE_PASSWORD}' $STARTUP_SCRIPT 2>/dev/null"; then
     ok "Startup script already up to date."
 else
     info "Creating startup script..."
@@ -395,7 +410,7 @@ fi
 # ── Step 6: Update rc.local for boot persistence ────────────────────
 info "Configuring auto-start on boot..."
 RC_LINE="sh $STARTUP_SCRIPT"
-if rcmd "grep -qF '$RC_LINE' /etc/rc.local 2>/dev/null"; then
+if rtest "grep -qF '$RC_LINE' /etc/rc.local 2>/dev/null"; then
     ok "rc.local already configured."
 else
     rcmd "grep -q '^exit 0' /etc/rc.local \
@@ -471,7 +486,7 @@ if [ "$SETUP_SSH" = "y" ] || [ "$SETUP_SSH" = "Y" ]; then
     info "Setting up dropbear SSH server..."
 
     # Check if dropbear is already present
-    if adb shell "test -x /usr/sbin/dropbear" 2>/dev/null; then
+    if rtest "test -x /usr/sbin/dropbear"; then
         ok "Dropbear already installed."
     else
         info "Downloading dropbear for aarch64..."
@@ -489,7 +504,7 @@ if [ "$SETUP_SSH" = "y" ] || [ "$SETUP_SSH" = "Y" ]; then
     info "Configuring SSH keys..."
     adb shell "mkdir -p /etc/dropbear && chmod 700 /etc/dropbear"
     PUBKEY=$(cat "$SSH_PUB")
-    if adb shell "grep -qF '$PUBKEY' /etc/dropbear/authorized_keys 2>/dev/null"; then
+    if rtest "grep -qF '$PUBKEY' /etc/dropbear/authorized_keys 2>/dev/null"; then
         ok "SSH key already authorized."
     else
         adb shell "echo '$PUBKEY' >> /etc/dropbear/authorized_keys"
@@ -499,7 +514,7 @@ if [ "$SETUP_SSH" = "y" ] || [ "$SETUP_SSH" = "Y" ]; then
 
     # Create dropbear startup script
     DROPBEAR_STARTUP=/data/local/tmp/start_dropbear.sh
-    if adb shell "test -x $DROPBEAR_STARTUP" 2>/dev/null; then
+    if rtest "test -x $DROPBEAR_STARTUP"; then
         ok "Dropbear startup script already exists."
     else
         adb shell "cat > $DROPBEAR_STARTUP" <<'DBBOOT'
@@ -512,7 +527,7 @@ DBBOOT
 
     # Add to rc.local if not already there
     DB_RC_LINE="sh $DROPBEAR_STARTUP"
-    if adb shell "grep -qF '$DB_RC_LINE' /etc/rc.local 2>/dev/null"; then
+    if rtest "grep -qF '$DB_RC_LINE' /etc/rc.local 2>/dev/null"; then
         ok "Dropbear rc.local entry already configured."
     else
         adb shell "grep -q '^exit 0' /etc/rc.local \
@@ -522,7 +537,7 @@ DBBOOT
     fi
 
     # Start dropbear now
-    if adb shell "pidof dropbear" >/dev/null 2>&1; then
+    if rtest "pidof dropbear >/dev/null 2>&1"; then
         ok "Dropbear already running on port $SSH_PORT."
     else
         info "Starting dropbear..."
