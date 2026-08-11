@@ -66,6 +66,21 @@ pub fn uci_set_no_commit(key: &str, value: &str) -> Result<(), String> {
 }
 
 /// Run `uci commit <config>`.
+/// Discard staged (uncommitted) uci changes for a config.
+pub fn uci_revert(config: &str) -> Result<(), String> {
+    let out = Command::new("uci")
+        .args(["revert", config])
+        .output()
+        .map_err(|e| format!("uci revert: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "uci revert {config}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    Ok(())
+}
+
 pub fn uci_commit(config: &str) -> Result<(), String> {
     let commit_out = Command::new("uci")
         .args(["commit", config])
