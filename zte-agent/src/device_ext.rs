@@ -179,3 +179,58 @@ pub fn device_fast_boot_set(_state: &AppState, body: &[u8]) -> (u16, Value) {
         Err(e) => (503, json!({"ok": false, "error": e})),
     }
 }
+
+pub fn device_auto_sleep_get(_state: &AppState) -> (u16, Value) {
+    let timeout = ubus::uci_get("zwrt_sleep.ztmp_time.SysIdTime").unwrap_or_default();
+    let switch = ubus::uci_get("zwrt_sleep.ztmp_switch.sleepSwitch").unwrap_or_default();
+    let status = ubus::uci_get("zwrt_sleep.ztmp_status.sleepStatus").unwrap_or_default();
+    (
+        200,
+        json!({
+            "ok": true,
+            "data": {
+                "enabled": switch == "1",
+                "timeout": timeout,
+                "status": status,
+            }
+        }),
+    )
+}
+
+pub fn device_auto_sleep_set(_state: &AppState, body: &[u8]) -> (u16, Value) {
+    let parsed: Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(_) => return (400, json!({"ok": false, "error": "invalid JSON"})),
+    };
+
+    if let Some(enabled) = parsed["enabled"].as_bool() {
+        let params = format!(r#"{{"switch":{}}}"#, enabled);
+        if let Err(e) = ubus::call("zwrt_zte_sleep_faw.wakelock", "enableAutoSleep", Some(&params))
+        {
+            return (503, json!({"ok": false, "error": format!("enableAutoSleep: {e}")}));
+        }
+        // Persist to UCI so it survives reboots
+        let val = if enabled { "1" } else { "0" };
+        let _ = ubus::uci_set("zwrt_sleep.ztmp_switch.sleepSwitch", val);
+    }
+
+    if let Some(timeout) = parsed["timeout"].as_str() {
+        let valid = timeout == "-1"
+            || timeout
+                .parse::<u32>()
+                .map(|v| (1..=1440).contains(&v))
+                .unwrap_or(false);
+        if !valid {
+            return (
+                400,
+                json!({"ok": false, "error": "timeout must be -1 or 1–1440 (minutes)"}),
+            );
+        }
+        let params = format!(r#"{{"ufiSleepTime":"{timeout}"}}"#);
+        if let Err(e) = ubus::call("zwrt_zte_sleep_faw.wakelock", "set_ufi_sleep", Some(&params)) {
+            return (503, json!({"ok": false, "error": format!("set_ufi_sleep: {e}")}));
+        }
+    }
+
+    device_auto_sleep_get(_state)
+}
