@@ -3,7 +3,7 @@ import Foundation
 // MARK: - Network Mode
 
 struct NetworkModeConfig: Equatable {
-    var netSelect: String       // WL_AND_5G, Only_5G, Only_LTE, Only_WCDMA, Only_GSM
+    var netSelect: String       // WL_AND_5G, LTE_AND_5G, Only_5G, Only_LTE, WCDMA_AND_LTE, Only_WCDMA
 
     static let empty = NetworkModeConfig(netSelect: "WL_AND_5G")
 

@@ -13,6 +13,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
+import com.openu60.core.components.AnimatedNumber
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -70,6 +71,8 @@ fun DeviceControlScreen(
             )
         },
     ) { padding ->
+        val controlsDisabled = state.isLoading
+
         PullToRefreshBox(
             isRefreshing = state.isLoading,
             onRefresh = { viewModel.refresh() },
@@ -112,10 +115,14 @@ fun DeviceControlScreen(
                             if (state.chargeLimitEnabled) {
                                 Spacer(modifier = Modifier.height(8.dp))
                                 var sliderValue by remember(state.chargeLimit) { mutableFloatStateOf(state.chargeLimit.toFloat()) }
-                                Text(
-                                    "Stop at ${sliderValue.toInt()}%",
-                                    style = MaterialTheme.typography.bodyLarge,
-                                )
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Text("Stop at ", style = MaterialTheme.typography.bodyLarge)
+                                    AnimatedNumber(
+                                        value = sliderValue.toInt(),
+                                        style = MaterialTheme.typography.bodyLarge,
+                                        suffix = "%",
+                                    )
+                                }
                                 Slider(
                                     value = sliderValue,
                                     onValueChange = { sliderValue = it },
@@ -131,10 +138,14 @@ fun DeviceControlScreen(
                                     horizontalArrangement = Arrangement.SpaceBetween,
                                     verticalAlignment = Alignment.CenterVertically,
                                 ) {
-                                    Text(
-                                        "Resume gap: ${state.hysteresis}%",
-                                        style = MaterialTheme.typography.bodyLarge,
-                                    )
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Text("Resume gap: ", style = MaterialTheme.typography.bodyLarge)
+                                        AnimatedNumber(
+                                            value = state.hysteresis,
+                                            style = MaterialTheme.typography.bodyLarge,
+                                            suffix = "%",
+                                        )
+                                    }
                                     Row(verticalAlignment = Alignment.CenterVertically) {
                                         IconButton(
                                             onClick = {
@@ -157,7 +168,7 @@ fun DeviceControlScreen(
                             Spacer(modifier = Modifier.height(4.dp))
                             if (state.chargeLimitEnabled) {
                                 Text(
-                                    "Charging stops at ${state.chargeLimit}% and resumes at ${state.chargeLimit - state.hysteresis}%.\n\n" +
+                                    "Charging stops at ${sliderValue.toInt()}% and resumes at ${sliderValue.toInt() - state.hysteresis}%.\n\n" +
                                         "The resume gap prevents the charger from rapidly switching on and off. " +
                                         "A smaller gap keeps the battery closer to your target but toggles more often. " +
                                         "A larger gap means fewer cycles but more swing.\n\nDefault: 5%",
@@ -187,6 +198,44 @@ fun DeviceControlScreen(
                         if (state.fastBootLoaded) {
                             ToggleRow("Fast Boot", state.fastBoot) { viewModel.toggleFastBoot(it) }
                         }
+                        if (state.autoSleepLoaded) {
+                            ToggleRow("Auto Sleep", state.autoSleepEnabled) {
+                                viewModel.setAutoSleep(it)
+                            }
+                            if (state.autoSleepEnabled) {
+                                Spacer(modifier = Modifier.height(4.dp))
+                                val presets = listOf(5, 10, 20, 30, 60, 120)
+                                val currentMinutes = state.autoSleepTimeout.toIntOrNull() ?: 5
+                                val currentIndex = presets.indexOf(currentMinutes).coerceAtLeast(0)
+                                var sliderIndex by remember(currentIndex) { mutableFloatStateOf(currentIndex.toFloat()) }
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Text("Idle timeout: ", style = MaterialTheme.typography.bodyLarge)
+                                    AnimatedNumber(
+                                        value = presets[sliderIndex.toInt().coerceIn(0, presets.lastIndex)],
+                                        style = MaterialTheme.typography.bodyLarge,
+                                        suffix = " min",
+                                    )
+                                }
+                                Slider(
+                                    value = sliderIndex,
+                                    onValueChange = { sliderIndex = it },
+                                    onValueChangeFinished = {
+                                        val selected = presets[sliderIndex.toInt().coerceIn(0, presets.lastIndex)]
+                                        viewModel.setAutoSleep(true, "$selected")
+                                    },
+                                    valueRange = 0f..(presets.size - 1).toFloat(),
+                                    steps = presets.size - 2,
+                                    enabled = !controlsDisabled,
+                                    modifier = Modifier.fillMaxWidth(),
+                                )
+                                Spacer(modifier = Modifier.height(4.dp))
+                                Text(
+                                    "Sleeps when no WiFi clients are connected and idle timeout expires.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        }
                     }
                 }
 
@@ -197,13 +246,13 @@ fun DeviceControlScreen(
                         Spacer(modifier = Modifier.height(12.dp))
                         Button(
                             onClick = { viewModel.showRebootConfirm() },
-                            enabled = !state.isLoading,
+                            enabled = !controlsDisabled,
                             modifier = Modifier.fillMaxWidth(),
                         ) { Text("Reboot Device") }
                         Spacer(modifier = Modifier.height(8.dp))
                         OutlinedButton(
                             onClick = { viewModel.showResetConfirm() },
-                            enabled = !state.isLoading,
+                            enabled = !controlsDisabled,
                             modifier = Modifier.fillMaxWidth(),
                             colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error),
                         ) { Text("Factory Reset") }

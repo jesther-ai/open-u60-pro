@@ -13,9 +13,12 @@ final class DeviceControlViewModel {
     var hysteresis: Int = 5
     var powerSaveEnabled: Bool = false
     var fastBootEnabled: Bool = false
+    var autoSleepEnabled: Bool = false
+    var autoSleepTimeout: String = "5"
     private var chargeControlLoaded: Bool = false
     private var powerSaveLoaded: Bool = false
     private var fastBootLoaded: Bool = false
+    private var autoSleepLoaded: Bool = false
     private let client: AgentClient
     private let authManager: AuthManager
 
@@ -66,6 +69,20 @@ final class DeviceControlViewModel {
         } catch {
             showMessage("Failed to load fast boot settings", isError: true)
         }
+
+        do {
+            let asData = try await client.getJSON("/api/device/auto-sleep")
+            let data = asData["data"] as? [String: Any] ?? asData
+            if let enabled = data["enabled"] as? Bool {
+                autoSleepEnabled = enabled
+            }
+            if let timeout = data["timeout"] as? String, !timeout.isEmpty {
+                autoSleepTimeout = timeout
+            }
+            autoSleepLoaded = true
+        } catch {
+            showMessage("Failed to load auto-sleep settings", isError: true)
+        }
     }
 
     func setChargeLimit(enabled: Bool, limit: Int, hysteresis: Int? = nil) async {
@@ -73,7 +90,6 @@ final class DeviceControlViewModel {
         let prevEnabled = chargeLimitEnabled
         let prevLimit = chargeLimit
         let prevHysteresis = self.hysteresis
-        isLoading = true
         do {
             var body: [String: Any] = [
                 "charge_limit_enabled": enabled,
@@ -93,40 +109,50 @@ final class DeviceControlViewModel {
             if let newHyst = data["hysteresis"] as? Int {
                 self.hysteresis = newHyst
             }
-            showMessage(enabled ? "Charge limit set to \(limit)%" : "Charge limit disabled", isError: false)
         } catch {
             chargeLimitEnabled = prevEnabled
             chargeLimit = prevLimit
             self.hysteresis = prevHysteresis
             showMessage("Failed: \(error.localizedDescription)", isError: true)
         }
-        isLoading = false
     }
 
     func setPowerSave(enabled: Bool) async {
         guard powerSaveLoaded else { return }
-        isLoading = true
         do {
             let _ = try await client.putJSON("/api/device/power-save", body: ["deviceInfoList": ["power_saver_mode": enabled ? "1" : "0"]])
-            showMessage(enabled ? "Power-save mode enabled" : "Power-save mode disabled", isError: false)
         } catch {
             powerSaveEnabled = !enabled
             showMessage("Failed: \(error.localizedDescription)", isError: true)
         }
-        isLoading = false
     }
 
     func setFastBoot(enabled: Bool) async {
         guard fastBootLoaded else { return }
-        isLoading = true
         do {
             let _ = try await client.putJSON("/api/device/fast-boot", body: ["fast_boot": enabled ? "1" : "0"])
-            showMessage(enabled ? "Fast boot enabled" : "Fast boot disabled", isError: false)
         } catch {
             fastBootEnabled = !enabled
             showMessage("Failed: \(error.localizedDescription)", isError: true)
         }
-        isLoading = false
+    }
+
+    func setAutoSleep(enabled: Bool, timeout: String? = nil) async {
+        guard autoSleepLoaded else { return }
+        let prevEnabled = autoSleepEnabled
+        let prevTimeout = autoSleepTimeout
+        do {
+            var body: [String: Any] = ["enabled": enabled]
+            if let t = timeout { body["timeout"] = t }
+            let resp = try await client.putJSON("/api/device/auto-sleep", body: body)
+            let data = resp["data"] as? [String: Any] ?? resp
+            if let newEnabled = data["enabled"] as? Bool { autoSleepEnabled = newEnabled }
+            if let newTimeout = data["timeout"] as? String { autoSleepTimeout = newTimeout }
+        } catch {
+            autoSleepEnabled = prevEnabled
+            autoSleepTimeout = prevTimeout
+            showMessage("Failed: \(error.localizedDescription)", isError: true)
+        }
     }
 
     func reboot() async {

@@ -17,11 +17,14 @@ data class DeviceControlState(
     val chargeControlLoaded: Boolean = false,
     val powerSaveLoaded: Boolean = false,
     val fastBootLoaded: Boolean = false,
+    val autoSleepLoaded: Boolean = false,
     val chargeLimitEnabled: Boolean = false,
     val chargeLimit: Int = 100,
     val hysteresis: Int = 5,
     val powerSave: Boolean = false,
     val fastBoot: Boolean = false,
+    val autoSleepEnabled: Boolean = false,
+    val autoSleepTimeout: String = "5",
     val isLoading: Boolean = false,
     val message: String? = null,
     val messageIsError: Boolean = false,
@@ -73,6 +76,18 @@ class DeviceControlViewModel @Inject constructor(
                     )
                 } catch (_: Exception) {}
 
+                // Auto sleep
+                try {
+                    val asData = agentClient.getJSON("/api/device/auto-sleep")
+                    @Suppress("UNCHECKED_CAST")
+                    val asInner = asData["data"] as? Map<String, Any?> ?: asData
+                    _state.value = _state.value.copy(
+                        autoSleepEnabled = asInner["enabled"] as? Boolean ?: false,
+                        autoSleepTimeout = asInner["timeout"]?.toString() ?: "5",
+                        autoSleepLoaded = true,
+                    )
+                } catch (_: Exception) {}
+
                 _state.value = _state.value.copy(isLoading = false)
             } catch (e: AgentError.Unauthorized) {
                 if (authManager.reauthenticate()) refresh() else setError(e.message)
@@ -109,8 +124,6 @@ class DeviceControlViewModel @Inject constructor(
                     chargeLimitEnabled = newEnabled,
                     chargeLimit = newLimit,
                     hysteresis = newHysteresis,
-                    message = if (enabled) "Charge limit set to $limit%" else "Charge limit disabled",
-                    messageIsError = false,
                 )
             } catch (e: AgentError.Unauthorized) {
                 _state.value = _state.value.copy(chargeLimitEnabled = prevEnabled, chargeLimit = prevLimit, hysteresis = prevHysteresis)
@@ -130,7 +143,6 @@ class DeviceControlViewModel @Inject constructor(
                 agentClient.putJSON("/api/device/power-save", mapOf(
                     "deviceInfoList" to mapOf("power_saver_mode" to if (enabled) "1" else "0"),
                 ))
-                _state.value = _state.value.copy(message = "Power save updated", messageIsError = false)
             } catch (e: AgentError.Unauthorized) {
                 _state.value = _state.value.copy(powerSave = prev)
                 if (authManager.reauthenticate()) togglePowerSave(enabled) else setError(e.message)
@@ -149,12 +161,34 @@ class DeviceControlViewModel @Inject constructor(
                 agentClient.putJSON("/api/device/fast-boot", mapOf(
                     "fast_boot" to if (enabled) "1" else "0",
                 ))
-                _state.value = _state.value.copy(message = "Fast boot updated", messageIsError = false)
             } catch (e: AgentError.Unauthorized) {
                 _state.value = _state.value.copy(fastBoot = prev)
                 if (authManager.reauthenticate()) toggleFastBoot(enabled) else setError(e.message)
             } catch (e: Exception) {
                 _state.value = _state.value.copy(fastBoot = prev)
+                setError(e.message)
+            }
+        }
+    }
+
+    fun setAutoSleep(enabled: Boolean, timeout: String? = null) {
+        val prevEnabled = _state.value.autoSleepEnabled
+        val prevTimeout = _state.value.autoSleepTimeout
+        _state.value = _state.value.copy(
+            autoSleepEnabled = enabled,
+            autoSleepTimeout = timeout ?: _state.value.autoSleepTimeout,
+            message = null,
+        )
+        viewModelScope.launch {
+            try {
+                val body = mutableMapOf<String, Any>("enabled" to enabled)
+                if (timeout != null) body["timeout"] = timeout
+                agentClient.putJSON("/api/device/auto-sleep", body)
+            } catch (e: AgentError.Unauthorized) {
+                _state.value = _state.value.copy(autoSleepEnabled = prevEnabled, autoSleepTimeout = prevTimeout)
+                if (authManager.reauthenticate()) setAutoSleep(enabled, timeout) else setError(e.message)
+            } catch (e: Exception) {
+                _state.value = _state.value.copy(autoSleepEnabled = prevEnabled, autoSleepTimeout = prevTimeout)
                 setError(e.message)
             }
         }
