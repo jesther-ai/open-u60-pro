@@ -1,6 +1,6 @@
 import SwiftUI
 
-struct BatteryCardView: View {
+struct BatteryCardView: View, Equatable {
     let battery: BatteryStatus
 
     var body: some View {
@@ -9,8 +9,10 @@ struct BatteryCardView: View {
                 Image(systemName: batteryIcon(battery.capacity))
                     .font(.title2)
                     .foregroundStyle(Color.batteryColor(battery.capacity))
-                AnimatedNumber(value: battery.capacity,
-                               font: .title3.weight(.bold), textColor: .primary, suffix: "%")
+                // A battery percentage must render as one exact value, not independent reels.
+                Text(battery.capacityText)
+                    .font(.title3.weight(.bold).monospacedDigit())
+                    .transaction { $0.animation = nil }
                 batteryStatusLine
                 if battery.temperature > 0 {
                     AnimatedNumber(value: battery.temperature, decimalPlaces: 0,
@@ -57,7 +59,7 @@ struct BatteryCardView: View {
                 .font(.caption)
                 .foregroundStyle(.orange)
         case "charging":
-            if battery.capacity >= 100 {
+            if battery.capacityPercent == 100 {
                 Text("Full")
                     .font(.caption)
                     .foregroundStyle(.green)
@@ -110,6 +112,7 @@ struct BatteryCardView: View {
     }
 
     private func batteryIcon(_ percent: Int) -> String {
+        guard (0...100).contains(percent) else { return "battery.0" }
         if percent >= 75 { return "battery.100" }
         if percent >= 50 { return "battery.75" }
         if percent >= 25 { return "battery.50" }
@@ -123,7 +126,7 @@ struct BatteryDetailSheet: View {
     var body: some View {
         NavigationStack {
             List {
-                row("Capacity", icon: batteryIcon(battery.capacity), value: "\(battery.capacity)%")
+                row("Capacity", icon: batteryIcon(battery.capacity), value: battery.capacityText)
                 row("Status", icon: "bolt.fill", value: statusLabel)
                 if let mv = battery.voltageMV {
                     row("Voltage", icon: "bolt.circle", value: String(format: "%.3f V", Double(mv) / 1000.0))
@@ -157,7 +160,7 @@ struct BatteryDetailSheet: View {
     private var statusLabel: String {
         switch battery.charging {
         case "stopped": return "Charge Stopped"
-        case "charging": return battery.capacity >= 100 ? "Full" : "Charging"
+        case "charging": return battery.capacityPercent == 100 ? "Full" : "Charging"
         default: return "Discharging"
         }
     }
@@ -171,6 +174,7 @@ struct BatteryDetailSheet: View {
     }
 
     private func batteryIcon(_ percent: Int) -> String {
+        guard (0...100).contains(percent) else { return "battery.0" }
         if percent >= 75 { return "battery.100" }
         if percent >= 50 { return "battery.75" }
         if percent >= 25 { return "battery.50" }

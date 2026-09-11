@@ -2,6 +2,7 @@ import SwiftUI
 
 struct SettingsView: View {
     @State private var viewModel: SettingsViewModel
+    @FocusState private var gatewayFieldFocused: Bool
 
     init(client: AgentClient) {
         _viewModel = State(initialValue: SettingsViewModel(client: client))
@@ -11,12 +12,21 @@ struct SettingsView: View {
         @Bindable var vm = viewModel
         NavigationStack {
             Form {
-                Section("Gateway") {
+                Section {
                     HStack {
                         TextField("Gateway IP", text: $vm.gatewayIP)
                             .keyboardType(.decimalPad)
                             .autocorrectionDisabled()
+                            .focused($gatewayFieldFocused)
+                            .onSubmit { viewModel.commitGatewayIP() }
+                            .onChange(of: gatewayFieldFocused) { _, isFocused in
+                                if !isFocused { viewModel.commitGatewayIP() }
+                            }
+                            // Detection walks the client's base URL across candidates; an edit
+                            // committed mid-probe would fight it for the same property.
+                            .disabled(viewModel.isDetectingGateway)
                         Button("Detect") {
+                            gatewayFieldFocused = false
                             Task { await viewModel.autoDetectGateway() }
                         }
                         .buttonStyle(.bordered)
@@ -25,6 +35,12 @@ struct SettingsView: View {
                         if viewModel.isDetectingGateway {
                             ProgressView()
                         }
+                    }
+                } header: {
+                    Text("Gateway")
+                } footer: {
+                    if viewModel.detectionFailed {
+                        Text("No agent answered on the common gateway addresses. The previous address is still in use.")
                     }
                 }
 
@@ -42,16 +58,22 @@ struct SettingsView: View {
                     }
                     SecureField("New Password", text: $vm.passwordInput)
                     Button("Save to Keychain") {
-                        viewModel.savePassword()
+                        withAnimation { viewModel.savePassword() }
                     }
                     .disabled(viewModel.passwordInput.isEmpty)
                 }
 
-                Section("Polling") {
+                Section {
                     VStack(alignment: .leading) {
                         Text("Refresh interval: \(viewModel.pollInterval, specifier: "%.1f")s")
                         Slider(value: $vm.pollInterval, in: 1...10, step: 0.5)
+                            .accessibilityLabel("Refresh interval")
+                            .accessibilityValue(String(format: "%.1f seconds", viewModel.pollInterval))
                     }
+                } header: {
+                    Text("Polling")
+                } footer: {
+                    Text("Live upload and download use a separate 1-second refresh, matching the modem’s update rate.")
                 }
 
                 Section("Appearance") {
@@ -82,6 +104,7 @@ struct SettingsView: View {
                     savedToast
                 }
             }
+            .task { await viewModel.refreshStoredPasswordState() }
         }
     }
 

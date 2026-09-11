@@ -10,6 +10,10 @@ struct BatteryStatus: Equatable {
     var currentMA: Int?            // milliamps; negative = discharging, positive = charging
     var voltageMV: Int?            // millivolts from agent
 
+    /// Preserve invalid telemetry as unknown instead of displaying or clamping it to full.
+    var capacityPercent: Int? { (0...100).contains(capacity) ? capacity : nil }
+    var capacityText: String { capacityPercent.map { "\($0)%" } ?? "—" }
+
     static let empty = BatteryStatus()
 }
 
@@ -35,6 +39,7 @@ struct TrafficStats: Equatable {
 
     static func == (lhs: TrafficStats, rhs: TrafficStats) -> Bool {
         lhs.rxBytes == rhs.rxBytes && lhs.txBytes == rhs.txBytes
+            && lhs.source == rhs.source
             && lhs.precomputedRxRate == rhs.precomputedRxRate
             && lhs.precomputedTxRate == rhs.precomputedTxRate
             && lhs.serverRxSpeed == rhs.serverRxSpeed
@@ -170,17 +175,18 @@ enum DeviceParser {
     }
 
     static func parseWwandstTraffic(_ data: [String: Any]) -> TrafficStats? {
-        guard let rx = asUInt64(data["real_rx_bytes"]) else { return nil }
-        let tx = asUInt64(data["real_tx_bytes"]) ?? 0
+        guard let rx = asUInt64(data["real_rx_bytes"]),
+              let tx = asUInt64(data["real_tx_bytes"]) else { return nil }
         var stats = TrafficStats(
             rxBytes: rx,
             txBytes: tx,
             timestamp: Date(),
             source: "wwandst"
         )
+        // Zero is a valid idle rate, even when the modem publishes a delayed byte total.
         if let rxRate = asDouble(data["real_rx_speed"]),
            let txRate = asDouble(data["real_tx_speed"]),
-           (rxRate > 0 || txRate > 0) {
+           rxRate.isFinite, txRate.isFinite, rxRate >= 0, txRate >= 0 {
             stats.precomputedRxRate = rxRate
             stats.precomputedTxRate = txRate
         }
@@ -226,6 +232,7 @@ enum DeviceParser {
 
     static func parseHostHints(_ data: [String: Any]) -> [ConnectedDevice] {
         var devices: [ConnectedDevice] = []
+        devices.reserveCapacity(data.count)
         for (mac, value) in data {
             guard let info = value as? [String: Any] else { continue }
             let name = info["name"] as? String ?? ""
@@ -241,7 +248,34 @@ enum DeviceParser {
                 dhcpHostname: ""
             ))
         }
+
+        // `localizedStandardCompare` is an ICU call per comparison. For dotted-quad IPv4 it orders
+        // identically to comparing the packed 32-bit value (its numeric chunk comparison is exactly
+        // an octet-wise numeric compare), so take that path when every host has one and fall back
+        // to the locale-aware comparator otherwise.
+        let keyed = devices.compactMap { device -> (UInt32, ConnectedDevice)? in
+            guard let key = ipv4SortKey(device.ipAddress) else { return nil }
+            return (key, device)
+        }
+        if keyed.count == devices.count {
+            return keyed.sorted { $0.0 < $1.0 }.map { $0.1 }
+        }
         return devices.sorted { $0.ipAddress.localizedStandardCompare($1.ipAddress) == .orderedAscending }
+    }
+
+    /// Packs a dotted-quad IPv4 string into a sortable integer; nil for anything else.
+    private static func ipv4SortKey(_ ip: String) -> UInt32? {
+        var key: UInt32 = 0
+        var octets = 0
+        for part in ip.split(separator: ".", omittingEmptySubsequences: false) {
+            guard octets < 4,
+                  !part.isEmpty, part.count <= 3,
+                  part.allSatisfy({ $0.isASCII && $0.isNumber }),
+                  let octet = UInt32(part), octet <= 255 else { return nil }
+            key = key << 8 | octet
+            octets += 1
+        }
+        return octets == 4 ? key : nil
     }
 
     static func enrichWithDHCP(devices: inout [ConnectedDevice], leases: [[String: Any]]) {
