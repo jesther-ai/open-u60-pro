@@ -7,9 +7,11 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
+import com.openu60.R
 import com.openu60.core.network.AuthState
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -25,7 +27,7 @@ fun SettingsScreen(
 
     Scaffold(
         topBar = {
-            TopAppBar(title = { Text("Settings") })
+            TopAppBar(title = { Text(stringResource(R.string.nav_settings)) })
         },
     ) { padding ->
         Column(
@@ -40,7 +42,7 @@ fun SettingsScreen(
             Card(modifier = Modifier.fillMaxWidth()) {
                 Column(modifier = Modifier.padding(16.dp)) {
                     Text(
-                        "Connection",
+                        stringResource(R.string.settings_connection),
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold,
                     )
@@ -48,7 +50,7 @@ fun SettingsScreen(
                     OutlinedTextField(
                         value = gateway,
                         onValueChange = viewModel::updateGateway,
-                        label = { Text("Gateway IP") },
+                        label = { Text(stringResource(R.string.settings_gateway_ip)) },
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth(),
                     )
@@ -57,15 +59,15 @@ fun SettingsScreen(
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         Text(
-                            "Status: ",
+                            stringResource(R.string.settings_status) + " ",
                             style = MaterialTheme.typography.bodyMedium,
                         )
                         Text(
                             when (authState) {
-                                AuthState.LOGGED_IN -> "Connected"
-                                AuthState.LOGGING_IN -> "Connecting..."
-                                AuthState.ERROR -> "Error"
-                                AuthState.LOGGED_OUT -> "Not connected"
+                                AuthState.LOGGED_IN -> stringResource(R.string.status_connected)
+                                AuthState.LOGGING_IN -> stringResource(R.string.status_connecting)
+                                AuthState.ERROR -> stringResource(R.string.status_error)
+                                AuthState.LOGGED_OUT -> stringResource(R.string.status_not_connected)
                             },
                             style = MaterialTheme.typography.bodyMedium,
                             fontWeight = FontWeight.Bold,
@@ -82,14 +84,14 @@ fun SettingsScreen(
                             onClick = { viewModel.logout() },
                             modifier = Modifier.fillMaxWidth(),
                         ) {
-                            Text("Logout")
+                            Text(stringResource(R.string.action_logout))
                         }
                     } else {
                         Button(
                             onClick = onNavigateToLogin,
                             modifier = Modifier.fillMaxWidth(),
                         ) {
-                            Text("Login")
+                            Text(stringResource(R.string.action_login))
                         }
                     }
                 }
@@ -99,13 +101,13 @@ fun SettingsScreen(
             Card(modifier = Modifier.fillMaxWidth()) {
                 Column(modifier = Modifier.padding(16.dp)) {
                     Text(
-                        "Polling",
+                        stringResource(R.string.settings_polling),
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold,
                     )
                     Spacer(modifier = Modifier.height(12.dp))
                     Text(
-                        "Refresh interval: ${pollInterval}s",
+                        stringResource(R.string.settings_refresh_interval, pollInterval),
                         style = MaterialTheme.typography.bodyMedium,
                     )
                     Slider(
@@ -121,7 +123,7 @@ fun SettingsScreen(
             Card(modifier = Modifier.fillMaxWidth()) {
                 Column(modifier = Modifier.padding(16.dp)) {
                     Text(
-                        "Appearance",
+                        stringResource(R.string.settings_appearance),
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold,
                     )
@@ -131,7 +133,7 @@ fun SettingsScreen(
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        Text("Dark mode", style = MaterialTheme.typography.bodyLarge)
+                        Text(stringResource(R.string.settings_dark_mode), style = MaterialTheme.typography.bodyLarge)
                         Switch(
                             checked = darkMode ?: false,
                             onCheckedChange = viewModel::toggleDarkMode,
@@ -144,7 +146,7 @@ fun SettingsScreen(
             Card(modifier = Modifier.fillMaxWidth()) {
                 Column(modifier = Modifier.padding(16.dp)) {
                     Text(
-                        "About",
+                        stringResource(R.string.settings_about),
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold,
                     )
@@ -154,13 +156,13 @@ fun SettingsScreen(
                         style = MaterialTheme.typography.bodyMedium,
                     )
                     Text(
-                        "Companion app for ZTE U60 Pro (MU5250)",
+                        stringResource(R.string.settings_companion_app),
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                     Spacer(modifier = Modifier.height(8.dp))
                     Text(
-                        "This app is not affiliated with, endorsed by, or sponsored by ZTE Corporation. ZTE and U60 Pro are trademarks of ZTE Corporation.",
+                        stringResource(R.string.settings_disclaimer),
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )

@@ -70,13 +70,8 @@ struct DeviceInfoView: View {
             Text("Signal")
                 .foregroundStyle(.secondary)
             Spacer()
-            HStack(spacing: 2) {
-                ForEach(0..<maxBars, id: \.self) { i in
-                    RoundedRectangle(cornerRadius: 1)
-                        .fill(i < bars ? signalColor(bars: bars, max: maxBars) : Color.gray.opacity(0.3))
-                        .frame(width: 4, height: CGFloat(6 + i * 3))
-                }
-            }
+            Image(systemName: "cellularbars")
+                .foregroundStyle(bars > 0 ? signalColor(bars: bars, max: maxBars) : .secondary)
             Text("\(bars)/\(maxBars)")
                 .font(.body.monospacedDigit())
                 .foregroundStyle(.secondary)

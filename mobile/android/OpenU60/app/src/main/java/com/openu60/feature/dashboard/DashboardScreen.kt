@@ -13,9 +13,11 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
+import com.openu60.R
 import com.openu60.core.components.AnimatedNumber
 import com.openu60.core.model.DeviceParser
 import com.openu60.core.network.AuthState
@@ -61,16 +63,16 @@ fun DashboardScreen(
                     tint = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 Spacer(modifier = Modifier.height(16.dp))
-                Text("Not connected", style = MaterialTheme.typography.titleMedium)
+                Text(stringResource(R.string.status_not_connected), style = MaterialTheme.typography.titleMedium)
                 Spacer(modifier = Modifier.height(8.dp))
                 Text(
-                    "Login to view dashboard",
+                    stringResource(R.string.dashboard_login_prompt),
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 Spacer(modifier = Modifier.height(16.dp))
                 Button(onClick = onNavigateToLogin) {
-                    Text("Login")
+                    Text(stringResource(R.string.action_login))
                 }
             }
         }
@@ -117,7 +119,7 @@ fun DashboardScreen(
                     ) {
                         Icon(Icons.Default.AirplanemodeActive, contentDescription = null, tint = Color(0xFFE65100))
                         Spacer(modifier = Modifier.width(12.dp))
-                        Text("Airplane Mode is active", color = Color(0xFFE65100))
+                        Text(stringResource(R.string.dashboard_airplane_mode), color = Color(0xFFE65100))
                     }
                 }
             }
@@ -135,7 +137,7 @@ fun DashboardScreen(
                     ) {
                         Icon(Icons.Default.MobiledataOff, contentDescription = null, tint = Color(0xFFE65100))
                         Spacer(modifier = Modifier.width(12.dp))
-                        Text("Mobile data is disabled", color = Color(0xFFE65100))
+                        Text(stringResource(R.string.dashboard_mobile_data_off), color = Color(0xFFE65100))
                     }
                 }
             }
@@ -153,7 +155,7 @@ fun DashboardScreen(
                     ) {
                         Icon(Icons.Default.SimCardAlert, contentDescription = null, tint = MaterialTheme.colorScheme.error)
                         Spacer(modifier = Modifier.width(12.dp))
-                        Text("SIM PUK required", color = MaterialTheme.colorScheme.error)
+                        Text(stringResource(R.string.dashboard_sim_puk_required), color = MaterialTheme.colorScheme.error)
                     }
                 }
             } else if (simPinRequired) {
@@ -168,7 +170,7 @@ fun DashboardScreen(
                     ) {
                         Icon(Icons.Default.SimCardAlert, contentDescription = null, tint = Color(0xFFE65100))
                         Spacer(modifier = Modifier.width(12.dp))
-                        Text("SIM PIN required", color = Color(0xFFE65100))
+                        Text(stringResource(R.string.dashboard_sim_pin_required), color = Color(0xFFE65100))
                     }
                 }
             }
@@ -190,20 +192,20 @@ fun DashboardScreen(
             ) {
                 val rsrp = nrSignal.rsrp ?: lteSignal.rsrp ?: wcdmaSignal.rscp
                 val sccCount = nrSignal.sccCarriers.size + lteSignal.sccCarriers.size
-                val signalTitle = when {
-                    nrSignal.isConnected -> "NR Signal"
-                    lteSignal.isConnected -> "LTE Signal"
-                    wcdmaSignal.isConnected -> "3G Signal"
-                    else -> "Signal"
+                val signalTitleRes = when {
+                    nrSignal.isConnected -> R.string.dashboard_nr_signal
+                    lteSignal.isConnected -> R.string.dashboard_lte_signal
+                    wcdmaSignal.isConnected -> R.string.dashboard_wcdma_signal
+                    else -> R.string.dashboard_signal
                 }
                 val signalSubtitle = buildString {
-                    append(signalQualityLabel(rsrp))
+                    append(stringResource(signalQualityLabelRes(rsrp)))
                     if (sccCount > 0) append(" +${sccCount}CA")
                 }
                 DashboardCard(
                     modifier = Modifier.weight(1f),
-                    icon = Icons.Default.SignalCellularAlt,
-                    title = signalTitle,
+                    icon = Icons.Default.SignalCellular4Bar,
+                    title = stringResource(signalTitleRes),
                     value = if (rsrp != null) "${rsrp.toInt()} dBm" else "--",
                     subtitle = signalSubtitle,
                     valueColor = rsrpColor(rsrp),
@@ -213,9 +215,9 @@ fun DashboardScreen(
                     } else null,
                 )
                 val chargingLabel = when (battery.charging) {
-                    "charging" -> "Charging"
-                    "stopped" -> "Charge Stopped"
-                    else -> "Discharging"
+                    "charging" -> stringResource(R.string.dashboard_charging)
+                    "stopped" -> stringResource(R.string.dashboard_charge_stopped)
+                    else -> stringResource(R.string.dashboard_discharging)
                 }
                 val currentStr = battery.currentMA?.let { "${it}mA" } ?: ""
                 val battSubtitle = listOfNotNull(
@@ -225,7 +227,7 @@ fun DashboardScreen(
                 DashboardCard(
                     modifier = Modifier.weight(1f),
                     icon = Icons.Default.BatteryStd,
-                    title = "Battery",
+                    title = stringResource(R.string.dashboard_battery),
                     value = "${battery.capacity}%",
                     subtitle = battSubtitle,
                     valueColor = batteryColor(battery.capacity),
@@ -254,7 +256,7 @@ fun DashboardScreen(
                 DashboardCard(
                     modifier = Modifier.weight(1f),
                     icon = Icons.Default.SwapVert,
-                    title = "Cellular",
+                    title = stringResource(R.string.dashboard_cellular),
                     value = DeviceParser.formatSpeed(speed.downloadBytesPerSec),
                     subtitle = DeviceParser.formatBytes(trafficStats.rxBytes + trafficStats.txBytes),
                     valueContent = { AnimatedNumber(value = speedComp.number, decimalPlaces = speedComp.decimalPlaces, suffix = speedComp.unit, style = MaterialTheme.typography.headlineSmall.copy(fontWeight = FontWeight.Bold)) },
@@ -283,7 +285,7 @@ fun DashboardScreen(
                             Text("5G: ${wifiStatus.ssid5g}", style = MaterialTheme.typography.bodyMedium)
                         }
                         Text(
-                            "${connectedDevices.size} clients",
+                            "${connectedDevices.size} ${stringResource(R.string.dashboard_clients)}",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
@@ -339,7 +341,7 @@ fun DashboardScreen(
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 )
                                 Text(
-                                    " Devices",
+                                    " ${stringResource(R.string.dashboard_devices)}",
                                     style = MaterialTheme.typography.labelMedium,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 )
@@ -354,7 +356,7 @@ fun DashboardScreen(
                         }
                         if (connectedDevices.size > 5) {
                             Text(
-                                "+${connectedDevices.size - 5} more",
+                                "+${connectedDevices.size - 5} ${stringResource(R.string.dashboard_more)}",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.primary,
                             )
@@ -369,7 +371,7 @@ fun DashboardScreen(
                 Card(modifier = Modifier.fillMaxWidth()) {
                     Column(modifier = Modifier.padding(16.dp)) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text("NR Band", style = MaterialTheme.typography.labelMedium)
+                            Text(stringResource(R.string.dashboard_nr_band), style = MaterialTheme.typography.labelMedium)
                             if (nrSignal.sccCarriers.isNotEmpty()) {
                                 Spacer(modifier = Modifier.width(6.dp))
                                 Text(
@@ -435,11 +437,11 @@ fun DashboardScreen(
                 Card(modifier = Modifier.fillMaxWidth()) {
                     Column(modifier = Modifier.padding(16.dp)) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text("LTE Band", style = MaterialTheme.typography.labelMedium)
+                            Text(stringResource(R.string.dashboard_lte_band), style = MaterialTheme.typography.labelMedium)
                             if (showNRBand) {
                                 Spacer(modifier = Modifier.width(6.dp))
                                 Text(
-                                    "Anchor",
+                                    stringResource(R.string.dashboard_anchor),
                                     style = MaterialTheme.typography.labelSmall,
                                     fontWeight = FontWeight.Bold,
                                     color = Color(0xFFFF9800),
@@ -510,7 +512,7 @@ fun DashboardScreen(
             if (!nrSignal.isConnected && !lteSignal.isConnected && wcdmaSignal.isConnected) {
                 Card(modifier = Modifier.fillMaxWidth()) {
                     Column(modifier = Modifier.padding(16.dp)) {
-                        Text("3G WCDMA", style = MaterialTheme.typography.labelMedium)
+                        Text(stringResource(R.string.dashboard_wcdma_band), style = MaterialTheme.typography.labelMedium)
                         Spacer(modifier = Modifier.height(4.dp))
                         Row(
                             modifier = Modifier.fillMaxWidth(),
@@ -602,13 +604,13 @@ private fun rsrpColor(rsrp: Double?): Color {
     }
 }
 
-private fun signalQualityLabel(rsrp: Double?): String {
-    if (rsrp == null) return "No signal"
+private fun signalQualityLabelRes(rsrp: Double?): Int {
+    if (rsrp == null) return R.string.dashboard_no_signal
     return when {
-        rsrp >= -80 -> "Excellent"
-        rsrp >= -100 -> "Good"
-        rsrp >= -110 -> "Fair"
-        else -> "Poor"
+        rsrp >= -80 -> R.string.dashboard_excellent
+        rsrp >= -100 -> R.string.dashboard_good
+        rsrp >= -110 -> R.string.dashboard_fair
+        else -> R.string.dashboard_poor
     }
 }
 

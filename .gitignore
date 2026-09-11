@@ -4,3 +4,29 @@
 skills-lock.json
 logs/
 .DS_Store
+
+# Android
+*.apk
+*.ap_
+*.aab
+*.dex
+*.keystore
+*.jks
+*.iml
+.gradle/
+build/
+local.properties
+captures/
+mobile/android/**/.gradle/
+mobile/android/**/build/
+mobile/android/**/local.properties
+
+# iOS / Xcode
+DerivedData/
+*.xcuserstate
+*.xcuserdata/
+*.xcodeproj/project.xcworkspace/xcuserdata/
+*.xcodeproj/xcuserdata/
+mobile/ios/**/build/
+mobile/ios/**/DerivedData/
+mobile/ios/**/*.xcuserstate

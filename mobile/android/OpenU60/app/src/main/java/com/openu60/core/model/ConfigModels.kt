@@ -77,7 +77,7 @@ data class KnownKey(
 
         fun getAllKeys(serial: String? = null, signature: ByteArray? = null): List<KnownKey> {
             val candidates = mutableListOf<KnownKey>()
-            if (!signature.isNullOrEmpty()) {
+            if (signature?.isNotEmpty() == true) {
                 candidates.add(KnownKey("derived from signature", keyFromSignature(signature)))
             }
             if (!serial.isNullOrBlank()) {

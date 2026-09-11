@@ -21,6 +21,7 @@ pub struct AppState {
     pub speedtest: crate::speedtest::SpeedTest,
     pub charge_limit: Arc<ChargeLimitEnforcer>,
     pub sms_forward: Arc<SmsForwarder>,
+    pub tailscale: Arc<crate::tailscale::TailscaleManager>,
 }
 
 impl AppState {
@@ -36,6 +37,7 @@ impl AppState {
             speedtest: crate::speedtest::SpeedTest::new(),
             charge_limit: Arc::new(ChargeLimitEnforcer::new()),
             sms_forward: Arc::new(SmsForwarder::new()),
+            tailscale: Arc::new(crate::tailscale::TailscaleManager::new()),
         }
     }
 }

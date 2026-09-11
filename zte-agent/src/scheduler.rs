@@ -127,6 +127,13 @@ fn validate_job(
     if action.path.starts_with("/api/auth/") {
         return Err("cannot schedule auth endpoints".into());
     }
+    if matches!(
+        action.path.as_str(),
+        "/api/tailscale/setup" | "/api/tailscale/logout" | "/api/tailscale/update"
+    ) {
+        // A scheduled logout/update is a remote-lockout device
+        return Err("cannot schedule tailscale enrollment or maintenance endpoints".into());
+    }
     if parse_method(&action.method).is_none() {
         return Err("action.method must be GET, POST, PUT, or DELETE".into());
     }

@@ -17,7 +17,8 @@ class AgentClient @Inject constructor() {
 
     companion object {
         private val JSON_MEDIA_TYPE = "application/json".toMediaType()
-        private val json = Json { ignoreUnknownKeys = true }
+        @PublishedApi
+        internal val json = Json { ignoreUnknownKeys = true }
     }
 
     private val httpClient = OkHttpClient.Builder()
