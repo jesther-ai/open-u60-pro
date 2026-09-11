@@ -70,8 +70,11 @@ struct SMSForwardConfigView: View {
                             .onTapGesture {
                                 viewModel.presentedSheet = .edit(rule)
                             }
+                            .accessibilityElement(children: .combine)
+                            .accessibilityAddTraits(.isButton)
+                            .accessibilityHint("Edit rule")
                             Spacer()
-                            Toggle("", isOn: Binding(
+                            Toggle(rule.name, isOn: Binding(
                                 get: { rule.enabled },
                                 set: { val in Task { await viewModel.toggleRule(id: rule.id, enabled: val) } }
                             ))

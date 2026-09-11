@@ -52,8 +52,10 @@ The iOS app communicates with `zte-agent`, a lightweight Rust HTTP server deploy
 
 ### Requirements
 
-- iOS 16.0+
-- Xcode 15+
+- iOS 17.0+
+- Xcode 26.6 recommended (includes Swift 6.3 and the iOS 26.5 SDK)
+- XcodeGen 2.46.0 (`brew install xcodegen`)
+- Swift 5 language mode; the compiler version is supplied by Xcode
 - No external dependencies (uses only Apple frameworks)
 
 ### Tech Stack
@@ -128,8 +130,8 @@ ios/OpenU60/
 
 1. Build `zte-agent`: `cargo build --release --target aarch64-unknown-linux-musl -p zte-agent`
 2. Deploy to router via ADB or SCP (see root README for details)
-3. Open the project in Xcode
-4. Add `NSAppTransportSecurity` → `NSAllowsArbitraryLoads = YES` to `Info.plist`
+3. Run `cd mobile/ios/OpenU60 && xcodegen generate` from the repository root
+4. Open `OpenU60.xcodeproj` in Xcode. The checked-in `Resources/Info.plist` already enables local HTTP access to the router.
 5. Build and run on device or simulator
 6. Connect to the router's WiFi and set the agent URL (default: `http://192.168.0.1:9090`)
 

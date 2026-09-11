@@ -3,6 +3,12 @@ import os
 
 private let logger = Logger(subsystem: "com.zte.companion", category: "SMS")
 
+/// Hands a decoded JSON payload to a background task. Safe because the value is transferred
+/// exactly once, is never mutated, and the sender drops it at the call site.
+private struct UncheckedTransfer<T>: @unchecked Sendable {
+    let value: T
+}
+
 @Observable
 @MainActor
 final class SMSViewModel {
@@ -28,19 +34,16 @@ final class SMSViewModel {
         isLoading = true
         error = nil
 
-        // Fetch messages — retry once on session expired
-        var messages = await fetchMessages()
-        if messages == nil, await authManager.reauthenticate() {
-            messages = await fetchMessages()
-        }
+        // Capacity is non-critical and independent, so let it fly alongside the list request.
+        async let capacityResult = self.fetchCapacity()
+        let messages = await fetchMessages()
 
         if let messages {
             allMessages = messages
             conversations = SMSParser.groupIntoConversations(messages)
         }
 
-        // Fetch capacity in parallel (non-critical)
-        if let cap = await fetchCapacity() {
+        if let cap = await capacityResult {
             capacity = cap
         }
 
@@ -56,12 +59,22 @@ final class SMSViewModel {
                 "tags": 10,
                 "order_by": "order by id desc"
             ])
-            return SMSParser.parseMessages(data)
+            return await Self.parseMessagesOffMain(data)
         } catch {
+            guard !error.isCancellation else { return nil }
             logger.error("fetchMessages: \(error.localizedDescription)")
             self.error = error.localizedDescription
             return nil
         }
+    }
+
+    /// A full page is 500 messages, each needing a UCS-2 decode and a date build. That is far
+    /// too much work to do between two frames, so it runs off the main actor.
+    private static func parseMessagesOffMain(_ data: [String: Any]) async -> [SMSMessage] {
+        let payload = UncheckedTransfer(value: data)
+        return await Task.detached(priority: .userInitiated) {
+            SMSParser.parseMessages(payload.value)
+        }.value
     }
 
     private func fetchCapacity() async -> SMSCapacity? {
@@ -69,6 +82,7 @@ final class SMSViewModel {
             let data = try await client.getJSON("/api/sms/capacity")
             return SMSParser.parseCapacity(data)
         } catch {
+            guard !error.isCancellation else { return nil }
             logger.warning("fetchCapacity: \(error.localizedDescription)")
             return nil
         }
@@ -97,9 +111,10 @@ final class SMSViewModel {
             await refresh()
             return true
         } catch {
+            isSending = false
+            guard !error.isCancellation else { return false }
             logger.error("sendSMS: \(error.localizedDescription)")
             self.error = "Failed to send: \(error.localizedDescription)"
-            isSending = false
             return false
         }
     }
@@ -114,6 +129,7 @@ final class SMSViewModel {
             logger.info("Deleted SMS ids: \(idStr)")
             await refresh()
         } catch {
+            guard !error.isCancellation else { return }
             logger.error("deleteMessages: \(error.localizedDescription)")
             self.error = "Delete failed: \(error.localizedDescription)"
         }
@@ -133,7 +149,8 @@ final class SMSViewModel {
         do {
             let _ = try await client.postJSON("/api/sms/read", body: ["id": idStr, "tag": 0])
             // Update local state without full refresh
-            for i in allMessages.indices where ids.contains(allMessages[i].id) {
+            let markedIds = Set(ids)
+            for i in allMessages.indices where markedIds.contains(allMessages[i].id) {
                 let msg = allMessages[i]
                 allMessages[i] = SMSMessage(
                     id: msg.id, number: msg.number, content: msg.content,
@@ -142,6 +159,7 @@ final class SMSViewModel {
             }
             conversations = SMSParser.groupIntoConversations(allMessages)
         } catch {
+            guard !error.isCancellation else { return }
             logger.warning("markAsRead: \(error.localizedDescription)")
         }
     }

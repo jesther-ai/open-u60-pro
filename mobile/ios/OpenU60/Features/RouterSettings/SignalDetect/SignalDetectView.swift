@@ -1,7 +1,13 @@
 import SwiftUI
 
 struct SignalDetectView: View {
-    var viewModel: SignalDetectViewModel
+    /// Owned as `@State` so a re-evaluated `NavigationLink` destination cannot replace the view
+    /// model (and lose the running sweep) while the screen is on screen.
+    @State private var viewModel: SignalDetectViewModel
+
+    init(viewModel: SignalDetectViewModel) {
+        _viewModel = State(initialValue: viewModel)
+    }
 
     var body: some View {
         List {
@@ -23,6 +29,8 @@ struct SignalDetectView: View {
                             .foregroundStyle(.secondary)
                     }
                     ProgressView(value: Double(viewModel.status.progress), total: 100)
+                        .accessibilityLabel("Detection progress")
+                        .accessibilityValue("\(viewModel.status.progress) percent")
 
                     Button("Stop Detection", role: .destructive) {
                         Task { await viewModel.stopDetection() }
@@ -58,11 +66,14 @@ struct SignalDetectView: View {
                                 .foregroundStyle(.tertiary)
                         }
                         .padding(.vertical, 2)
+                        .accessibilityElement(children: .combine)
                     }
                 }
             }
         }
         .navigationTitle("Signal Detection")
+        .task { await viewModel.resumeIfRunning() }
+        .onDisappear { viewModel.stopPolling() }
         .overlay {
             if viewModel.isLoading {
                 ProgressView()

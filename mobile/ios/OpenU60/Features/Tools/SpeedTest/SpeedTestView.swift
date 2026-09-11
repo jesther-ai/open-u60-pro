@@ -1,7 +1,13 @@
 import SwiftUI
 
 struct SpeedTestView: View {
-    @Bindable var viewModel: SpeedTestViewModel
+    /// Owned as `@State` so a re-evaluated `NavigationLink` destination cannot replace the view
+    /// model (and lose the running test) while the screen is on screen.
+    @State private var viewModel: SpeedTestViewModel
+
+    init(viewModel: SpeedTestViewModel) {
+        _viewModel = State(initialValue: viewModel)
+    }
 
     var body: some View {
         List {
@@ -35,6 +41,8 @@ struct SpeedTestView: View {
                             .animation(.default, value: viewModel.progress.progress)
                     }
                     ProgressView(value: Double(viewModel.progress.progress), total: 100)
+                        .accessibilityLabel(phaseLabel)
+                        .accessibilityValue("\(viewModel.progress.progress) percent")
 
                     HStack {
                         Spacer()
@@ -57,6 +65,9 @@ struct SpeedTestView: View {
                         Spacer()
                     }
                     .padding(.vertical, 8)
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel("Current speed")
+                    .accessibilityValue(String(format: "%.1f megabits per second", viewModel.progress.liveSpeedMbps))
 
                     Button("Stop Test", role: .destructive) {
                         Task { await viewModel.stopTest() }
@@ -95,7 +106,11 @@ struct SpeedTestView: View {
             }
         }
         .navigationTitle("Speed Test")
-        .task { await viewModel.loadServers() }
+        .task {
+            await viewModel.loadServers()
+            await viewModel.resumeIfRunning()
+        }
+        .onDisappear { viewModel.stopPolling() }
         .overlay {
             if viewModel.isLoading && !viewModel.isRunning {
                 ProgressView()

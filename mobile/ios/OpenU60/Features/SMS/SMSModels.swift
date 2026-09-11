@@ -42,7 +42,7 @@ struct SMSMessage: Identifiable, Sendable {
 
 // MARK: - SMS Conversation
 
-struct SMSConversation: Identifiable {
+struct SMSConversation: Identifiable, Sendable {
     var id: String { normalizedNumber }
     let normalizedNumber: String
     let number: String
@@ -54,7 +54,7 @@ struct SMSConversation: Identifiable {
 
 // MARK: - SMS Capacity
 
-struct SMSCapacity {
+struct SMSCapacity: Sendable {
     let nvTotal: Int
     let nvUsed: Int
     let simTotal: Int
@@ -68,68 +68,114 @@ struct SMSCapacity {
 
 enum SMSParser {
 
-    /// Decode UCS-2 hex string (UTF-16BE, 4 hex chars per character) to readable text.
+    // MARK: Shared immutable helpers
+
+    /// Hoisted out of the per-message path: constructing a `Calendar` costs more than the
+    /// date arithmetic it performs, and `parseMessages` runs it up to 500 times per refresh.
+    private static let utcCalendar: Calendar = {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(identifier: "UTC") ?? .gmt
+        return calendar
+    }()
+
+    private static let gregorianCalendar = Calendar(identifier: .gregorian)
+
+    /// GSM 7-bit default alphabet. Anything outside it forces UCS-2 on send.
+    private static let gsm7Alphabet = CharacterSet(charactersIn:
+        "@£$¥èéùìòÇ\nØø\rÅåΔ_ΦΓΛΩΠΨΣΘΞ ÆæßÉ" +
+        " !\"#¤%&'()*+,-./0123456789:;<=>?" +
+        "¡ABCDEFGHIJKLMNOPQRSTUVWXYZ" +
+        "ÄÖÑÜabcdefghijklmnopqrstuvwxyz" +
+        "äöñüà§")
+
+    private static let hexDigits: [Character] = Array("0123456789ABCDEF")
+
+    // MARK: UCS-2
+
+    /// Decode UCS-2 hex string (UTF-16BE, 4 hex chars per code unit) to readable text.
+    ///
+    /// Accumulates UTF-16 code units rather than scalars so surrogate pairs survive: decoding
+    /// each quad to a `Unicode.Scalar` individually fails for the D800–DFFF range and silently
+    /// erases every emoji and non-BMP character. Quads that are not valid hex are skipped, which
+    /// leaves plain GSM-7 bodies decoding to "" so `parseMessages` falls back to the raw text.
     static func decodeUCS2Hex(_ hex: String) -> String {
-        var result = ""
-        let chars = Array(hex)
-        var i = 0
-        while i + 3 < chars.count {
-            let hexStr = String(chars[i...i+3])
-            if let scalar = UInt32(hexStr, radix: 16), let unicode = Unicode.Scalar(scalar) {
-                result.append(Character(unicode))
+        var units: [UInt16] = []
+        units.reserveCapacity(hex.utf8.count / 4)
+
+        var unit: UInt16 = 0
+        var digitsInQuad = 0
+        var quadIsHex = true
+
+        for byte in hex.utf8 {
+            if let digit = hexDigit(byte) {
+                unit = (unit << 4) | digit
+            } else {
+                quadIsHex = false
             }
-            i += 4
+            digitsInQuad += 1
+            if digitsInQuad == 4 {
+                if quadIsHex { units.append(unit) }
+                unit = 0
+                digitsInQuad = 0
+                quadIsHex = true
+            }
         }
-        return result
+
+        return String(decoding: units, as: UTF16.self)
+    }
+
+    private static func hexDigit(_ byte: UInt8) -> UInt16? {
+        switch byte {
+        case 0x30...0x39: return UInt16(byte - 0x30)        // 0-9
+        case 0x41...0x46: return UInt16(byte - 0x41) + 10   // A-F
+        case 0x61...0x66: return UInt16(byte - 0x61) + 10   // a-f
+        default: return nil
+        }
     }
 
     /// Encode text to UCS-2 hex string (UTF-16BE).
     static func encodeUCS2Hex(_ text: String) -> String {
-        text.utf16.map { String(format: "%04X", $0) }.joined()
+        var result = ""
+        result.reserveCapacity(text.utf16.count * 4)
+        for unit in text.utf16 {
+            result.append(hexDigits[Int((unit >> 12) & 0xF)])
+            result.append(hexDigits[Int((unit >> 8) & 0xF)])
+            result.append(hexDigits[Int((unit >> 4) & 0xF)])
+            result.append(hexDigits[Int(unit & 0xF)])
+        }
+        return result
     }
+
+    // MARK: Dates
 
     /// Parse ZTE date format "YY,MM,DD,HH,MM,SS,TZ" to Date.
     static func parseSMSDate(_ dateStr: String) -> Date {
-        let parts = dateStr.split(separator: ",").map(String.init)
+        let parts = dateStr.split(separator: ",")
         guard parts.count >= 6 else { return Date() }
 
-        var calendar = Calendar(identifier: .gregorian)
-        calendar.timeZone = TimeZone(identifier: "UTC")!
-
-        let year = (Int(parts[0]) ?? 0) + 2000
-        let month = Int(parts[1]) ?? 1
-        let day = Int(parts[2]) ?? 1
-        let hour = Int(parts[3]) ?? 0
-        let minute = Int(parts[4]) ?? 0
-        let second = Int(parts[5]) ?? 0
-
         var components = DateComponents()
-        components.year = year
-        components.month = month
-        components.day = day
-        components.hour = hour
-        components.minute = minute
-        components.second = second
+        components.year = (Int(parts[0]) ?? 0) + 2000
+        components.month = Int(parts[1]) ?? 1
+        components.day = Int(parts[2]) ?? 1
+        components.hour = Int(parts[3]) ?? 0
+        components.minute = Int(parts[4]) ?? 0
+        components.second = Int(parts[5]) ?? 0
 
         // Parse timezone offset if present (e.g. "+0", "+32" = +8h in quarter-hours)
-        if parts.count >= 7 {
-            let tzStr = parts[6].trimmingCharacters(in: .whitespaces)
-            if let quarters = Int(tzStr) {
-                let offsetSeconds = quarters * 15 * 60
-                components.timeZone = TimeZone(secondsFromGMT: offsetSeconds)
-            }
+        if parts.count >= 7,
+           let quarters = Int(parts[6].trimmingCharacters(in: .whitespaces)) {
+            components.timeZone = TimeZone(secondsFromGMT: quarters * 15 * 60)
         }
 
-        return calendar.date(from: components) ?? Date()
+        return utcCalendar.date(from: components) ?? Date()
     }
 
     /// Format current time in ZTE SMS send format (semicolons, tz in hours).
     /// JS: "YY;MM;DD;HH;MM;SS;+TZ" where TZ is offset in hours.
     static func formatSMSTime() -> String {
         let now = Date()
-        let calendar = Calendar(identifier: .gregorian)
         let tz = TimeZone.current
-        let comps = calendar.dateComponents(in: tz, from: now)
+        let comps = gregorianCalendar.dateComponents(in: tz, from: now)
 
         let year = (comps.year ?? 2026) % 100
         let offsetHours = tz.secondsFromGMT() / 3600
@@ -140,33 +186,38 @@ enum SMSParser {
                       comps.hour ?? 0, comps.minute ?? 0, comps.second ?? 0, tzStr)
     }
 
+    // MARK: Senders
+
     /// Determine encode type for sending.
     static func getEncodeType(_ text: String) -> String {
-        // Check if all characters are in GSM 7-bit default alphabet
-        let gsm7 = CharacterSet(charactersIn:
-            "@£$¥èéùìòÇ\nØø\rÅåΔ_ΦΓΛΩΠΨΣΘΞ ÆæßÉ" +
-            " !\"#¤%&'()*+,-./0123456789:;<=>?" +
-            "¡ABCDEFGHIJKLMNOPQRSTUVWXYZ" +
-            "ÄÖÑÜabcdefghijklmnopqrstuvwxyz" +
-            "äöñüà§")
-        if text.unicodeScalars.allSatisfy({ gsm7.contains($0) }) {
+        if text.unicodeScalars.allSatisfy({ gsm7Alphabet.contains($0) }) {
             return "GSM7_default"
         }
         return "UNICODE"
     }
 
-    /// Normalize phone number to last 8 digits for conversation grouping.
+    /// Normalize a sender into a conversation key.
+    ///
+    /// Numeric senders collapse to their last 8 digits so that "+1 555 010 1234",
+    /// "5550101234" and "005550101234" share one thread. Alphanumeric sender IDs
+    /// ("AMAZON", "VM-HDFCBK") contain no meaningful digits, so they keep their own
+    /// case-folded identity — stripping to digits would merge every bank, carrier and
+    /// marketing sender into a single empty-keyed conversation.
     static func normalizeNumber(_ number: String) -> String {
-        let digits = number.filter(\.isNumber)
-        if digits.count > 8 {
-            return String(digits.suffix(8))
+        let trimmed = number.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.contains(where: \.isLetter) {
+            return trimmed.uppercased()
         }
-        return digits
+
+        let digits = trimmed.filter(\.isNumber)
+        guard !digits.isEmpty else { return trimmed }
+        return digits.count > 8 ? String(digits.suffix(8)) : digits
     }
 
-    /// Group messages into conversations by normalized phone number.
+    /// Group messages into conversations by normalized sender.
     static func groupIntoConversations(_ messages: [SMSMessage]) -> [SMSConversation] {
         var grouped: [String: [SMSMessage]] = [:]
+        grouped.reserveCapacity(messages.count)
 
         for msg in messages {
             let key = normalizeNumber(msg.number)
@@ -176,9 +227,11 @@ enum SMSParser {
         return grouped.map { key, msgs in
             let sorted = msgs.sorted { $0.date < $1.date }
             let latest = sorted.last!
-            let unread = msgs.filter { $0.tag == .unread }.count
+            let unread = msgs.reduce(into: 0) { count, msg in
+                if msg.tag == .unread { count += 1 }
+            }
             // Use the longest number variant as display number
-            let displayNumber = msgs.map(\.number).max(by: { $0.count < $1.count }) ?? latest.number
+            let displayNumber = msgs.max(by: { $0.number.count < $1.number.count })?.number ?? latest.number
 
             return SMSConversation(
                 normalizedNumber: key,

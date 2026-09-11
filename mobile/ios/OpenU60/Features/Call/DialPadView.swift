@@ -3,7 +3,7 @@ import SwiftUI
 struct DialPadView: View {
     var onDigit: (String) -> Void
 
-    private let rows: [[DialKey]] = [
+    private static let rows: [[DialKey]] = [
         [.init("1", sub: ""), .init("2", sub: "ABC"), .init("3", sub: "DEF")],
         [.init("4", sub: "GHI"), .init("5", sub: "JKL"), .init("6", sub: "MNO")],
         [.init("7", sub: "PQRS"), .init("8", sub: "TUV"), .init("9", sub: "WXYZ")],
@@ -12,7 +12,7 @@ struct DialPadView: View {
 
     var body: some View {
         Grid(horizontalSpacing: 24, verticalSpacing: 16) {
-            ForEach(rows, id: \.self) { row in
+            ForEach(Self.rows, id: \.self) { row in
                 GridRow {
                     ForEach(row) { key in
                         Button {
@@ -32,6 +32,7 @@ struct DialPadView: View {
                             .background(.fill.tertiary, in: Circle())
                         }
                         .buttonStyle(.plain)
+                        .accessibilityLabel(key.digit)
                     }
                 }
             }

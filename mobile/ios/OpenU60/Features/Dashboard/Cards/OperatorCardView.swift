@@ -1,6 +1,6 @@
 import SwiftUI
 
-struct OperatorCardView: View {
+struct OperatorCardView: View, Equatable {
     let operatorInfo: OperatorInfo
     let nrSignal: NRSignal
     let lteSignal: LTESignal

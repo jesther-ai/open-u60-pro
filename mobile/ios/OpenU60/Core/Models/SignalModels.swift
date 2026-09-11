@@ -81,7 +81,7 @@ struct OperatorInfo: Equatable {
 
     var networkMode: NetworkMode {
         let raw = networkType.uppercased()
-        if raw == "SA" || raw == "5G SA" || raw.contains("NR SA") { return .sa }
+        if raw == "SA" || raw.contains("5G SA") || raw.contains("NR SA") || raw.contains("NR-SA") { return .sa }
         if raw.contains("NSA") || raw == "ENDC" || raw == "EN-DC" { return .nsa }
         if raw.contains("LTE") || raw == "4G" || raw == "4G+" { return .lte }
         if raw.contains("WCDMA") || raw.contains("UMTS") || raw.contains("GSM")
@@ -134,16 +134,13 @@ struct OperatorInfo: Equatable {
 }
 
 struct SignalSnapshot: Identifiable, Equatable {
-    private static var nextID: Int = 0
-    let id: Int
+    let id = UUID()
     let timestamp: Date
     let nrRSRP: Double?
     let lteRSRP: Double?
     let wcdmaRSCP: Double?
 
     init(timestamp: Date, nrRSRP: Double?, lteRSRP: Double?, wcdmaRSCP: Double? = nil) {
-        self.id = Self.nextID
-        Self.nextID += 1
         self.timestamp = timestamp
         self.nrRSRP = nrRSRP
         self.lteRSRP = lteRSRP
@@ -153,11 +150,20 @@ struct SignalSnapshot: Identifiable, Equatable {
 
 /// Parser that extracts signal data from the agent nwinfo_get_netinfo response.
 enum SignalParser {
+
+    /// One entry of an `lteca` / `nrca` list: "PCI,Band,Index,EARFCN,BW".
+    private typealias CarrierEntry = (pci: String, band: String, earfcn: String, bandwidth: String)
+
+    /// One entry of an `ltecasig` / `nrcasig` list: "RSRP,RSRQ,SINR,RSSI,...".
+    private typealias CarrierSignal = (rsrp: Double?, rsrq: Double?, sinr: Double?, rssi: Double?)
+
     static func parseNetInfo(_ data: [String: Any]) -> (NRSignal, LTESignal, WCDMASignal, OperatorInfo) {
         var nr = NRSignal()
         var lte = LTESignal()
         var wcdma = WCDMASignal()
         var op = OperatorInfo()
+
+        let nrcaStr = stringVal(data["nrca"])
 
         nr.rsrp = parseDouble(data["nr5g_rsrp"]).flatMap { $0 == 0 ? nil : $0 }
         nr.rsrq = parseDouble(data["nr5g_rsrq"])
@@ -168,60 +174,16 @@ enum SignalParser {
         nr.cellID = stringVal(data["nr5g_cell_id"])
         nr.channel = stringVal(data["nr5g_action_channel"])
         nr.bandwidth = stringVal(data["nr5g_bandwidth"])
-        nr.carrierAggregation = stringVal(data["nrca"])
+        nr.carrierAggregation = nrcaStr
 
-        // Parse nrca: "PCI,Band,Index,EARFCN,BW;..." — same format as lteca
-        let nrcaStr = stringVal(data["nrca"])
-        var nrCarriers: [(pci: String, band: String, earfcn: String, bandwidth: String)] = []
-        for entry in nrcaStr.trimmingCharacters(in: CharacterSet(charactersIn: ";")).split(separator: ";") {
-            let parts = entry.split(separator: ",").map(String.init)
-            if parts.count >= 5 {
-                nrCarriers.append((pci: parts[0], band: parts[1], earfcn: parts[3], bandwidth: parts[4]))
-            }
-        }
-
-        // Parse nrcasig: "RSRP,RSRQ,SINR,RSSI,...;..."
-        let nrcasigStr = stringVal(data["nrcasig"])
-        var nrSccSigs: [(rsrp: Double?, rsrq: Double?, sinr: Double?, rssi: Double?)] = []
-        for entry in nrcasigStr.trimmingCharacters(in: CharacterSet(charactersIn: ";")).split(separator: ";") {
-            let parts = entry.split(separator: ",").map(String.init)
-            if parts.count >= 4 {
-                nrSccSigs.append((
-                    rsrp: Double(parts[0].trimmingCharacters(in: .whitespaces)),
-                    rsrq: Double(parts[1].trimmingCharacters(in: .whitespaces)),
-                    sinr: Double(parts[2].trimmingCharacters(in: .whitespaces)),
-                    rssi: Double(parts[3].trimmingCharacters(in: .whitespaces))
-                ))
-            }
-        }
-
-        // Match NR PCC by PCI+channel, remainder = SCCs
-        let nrPccPci = nr.pci
-        let nrPccChannel = nr.channel
-        var nrSccEntries: [(pci: String, band: String, earfcn: String, bandwidth: String)] = []
-        var nrPccFound = false
-        for c in nrCarriers {
-            if !nrPccFound && c.pci == nrPccPci && c.earfcn == nrPccChannel && !nrPccPci.isEmpty {
-                if !c.bandwidth.isEmpty { nr.bandwidth = c.bandwidth }
-                nrPccFound = true
-            } else {
-                nrSccEntries.append(c)
-            }
-        }
-
-        // Build NR SCC carriers with signals
-        var nrSccCarriers: [LTECarrier] = []
-        for (i, sc) in nrSccEntries.enumerated() {
-            var carrier = LTECarrier(label: "5G SCC\(i)", pci: sc.pci, band: sc.band, earfcn: sc.earfcn, bandwidth: sc.bandwidth)
-            if i < nrSccSigs.count {
-                carrier.rsrp = nrSccSigs[i].rsrp
-                carrier.rsrq = nrSccSigs[i].rsrq
-                carrier.sinr = nrSccSigs[i].sinr
-                carrier.rssi = nrSccSigs[i].rssi
-            }
-            nrSccCarriers.append(carrier)
-        }
-        nr.sccCarriers = nrSccCarriers
+        // nrca/nrcasig use the same wire format as lteca/ltecasig.
+        let nrSplit = splitPCC(parseCarriers(nrcaStr), pci: nr.pci, channel: nr.channel)
+        if let pccBandwidth = nrSplit.pccBandwidth { nr.bandwidth = pccBandwidth }
+        nr.sccCarriers = makeCarriers(
+            nrSplit.sccs,
+            signals: parseCarrierSignals(stringVal(data["nrcasig"])),
+            labelPrefix: "5G SCC"
+        )
 
         let pccPci = stringVal(data["lte_pci"])
         let pccEarfcn = stringVal(data["wan_active_channel"])
@@ -235,57 +197,16 @@ enum SignalParser {
         lte.cellID = stringVal(data["cell_id"])
         lte.caState = stringVal(data["lteca_state"])
 
-        // Parse lteca: "PCI,Band,Index,EARFCN,BW;..."
         let ltecaStr = stringVal(data["lteca"])
         lte.carrierAggregation = ltecaStr
-        var carriers: [(pci: String, band: String, earfcn: String, bandwidth: String)] = []
-        for entry in ltecaStr.trimmingCharacters(in: CharacterSet(charactersIn: ";")).split(separator: ";") {
-            let parts = entry.split(separator: ",").map(String.init)
-            if parts.count >= 5 {
-                carriers.append((pci: parts[0], band: parts[1], earfcn: parts[3], bandwidth: parts[4]))
-            }
-        }
 
-        // Parse ltecasig: "RSRP,RSRQ,SINR,RSSI,...;..."
-        let ltecasigStr = stringVal(data["ltecasig"])
-        var sccSigs: [(rsrp: Double?, rsrq: Double?, sinr: Double?, rssi: Double?)] = []
-        for entry in ltecasigStr.trimmingCharacters(in: CharacterSet(charactersIn: ";")).split(separator: ";") {
-            let parts = entry.split(separator: ",").map(String.init)
-            if parts.count >= 4 {
-                sccSigs.append((
-                    rsrp: Double(parts[0].trimmingCharacters(in: .whitespaces)),
-                    rsrq: Double(parts[1].trimmingCharacters(in: .whitespaces)),
-                    sinr: Double(parts[2].trimmingCharacters(in: .whitespaces)),
-                    rssi: Double(parts[3].trimmingCharacters(in: .whitespaces))
-                ))
-            }
-        }
-
-        // Match PCC by PCI+EARFCN, remainder = SCCs
-        var sccEntries: [(pci: String, band: String, earfcn: String, bandwidth: String)] = []
-        var pccFound = false
-        for c in carriers {
-            if !pccFound && c.pci == pccPci && c.earfcn == pccEarfcn && !pccPci.isEmpty {
-                if !c.bandwidth.isEmpty { lte.bandwidth = c.bandwidth }
-                pccFound = true
-            } else {
-                sccEntries.append(c)
-            }
-        }
-
-        // Build SCC carriers with signals
-        var sccCarriers: [LTECarrier] = []
-        for (i, sc) in sccEntries.enumerated() {
-            var carrier = LTECarrier(label: "SCC\(i)", pci: sc.pci, band: sc.band, earfcn: sc.earfcn, bandwidth: sc.bandwidth)
-            if i < sccSigs.count {
-                carrier.rsrp = sccSigs[i].rsrp
-                carrier.rsrq = sccSigs[i].rsrq
-                carrier.sinr = sccSigs[i].sinr
-                carrier.rssi = sccSigs[i].rssi
-            }
-            sccCarriers.append(carrier)
-        }
-        lte.sccCarriers = sccCarriers
+        let lteSplit = splitPCC(parseCarriers(ltecaStr), pci: pccPci, channel: pccEarfcn)
+        if let pccBandwidth = lteSplit.pccBandwidth { lte.bandwidth = pccBandwidth }
+        lte.sccCarriers = makeCarriers(
+            lteSplit.sccs,
+            signals: parseCarrierSignals(stringVal(data["ltecasig"])),
+            labelPrefix: "SCC"
+        )
 
         wcdma.rscp = parseDouble(data["rscp"]).flatMap { $0 == 0 ? nil : $0 }
         wcdma.ecio = parseDouble(data["ecio"])
@@ -296,6 +217,87 @@ enum SignalParser {
         op.roaming = stringVal(data["simcard_roam"]) == "1"
 
         return (nr, lte, wcdma, op)
+    }
+
+    // MARK: - Carrier lists
+
+    /// `split` already omits empty subsequences, so leading/trailing/repeated separators need
+    /// no pre-trimming.
+    private static func parseCarriers(_ raw: String) -> [CarrierEntry] {
+        var entries: [CarrierEntry] = []
+        for entry in raw.split(separator: ";") {
+            let parts = entry.split(separator: ",")
+            guard parts.count >= 5 else { continue }
+            entries.append((
+                pci: String(parts[0]),
+                band: String(parts[1]),
+                earfcn: String(parts[3]),
+                bandwidth: String(parts[4])
+            ))
+        }
+        return entries
+    }
+
+    private static func parseCarrierSignals(_ raw: String) -> [CarrierSignal] {
+        var signals: [CarrierSignal] = []
+        for entry in raw.split(separator: ";") {
+            let parts = entry.split(separator: ",")
+            guard parts.count >= 4 else { continue }
+            signals.append((
+                rsrp: parseField(parts[0]),
+                rsrq: parseField(parts[1]),
+                sinr: parseField(parts[2]),
+                rssi: parseField(parts[3])
+            ))
+        }
+        return signals
+    }
+
+    /// Separates the primary carrier — matched on PCI plus channel — from the secondaries.
+    /// - Returns: the PCC's own bandwidth when the firmware reported one, and the rest.
+    private static func splitPCC(_ carriers: [CarrierEntry], pci: String, channel: String)
+        -> (pccBandwidth: String?, sccs: [CarrierEntry]) {
+        var pccBandwidth: String?
+        var sccs: [CarrierEntry] = []
+        var pccFound = false
+        for carrier in carriers {
+            if !pccFound && !pci.isEmpty && carrier.pci == pci && carrier.earfcn == channel {
+                if !carrier.bandwidth.isEmpty { pccBandwidth = carrier.bandwidth }
+                pccFound = true
+            } else {
+                sccs.append(carrier)
+            }
+        }
+        return (pccBandwidth, sccs)
+    }
+
+    private static func makeCarriers(_ entries: [CarrierEntry], signals: [CarrierSignal], labelPrefix: String) -> [LTECarrier] {
+        entries.enumerated().map { index, entry in
+            var carrier = LTECarrier(
+                label: "\(labelPrefix)\(index)",
+                pci: entry.pci,
+                band: entry.band,
+                earfcn: entry.earfcn,
+                bandwidth: entry.bandwidth
+            )
+            if index < signals.count {
+                carrier.rsrp = signals[index].rsrp
+                carrier.rsrq = signals[index].rsrq
+                carrier.sinr = signals[index].sinr
+                carrier.rssi = signals[index].rssi
+            }
+            return carrier
+        }
+    }
+
+    // MARK: - Scalars
+
+    /// Parses one CSV field in place, without materialising a `String` for it.
+    private static func parseField(_ field: Substring) -> Double? {
+        var slice = field
+        while let first = slice.first, first.isWhitespace { slice.removeFirst() }
+        while let last = slice.last, last.isWhitespace { slice.removeLast() }
+        return Double(slice)
     }
 
     private static func parseDouble(_ value: Any?) -> Double? {

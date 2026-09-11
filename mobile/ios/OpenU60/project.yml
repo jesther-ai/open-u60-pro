@@ -4,23 +4,24 @@ options:
   bundleIdPrefix: com.openu60
   deploymentTarget:
     iOS: "17.0"
-  xcodeVersion: "16.0"
+  xcodeVersion: "26.6"
   generateEmptyDirectories: true
 
 settings:
   base:
-    SWIFT_VERSION: "5.9"
+    # Language mode, independent of the Swift compiler bundled with Xcode.
+    SWIFT_VERSION: "5.0"
 
 targets:
   OpenU60:
     type: application
     platform: iOS
     sources:
-      - path: .
-        excludes:
-          - project.yml
-          - build/
-          - "*.xcodeproj/"
+      - path: OpenU60App.swift
+      - path: Core
+      - path: Features
+      - path: Navigation
+      - path: Resources
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.openu60.app
