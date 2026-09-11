@@ -15,3 +15,7 @@ swiftc -module-cache-path "$test_dir/cache" \
     mobile/ios/OpenU60/Features/Dashboard/DashboardViewModel.swift \
     mobile/ios/Tests/DashboardTrafficTests.swift -o "$test_dir/dashboard-tests"
 "$test_dir/dashboard-tests"
+swiftc -module-cache-path "$test_dir/cache" \
+    "$models/DeviceModels.swift" "$models/RouterSettingsModels.swift" \
+    mobile/ios/Tests/BatteryStatusTests.swift -o "$test_dir/battery-tests"
+"$test_dir/battery-tests"
