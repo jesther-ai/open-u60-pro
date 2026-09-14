@@ -21,6 +21,8 @@
     <string name="dashboard_sim_pin_required">SIM PIN required</string>
     <string name="dashboard_nr_signal">NR Signal</string>
     <string name="dashboard_lte_signal">LTE Signal</string>
+    <string name="dashboard_wcdma_signal">3G Signal</string>
+    <string name="dashboard_signal">Signal</string>
     <string name="dashboard_no_signal">No signal</string>
     <string name="dashboard_excellent">Excellent</string>
     <string name="dashboard_good">Good</string>
@@ -36,6 +38,7 @@
     <string name="dashboard_more">more</string>
     <string name="dashboard_nr_band">NR Band</string>
     <string name="dashboard_lte_band">LTE Band</string>
+    <string name="dashboard_wcdma_band">3G WCDMA</string>
     <string name="dashboard_anchor">Anchor</string>
     <string name="settings_connection">Connection</string>
     <string name="settings_gateway_ip">Gateway IP</string>

@@ -1,16 +1,51 @@
 import SwiftUI
 
-struct SignalCardView: View {
+struct SignalCardView: View, Equatable {
     let operatorInfo: OperatorInfo
     let nrSignal: NRSignal
     let lteSignal: LTESignal
     var wcdmaSignal: WCDMASignal = .empty
     var isAirplaneMode: Bool = false
 
+    /// Everything that changes the card's *layout*, as opposed to the values inside it. Compares
+    /// the carrier fields that make up `LTECarrier.id` directly, so driving the animation no
+    /// longer builds an array of interpolated id strings on every body pass.
+    private struct LayoutKey: Equatable {
+        let showNR: Bool
+        let showLTE: Bool
+        let show3G: Bool
+        /// Swaps the placeholder between the airplane label and "No signal data", which is a
+        /// layout change of its own: it flips while every `show*` flag stays false.
+        let isAirplaneMode: Bool
+        let nrCarriers: [LTECarrier]
+        let lteCarriers: [LTECarrier]
+
+        static func == (lhs: LayoutKey, rhs: LayoutKey) -> Bool {
+            lhs.showNR == rhs.showNR
+                && lhs.showLTE == rhs.showLTE
+                && lhs.show3G == rhs.show3G
+                && lhs.isAirplaneMode == rhs.isAirplaneMode
+                && sameIdentity(lhs.nrCarriers, rhs.nrCarriers)
+                && sameIdentity(lhs.lteCarriers, rhs.lteCarriers)
+        }
+
+        private static func sameIdentity(_ lhs: [LTECarrier], _ rhs: [LTECarrier]) -> Bool {
+            lhs.count == rhs.count && zip(lhs, rhs).allSatisfy {
+                $0.label == $1.label && $0.band == $1.band
+                    && $0.pci == $1.pci && $0.earfcn == $1.earfcn
+            }
+        }
+    }
+
     var body: some View {
         let showNR = operatorInfo.showNR(nr: nrSignal)
         let showLTE = operatorInfo.showLTE(lte: lteSignal)
         let show3G = operatorInfo.show3G(nr: nrSignal, lte: lteSignal, wcdma: wcdmaSignal)
+        let layout = LayoutKey(
+            showNR: showNR, showLTE: showLTE, show3G: show3G,
+            isAirplaneMode: isAirplaneMode,
+            nrCarriers: nrSignal.sccCarriers, lteCarriers: lteSignal.sccCarriers
+        )
 
         CardView {
             VStack(alignment: .leading, spacing: 8) {
@@ -79,11 +114,7 @@ struct SignalCardView: View {
                     }
                 }
             }
-            .animation(.smooth, value: nrSignal.sccCarriers.map(\.id))
-            .animation(.smooth, value: lteSignal.sccCarriers.map(\.id))
-            .animation(.smooth, value: showNR)
-            .animation(.smooth, value: showLTE)
-            .animation(.smooth, value: show3G)
+            .animation(.smooth, value: layout)
         }
     }
 

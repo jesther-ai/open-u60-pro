@@ -27,6 +27,10 @@ final class ATTerminalViewModel {
 
     private let dangerousPatterns = ["CFUN=0", "CFUN=4", "+CRESET", "&F", "+NVWR", "+QPOWD", "+COPS="]
 
+    /// Modem responses are unbounded in size, so an untrimmed log is a slow leak in a screen the
+    /// user can leave open indefinitely. Only the manual Clear button used to trim it.
+    private static let historyLimit = 200
+
     init(client: AgentClient, authManager: AuthManager) {
         self.client = client
         self.authManager = authManager
@@ -47,7 +51,7 @@ final class ATTerminalViewModel {
         let cmd = currentCommand.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cmd.isEmpty else { return }
         guard cmd.uppercased().hasPrefix("AT") else {
-            history.insert(ATHistoryEntry(command: cmd, response: "Error: Command must start with AT", port: "", elapsedMs: 0, timestamp: Date(), isError: true), at: 0)
+            record(ATHistoryEntry(command: cmd, response: "Error: Command must start with AT", port: "", elapsedMs: 0, timestamp: Date(), isError: true))
             return
         }
 
@@ -77,11 +81,20 @@ final class ATTerminalViewModel {
             let response = data["response"] as? String ?? ""
             let port = data["port"] as? String ?? ""
             let elapsedMs = (data["elapsed_ms"] as? NSNumber)?.intValue ?? 0
-            history.insert(ATHistoryEntry(command: cmd, response: response, port: port, elapsedMs: elapsedMs, timestamp: Date(), isError: false), at: 0)
+            record(ATHistoryEntry(command: cmd, response: response, port: port, elapsedMs: elapsedMs, timestamp: Date(), isError: false))
         } catch {
-            history.insert(ATHistoryEntry(command: cmd, response: "Error: \(error.localizedDescription)", port: "", elapsedMs: 0, timestamp: Date(), isError: true), at: 0)
+            if !error.isCancellation {
+                record(ATHistoryEntry(command: cmd, response: "Error: \(error.localizedDescription)", port: "", elapsedMs: 0, timestamp: Date(), isError: true))
+            }
         }
         isLoading = false
+    }
+
+    private func record(_ entry: ATHistoryEntry) {
+        history.insert(entry, at: 0)
+        if history.count > Self.historyLimit {
+            history.removeLast(history.count - Self.historyLimit)
+        }
     }
 
     func clearHistory() {

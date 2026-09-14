@@ -1,8 +1,14 @@
 import SwiftUI
 
 struct CallView: View {
-    @Bindable var viewModel: CallViewModel
+    /// Owned as `@State` so a re-evaluation of the presenting `fullScreenCover` closure cannot
+    /// swap in a fresh view model (and a fresh poll loop) mid-call.
+    @State private var viewModel: CallViewModel
     @Environment(\.dismiss) private var dismiss
+
+    init(viewModel: CallViewModel) {
+        _viewModel = State(initialValue: viewModel)
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -46,6 +52,8 @@ struct CallView: View {
             }
         }
         .background(.background)
+        .task { await viewModel.syncWithRouter() }
+        .onDisappear { viewModel.stopPolling() }
     }
 
     // MARK: - Idle (Dialer)
@@ -67,6 +75,7 @@ struct CallView: View {
                             .font(.title2)
                             .foregroundStyle(.secondary)
                     }
+                    .accessibilityLabel("Delete last digit")
                 }
             }
             .frame(height: 44)
@@ -86,6 +95,7 @@ struct CallView: View {
                     .frame(width: 72, height: 72)
                     .background(.green, in: Circle())
             }
+            .accessibilityLabel("Call")
             .disabled(viewModel.phoneNumber.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
         }
     }
@@ -187,6 +197,7 @@ struct CallView: View {
                         .frame(width: 72, height: 72)
                         .background(.red, in: Circle())
                 }
+                .accessibilityLabel("Decline")
 
                 // Answer
                 Button {
@@ -198,6 +209,7 @@ struct CallView: View {
                         .frame(width: 72, height: 72)
                         .background(.green, in: Circle())
                 }
+                .accessibilityLabel("Answer")
             }
         }
         .padding(.top, 40)
@@ -215,6 +227,7 @@ struct CallView: View {
                 .frame(width: 72, height: 72)
                 .background(.red, in: Circle())
         }
+        .accessibilityLabel("End call")
         .padding(.bottom, 40)
     }
 

@@ -1,6 +1,6 @@
 import SwiftUI
 
-struct CPUCardView: View {
+struct CPUCardView: View, Equatable {
     let systemInfo: SystemInfo
     let thermal: ThermalStatus
 

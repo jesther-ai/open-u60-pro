@@ -12,6 +12,7 @@ struct USBModeSheetView: View {
                 Image(systemName: "cable.connector")
                     .font(.system(size: 64))
                     .foregroundStyle(.blue)
+                    .accessibilityHidden(true)
 
                 Text("USB-C Connected")
                     .font(.title2.bold())
@@ -52,12 +53,13 @@ struct USBModeSheetView: View {
                             }
                         }
                         .frame(maxWidth: .infinity)
-                        .frame(height: 44)
+                        .frame(minHeight: 44)
                     }
                     .buttonStyle(.borderedProminent)
                     .tint(.orange)
                     .padding(.horizontal, 40)
                     .disabled(viewModel.isLoading)
+                    .accessibilityLabel("Fast Charging")
 
                     Text("Charge your phone using the U60 Pro battery")
                         .font(.caption)

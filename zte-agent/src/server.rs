@@ -149,6 +149,8 @@ pub fn route(method: &Method, path: &str, state: &AppState, body: &[u8]) -> (u16
         (&Method::Put, "/api/device/power-save") => device_ext::device_power_save_set(state, body),
         (&Method::Get, "/api/device/fast-boot") => device_ext::device_fast_boot_get(state),
         (&Method::Put, "/api/device/fast-boot") => device_ext::device_fast_boot_set(state, body),
+        (&Method::Get, "/api/device/auto-sleep") => device_ext::device_auto_sleep_get(state),
+        (&Method::Put, "/api/device/auto-sleep") => device_ext::device_auto_sleep_set(state, body),
         // System — process monitor
         (&Method::Get, "/api/system/top") => handlers::system_top(state),
         (&Method::Post, "/api/system/kill-bloat") => handlers::system_kill_bloat(state, body),

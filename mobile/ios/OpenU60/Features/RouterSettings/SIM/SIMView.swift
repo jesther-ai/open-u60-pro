@@ -32,6 +32,7 @@ struct SIMView: View {
                     Button {
                         viewModel.pinSheetAction = .verify
                         viewModel.pinInput = ""
+                        viewModel.sheetError = nil
                         viewModel.showEnterPinSheet = true
                     } label: {
                         Text("Enter PIN")
@@ -58,6 +59,7 @@ struct SIMView: View {
                     Button {
                         viewModel.pukInput = ""
                         viewModel.newPinInput = ""
+                        viewModel.sheetError = nil
                         viewModel.showEnterPukSheet = true
                     } label: {
                         Text("Enter PUK")
@@ -105,6 +107,7 @@ struct SIMView: View {
                         Button {
                             viewModel.pinSheetAction = .disableLock
                             viewModel.pinInput = ""
+                            viewModel.sheetError = nil
                             viewModel.showEnterPinSheet = true
                         } label: {
                             Label("Disable PIN Lock", systemImage: "lock.open")
@@ -113,6 +116,7 @@ struct SIMView: View {
                         Button {
                             viewModel.pinSheetAction = .enableLock
                             viewModel.pinInput = ""
+                            viewModel.sheetError = nil
                             viewModel.showEnterPinSheet = true
                         } label: {
                             Label("Enable PIN Lock", systemImage: "lock")
@@ -122,6 +126,7 @@ struct SIMView: View {
                     Button {
                         viewModel.oldPinInput = ""
                         viewModel.newPinInput = ""
+                        viewModel.sheetError = nil
                         viewModel.showChangePinSheet = true
                     } label: {
                         Label("Change PIN", systemImage: "pencil")
@@ -141,6 +146,7 @@ struct SIMView: View {
                 if viewModel.lockInfo.availableTrials > 0 {
                     Button {
                         viewModel.nckInput = ""
+                        viewModel.sheetError = nil
                         viewModel.showUnlockSheet = true
                     } label: {
                         Label("Enter Unlock Code", systemImage: "lock.open")
@@ -257,6 +263,18 @@ struct SIMView: View {
 
 // MARK: - Sheets
 
+/// Renders a failed attempt inside the presented sheet; `SIMView`'s own message row is behind it.
+private struct SheetErrorFooter: View {
+    let message: String?
+
+    var body: some View {
+        if let message {
+            Text(message)
+                .foregroundStyle(.red)
+        }
+    }
+}
+
 struct ChangePinSheet: View {
     @Bindable var viewModel: SIMViewModel
     @Environment(\.dismiss) private var dismiss
@@ -282,6 +300,8 @@ struct ChangePinSheet: View {
                             .frame(maxWidth: .infinity)
                     }
                     .disabled(viewModel.oldPinInput.count < 4 || viewModel.newPinInput.count < 4 || viewModel.isLoading)
+                } footer: {
+                    SheetErrorFooter(message: viewModel.sheetError)
                 }
             }
             .navigationTitle("Change PIN")
@@ -322,8 +342,11 @@ struct EnterPinSheet: View {
                     SecureField("PIN", text: $viewModel.pinInput)
                         .keyboardType(.numberPad)
                 } footer: {
-                    if viewModel.pinSheetAction == .verify {
-                        Text("\(viewModel.simInfo.pinAttempts) attempts remaining")
+                    VStack(alignment: .leading, spacing: 4) {
+                        if viewModel.pinSheetAction == .verify {
+                            Text("\(viewModel.simInfo.pinAttempts) attempts remaining")
+                        }
+                        SheetErrorFooter(message: viewModel.sheetError)
                     }
                 }
 
@@ -359,7 +382,10 @@ struct EnterPukSheet: View {
                     SecureField("PUK Code", text: $viewModel.pukInput)
                         .keyboardType(.numberPad)
                 } footer: {
-                    Text("\(viewModel.simInfo.pukAttempts) attempts remaining")
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("\(viewModel.simInfo.pukAttempts) attempts remaining")
+                        SheetErrorFooter(message: viewModel.sheetError)
+                    }
                 }
 
                 Section("New PIN") {
@@ -400,7 +426,10 @@ struct UnlockSIMSheet: View {
                         .autocorrectionDisabled()
                         .textInputAutocapitalization(.never)
                 } footer: {
-                    Text("\(viewModel.lockInfo.availableTrials) attempts remaining")
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("\(viewModel.lockInfo.availableTrials) attempts remaining")
+                        SheetErrorFooter(message: viewModel.sheetError)
+                    }
                 }
 
                 Section {

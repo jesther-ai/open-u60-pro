@@ -4,6 +4,7 @@ struct SMSConversationView: View {
     var viewModel: SMSViewModel
     let conversation: SMSConversation
     @State private var messageText = ""
+    @State private var sendFailure: String?
     @FocusState private var isInputFocused: Bool
 
     private var messages: [SMSMessage] {
@@ -19,22 +20,31 @@ struct SMSConversationView: View {
                             SMSBubbleView(message: message)
                                 .id(message.id)
                         }
-                        // Invisible anchor for scrolling
-                        Color.clear
-                            .frame(height: 1)
-                            .id("bottom")
                     }
                     .padding(.horizontal, 12)
                     .padding(.vertical, 8)
                 }
-                .onAppear {
-                    proxy.scrollTo("bottom", anchor: .bottom)
-                }
+                // Lands on the newest message at first layout, unlike an onAppear scrollTo
+                // that fires before the LazyVStack has materialized its rows.
+                .defaultScrollAnchor(.bottom)
                 .onChange(of: messages.count) {
+                    guard let lastId = messages.last?.id else { return }
                     withAnimation {
-                        proxy.scrollTo("bottom", anchor: .bottom)
+                        proxy.scrollTo(lastId, anchor: .bottom)
                     }
                 }
+            }
+
+            if let sendFailure {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                    Text(sendFailure)
+                    Spacer(minLength: 0)
+                }
+                .font(.caption)
+                .foregroundStyle(.red)
+                .padding(.horizontal, 12)
+                .padding(.bottom, 4)
             }
 
             Divider()
@@ -51,14 +61,22 @@ struct SMSConversationView: View {
 
                 Button {
                     let text = messageText
-                    messageText = ""
+                    guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+                    sendFailure = nil
                     Task {
-                        await viewModel.sendSMS(to: conversation.number, message: text)
+                        // Only clear the field once the agent accepted it, so a failed send
+                        // leaves the user's text intact to retry.
+                        if await viewModel.sendSMS(to: conversation.number, message: text) {
+                            messageText = ""
+                        } else {
+                            sendFailure = viewModel.error ?? "Message not sent"
+                        }
                     }
                 } label: {
                     Image(systemName: "arrow.up.circle.fill")
                         .font(.title2)
                 }
+                .accessibilityLabel("Send")
                 .disabled(messageText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || viewModel.isSending)
             }
             .padding(.horizontal, 12)
@@ -105,6 +123,7 @@ private struct SMSBubbleView: View {
                         Image(systemName: "exclamationmark.circle.fill")
                             .foregroundStyle(.red)
                             .font(.caption2)
+                            .accessibilityLabel("Not delivered")
                     }
                     Text(message.date, style: .time)
                         .font(.caption2)

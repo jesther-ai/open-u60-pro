@@ -15,11 +15,18 @@ struct ATTerminalView: View {
         ("AT+CLCC", "Active calls"),
     ]
 
-    private let timestampFormatter: DateFormatter = {
+    /// Fixed-format, so it needs a fixed locale — and `static` so it isn't rebuilt with the view.
+    private static let timestampFormatter: DateFormatter = {
         let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
         f.dateFormat = "HH:mm:ss"
         return f
     }()
+
+    private var portAccessibilityLabel: String {
+        guard let port = viewModel.portName else { return "No port detected" }
+        return viewModel.portAvailable ? "Port \(port) available" : "Port \(port) unavailable"
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -28,9 +35,11 @@ struct ATTerminalView: View {
                 Circle()
                     .fill(viewModel.portAvailable ? .green : .red)
                     .frame(width: 10, height: 10)
+                    .accessibilityHidden(true)
                 Text(viewModel.portName ?? "No port detected")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                    .accessibilityLabel(portAccessibilityLabel)
                 Spacer()
                 if !viewModel.history.isEmpty {
                     Button("Clear") {
@@ -100,6 +109,7 @@ struct ATTerminalView: View {
                             .foregroundStyle(.secondary)
                         Stepper("\(viewModel.timeout)s", value: $viewModel.timeout, in: 1...30)
                             .labelsHidden()
+                            .accessibilityLabel("Command timeout in seconds")
                         Text("\(viewModel.timeout)s")
                             .font(.caption.monospacedDigit())
                             .frame(width: 28, alignment: .trailing)
@@ -128,6 +138,7 @@ struct ATTerminalView: View {
                         }
                     }
                     .buttonStyle(.borderedProminent)
+                    .accessibilityLabel("Send command")
                     .disabled(viewModel.currentCommand.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || viewModel.isLoading)
                 }
                 .padding(.horizontal)
@@ -168,6 +179,7 @@ struct ATTerminalView: View {
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(.secondary)
+                .accessibilityLabel("Copy response")
             }
 
             // Response
@@ -182,7 +194,7 @@ struct ATTerminalView: View {
                     Text(entry.port)
                 }
                 Text("\(entry.elapsedMs)ms")
-                Text(timestampFormatter.string(from: entry.timestamp))
+                Text(Self.timestampFormatter.string(from: entry.timestamp))
             }
             .font(.caption2)
             .foregroundStyle(.tertiary)

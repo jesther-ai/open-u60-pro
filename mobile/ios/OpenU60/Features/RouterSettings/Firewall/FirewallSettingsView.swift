@@ -99,6 +99,7 @@ struct FirewallSettingsView: View {
                                 .foregroundStyle(.secondary)
                         }
                         .padding(.vertical, 2)
+                        .accessibilityElement(children: .combine)
                         .swipeActions(edge: .trailing) {
                             Button(role: .destructive) {
                                 Task { await viewModel.deletePortForward(rule) }
@@ -132,6 +133,7 @@ struct FirewallSettingsView: View {
                             }
                         }
                         .padding(.vertical, 2)
+                        .accessibilityElement(children: .combine)
                     }
                 }
             }

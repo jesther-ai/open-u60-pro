@@ -21,6 +21,8 @@
     <string name="dashboard_sim_pin_required">需要 SIM PIN</string>
     <string name="dashboard_nr_signal">NR 信号</string>
     <string name="dashboard_lte_signal">LTE 信号</string>
+    <string name="dashboard_wcdma_signal">3G 信号</string>
+    <string name="dashboard_signal">信号</string>
     <string name="dashboard_no_signal">无信号</string>
     <string name="dashboard_excellent">极佳</string>
     <string name="dashboard_good">良好</string>
@@ -36,6 +38,7 @@
     <string name="dashboard_more">更多</string>
     <string name="dashboard_nr_band">NR 频段</string>
     <string name="dashboard_lte_band">LTE 频段</string>
+    <string name="dashboard_wcdma_band">3G WCDMA</string>
     <string name="dashboard_anchor">锚点</string>
     <string name="settings_connection">连接</string>
     <string name="settings_gateway_ip">网关 IP</string>

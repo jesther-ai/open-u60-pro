@@ -1,10 +1,11 @@
 import SwiftUI
 
-struct CellularCardView: View {
+struct CellularCardView: View, Equatable {
     let wanIPv4: String
     let wanIPv6: String
     let speed: TrafficSpeed
     let trafficStats: TrafficStats
+    let isTrafficAvailable: Bool
 
     var body: some View {
         CardView {
@@ -42,13 +43,15 @@ struct CellularCardView: View {
                         Image(systemName: "arrow.down.circle.fill")
                             .foregroundStyle(.green)
                         let dl = DeviceParser.speedComponents(speed.downloadBytesPerSec)
-                        HStack(spacing: 0) {
-                            AnimatedNumber(value: dl.number, decimalPlaces: dl.decimalPlaces,
-                                           font: .title3.weight(.bold), textColor: .primary)
-                            Text(dl.unit)
-                                .font(.title3.weight(.bold).monospacedDigit())
-                                .contentTransition(.opacity)
-                                .animation(.easeInOut(duration: 0.4), value: dl.unit)
+                        if isTrafficAvailable {
+                            HStack(spacing: 0) {
+                                Text(dl.number, format: .number.precision(.fractionLength(dl.decimalPlaces)))
+                                Text(dl.unit)
+                            }
+                            .font(.title3.weight(.bold).monospacedDigit())
+                            .transaction { $0.animation = nil }
+                        } else {
+                            Text("—").font(.title3.bold())
                         }
                         Text("Download")
                             .font(.caption)
@@ -62,13 +65,15 @@ struct CellularCardView: View {
                         Image(systemName: "arrow.up.circle.fill")
                             .foregroundStyle(.blue)
                         let ul = DeviceParser.speedComponents(speed.uploadBytesPerSec)
-                        HStack(spacing: 0) {
-                            AnimatedNumber(value: ul.number, decimalPlaces: ul.decimalPlaces,
-                                           font: .title3.weight(.bold), textColor: .primary)
-                            Text(ul.unit)
-                                .font(.title3.weight(.bold).monospacedDigit())
-                                .contentTransition(.opacity)
-                                .animation(.easeInOut(duration: 0.4), value: ul.unit)
+                        if isTrafficAvailable {
+                            HStack(spacing: 0) {
+                                Text(ul.number, format: .number.precision(.fractionLength(ul.decimalPlaces)))
+                                Text(ul.unit)
+                            }
+                            .font(.title3.weight(.bold).monospacedDigit())
+                            .transaction { $0.animation = nil }
+                        } else {
+                            Text("—").font(.title3.bold())
                         }
                         Text("Upload")
                             .font(.caption)
@@ -76,6 +81,12 @@ struct CellularCardView: View {
                     }
                     .frame(maxWidth: .infinity)
                 }
+
+                Text(!isTrafficAvailable ? "Live traffic unavailable"
+                     : trafficStats.source == "wwandst" ? "Live cellular traffic · all devices"
+                     : "Estimated cellular traffic · all devices")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
 
                 Divider()
 

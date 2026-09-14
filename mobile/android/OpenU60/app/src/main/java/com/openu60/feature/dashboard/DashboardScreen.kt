@@ -34,6 +34,7 @@ fun DashboardScreen(
     val error by viewModel.error.collectAsState()
     val nrSignal by viewModel.nrSignal.collectAsState()
     val lteSignal by viewModel.lteSignal.collectAsState()
+    val wcdmaSignal by viewModel.wcdmaSignal.collectAsState()
     val operatorInfo by viewModel.operatorInfo.collectAsState()
     val battery by viewModel.battery.collectAsState()
     val thermal by viewModel.thermal.collectAsState()
@@ -189,8 +190,14 @@ fun DashboardScreen(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(12.dp),
             ) {
-                val rsrp = nrSignal.rsrp ?: lteSignal.rsrp
+                val rsrp = nrSignal.rsrp ?: lteSignal.rsrp ?: wcdmaSignal.rscp
                 val sccCount = nrSignal.sccCarriers.size + lteSignal.sccCarriers.size
+                val signalTitleRes = when {
+                    nrSignal.isConnected -> R.string.dashboard_nr_signal
+                    lteSignal.isConnected -> R.string.dashboard_lte_signal
+                    wcdmaSignal.isConnected -> R.string.dashboard_wcdma_signal
+                    else -> R.string.dashboard_signal
+                }
                 val signalSubtitle = buildString {
                     append(stringResource(signalQualityLabelRes(rsrp)))
                     if (sccCount > 0) append(" +${sccCount}CA")
@@ -198,7 +205,7 @@ fun DashboardScreen(
                 DashboardCard(
                     modifier = Modifier.weight(1f),
                     icon = Icons.Default.SignalCellular4Bar,
-                    title = stringResource(if (nrSignal.isConnected) R.string.dashboard_nr_signal else R.string.dashboard_lte_signal),
+                    title = stringResource(signalTitleRes),
                     value = if (rsrp != null) "${rsrp.toInt()} dBm" else "--",
                     subtitle = signalSubtitle,
                     valueColor = rsrpColor(rsrp),
@@ -496,6 +503,36 @@ fun DashboardScreen(
                                         Text("${scc.rsrp.toInt()} dBm", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                                     }
                                 }
+                            }
+                        }
+                    }
+                }
+            }
+            // WCDMA band info (3G mode)
+            if (!nrSignal.isConnected && !lteSignal.isConnected && wcdmaSignal.isConnected) {
+                Card(modifier = Modifier.fillMaxWidth()) {
+                    Column(modifier = Modifier.padding(16.dp)) {
+                        Text(stringResource(R.string.dashboard_wcdma_band), style = MaterialTheme.typography.labelMedium)
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                        ) {
+                            Column {
+                                Text("RSCP", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                Text(
+                                    wcdmaSignal.rscp?.let { "${it.toInt()} dBm" } ?: "--",
+                                    style = MaterialTheme.typography.titleMedium,
+                                    fontWeight = FontWeight.Bold,
+                                )
+                            }
+                            Column {
+                                Text("Ec/Io", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                Text(
+                                    wcdmaSignal.ecio?.let { "${it.toInt()} dB" } ?: "--",
+                                    style = MaterialTheme.typography.titleMedium,
+                                    fontWeight = FontWeight.Bold,
+                                )
                             }
                         }
                     }

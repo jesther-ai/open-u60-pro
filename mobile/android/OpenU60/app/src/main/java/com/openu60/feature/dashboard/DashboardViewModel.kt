@@ -28,6 +28,7 @@ class DashboardViewModel @Inject constructor(
     // Signal
     val nrSignal = MutableStateFlow(NRSignal.empty)
     val lteSignal = MutableStateFlow(LTESignal.empty)
+    val wcdmaSignal = MutableStateFlow(WCDMASignal.empty)
     val operatorInfo = MutableStateFlow(OperatorInfo.empty)
 
     // Device
@@ -149,6 +150,7 @@ class DashboardViewModel @Inject constructor(
             val result = SignalParser.parseNetInfo(data)
             nrSignal.value = result.nr
             lteSignal.value = result.lte
+            wcdmaSignal.value = result.wcdma
             operatorInfo.value = result.operatorInfo
         } catch (e: AgentError.Unauthorized) {
             throw e

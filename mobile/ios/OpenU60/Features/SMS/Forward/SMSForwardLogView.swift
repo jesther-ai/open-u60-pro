@@ -3,6 +3,15 @@ import SwiftUI
 struct SMSForwardLogView: View {
     @Bindable var viewModel: SMSForwardViewModel
 
+    /// One shared formatter: building a `DateFormatter` costs more than formatting with one,
+    /// and a per-row instance is rebuilt on every render pass.
+    private static let timestampFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .short
+        formatter.timeStyle = .medium
+        return formatter
+    }()
+
     var body: some View {
         List {
             ForEach(Array(viewModel.log.enumerated()), id: \.element.id) { index, entry in
@@ -13,6 +22,7 @@ struct SMSForwardLogView: View {
                         Spacer()
                         Image(systemName: entry.success ? "checkmark.circle.fill" : "xmark.circle.fill")
                             .foregroundStyle(entry.success ? .green : .red)
+                            .accessibilityLabel(entry.success ? "Forwarded" : "Failed")
                     }
                     Text("\(entry.ruleName) → \(entry.destinationType)")
                         .font(.caption)
@@ -58,10 +68,6 @@ struct SMSForwardLogView: View {
     }
 
     private func formatTimestamp(_ ts: Int) -> String {
-        let date = Date(timeIntervalSince1970: TimeInterval(ts))
-        let formatter = DateFormatter()
-        formatter.dateStyle = .short
-        formatter.timeStyle = .medium
-        return formatter.string(from: date)
+        Self.timestampFormatter.string(from: Date(timeIntervalSince1970: TimeInterval(ts)))
     }
 }

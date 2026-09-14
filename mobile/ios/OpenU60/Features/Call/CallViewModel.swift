@@ -23,9 +23,8 @@ final class CallViewModel {
 
     private let client: AgentClient
     private let authManager: AuthManager
-    private var pollTask: Task<Void, Never>?
-    private var durationTask: Task<Void, Never>?
-    private var callStartTime: Date?
+    private let pollLoop = PollingLoop()
+    private let durationLoop = PollingLoop()
 
     init(client: AgentClient, authManager: AuthManager) {
         self.client = client
@@ -56,12 +55,16 @@ final class CallViewModel {
 
         do {
             let _ = try await client.postJSON("/api/call/dial", body: ["number": number])
+            // State will be updated by polling
+            startPolling()
         } catch {
-            self.error = error.localizedDescription
             callState = .idle
+            guard !error.isCancellation else { return }
+            self.error = error.localizedDescription
+            // The POST can fail client-side (timeout) after the router already placed the
+            // call, so keep polling and let the router's status decide the state.
+            startPolling()
         }
-        // State will be updated by polling
-        startPolling()
     }
 
     func hangup() async {
@@ -100,23 +103,39 @@ final class CallViewModel {
     // MARK: - Polling
 
     func startPolling() {
-        stopPolling()
-        pollTask = Task {
-            while !Task.isCancelled {
-                await pollCallStatus()
-                try? await Task.sleep(for: .seconds(2))
-            }
+        pollLoop.start(interval: .seconds(2)) { [weak self] in
+            guard let self else { return .failure }
+            return await self.pollCallStatus()
         }
     }
 
+    /// Stops status polling without touching the call itself. Dismissing the screen
+    /// leaves an active call up on the router, exactly as before.
     func stopPolling() {
-        pollTask?.cancel()
-        pollTask = nil
+        pollLoop.stop()
     }
 
-    private func pollCallStatus() async {
-        guard let result = try? await client.getJSON("/api/call/status") else { return }
-        guard let calls = result["calls"] as? [[String: Any]] else { return }
+    /// One-shot reconciliation when the screen appears.
+    ///
+    /// Closing the call screen leaves an active call up on the router but tears down this view
+    /// model, so re-opening it would otherwise show an idle dial pad with no way to reach a call
+    /// that is still connected. Poll once to find out, and only stay polling if there is something
+    /// to watch — an idle dialer has no reason to hit the router every two seconds.
+    func syncWithRouter() async {
+        guard !pollLoop.isRunning else { return }
+        _ = await pollCallStatus()
+        if callState != .idle { startPolling() }
+    }
+
+    private func pollCallStatus() async -> PollingLoop.Outcome {
+        let result: [String: Any]
+        do {
+            result = try await client.getJSON("/api/call/status")
+        } catch {
+            return error.isCancellation ? .success : .failure
+        }
+
+        guard let calls = result["calls"] as? [[String: Any]] else { return .success }
 
         if calls.isEmpty {
             if callState != .idle {
@@ -124,11 +143,11 @@ final class CallViewModel {
                 isMuted = false
                 stopDurationTimer()
             }
-            return
+            return .success
         }
 
         guard let first = calls.first,
-              let stat = first["stat"] as? String else { return }
+              let stat = first["stat"] as? String else { return .success }
 
         let number = first["number"] as? String ?? ""
         let dir = first["dir"] as? String ?? "mo"
@@ -154,28 +173,24 @@ final class CallViewModel {
         default:
             break
         }
+
+        return .success
     }
 
     // MARK: - Duration Timer
 
     private func startDurationTimer() {
-        callStartTime = Date()
+        let start = Date()
         callDuration = 0
-        stopDurationTimer()
-        durationTask = Task {
-            while !Task.isCancelled {
-                if let start = callStartTime {
-                    callDuration = Date().timeIntervalSince(start)
-                }
-                try? await Task.sleep(for: .seconds(1))
-            }
+        durationLoop.start(interval: .seconds(1)) { [weak self] in
+            guard let self else { return .failure }
+            self.callDuration = Date().timeIntervalSince(start)
+            return .success
         }
     }
 
     private func stopDurationTimer() {
-        durationTask?.cancel()
-        durationTask = nil
-        callStartTime = nil
+        durationLoop.stop()
         callDuration = 0
     }
 }

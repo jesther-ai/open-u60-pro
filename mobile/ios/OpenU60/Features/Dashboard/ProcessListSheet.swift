@@ -11,8 +11,8 @@ struct ProcessListSheet: View {
     @State private var error: String?
     @State private var banner: String?
     @State private var showKillAllConfirm = false
-    @State private var refreshTimer: Timer?
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.processKillRefresh) private var refreshHost
 
     var body: some View {
         NavigationStack {
@@ -94,11 +94,14 @@ struct ProcessListSheet: View {
                 Text("This will SIGKILL \(bloatCount) bloat daemons. They will return on reboot.")
             }
             .task {
-                await refresh()
-                startTimer()
-            }
-            .onDisappear {
-                refreshTimer?.invalidate()
+                while !Task.isCancelled {
+                    await refresh()
+                    do {
+                        try await Task.sleep(for: .seconds(3))
+                    } catch {
+                        break
+                    }
+                }
             }
         }
     }
@@ -137,6 +140,7 @@ struct ProcessListSheet: View {
             bloatRssKb = result.bloatRssKb
             error = nil
         } catch {
+            guard !error.isCancellation else { return }
             self.error = error.localizedDescription
         }
     }
@@ -148,6 +152,7 @@ struct ProcessListSheet: View {
             let freed = data["freed_rss_kb"] as? Int ?? 0
             banner = "Killed PID \(pid), freed \(formatKB(freed))"
             await refresh()
+            await refreshHost?()
         } catch {
             self.error = error.localizedDescription
         }
@@ -160,16 +165,9 @@ struct ProcessListSheet: View {
             let killedArr = data["killed"] as? [[String: Any]] ?? []
             banner = "Killed \(killedArr.count) daemons, freed \(formatKB(freed))"
             await refresh()
+            await refreshHost?()
         } catch {
             self.error = error.localizedDescription
-        }
-    }
-
-    private func startTimer() {
-        refreshTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { _ in
-            Task { @MainActor in
-                await refresh()
-            }
         }
     }
 
@@ -178,5 +176,22 @@ struct ProcessListSheet: View {
             return String(format: "%.1f MB", Double(kb) / 1024.0)
         }
         return "\(kb) KB"
+    }
+}
+
+// MARK: - Host refresh
+
+/// A refresh of the screen this sheet stack was presented over, injected by that screen.
+/// Killing bloat frees ~225 MB in one go, but the values behind the sheet come from the
+/// dashboard's slow poll tier, and neither pull-to-refresh nor a tab switch is reachable from
+/// inside a sheet, so the freed memory would not show for up to a minute.
+private struct ProcessKillRefreshKey: EnvironmentKey {
+    static var defaultValue: (@MainActor () async -> Void)? { nil }
+}
+
+extension EnvironmentValues {
+    var processKillRefresh: (@MainActor () async -> Void)? {
+        get { self[ProcessKillRefreshKey.self] }
+        set { self[ProcessKillRefreshKey.self] = newValue }
     }
 }

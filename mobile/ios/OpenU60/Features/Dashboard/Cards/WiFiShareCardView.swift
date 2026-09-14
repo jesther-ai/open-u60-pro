@@ -121,6 +121,7 @@ struct WiFiShareCardView: View {
                                     Image(systemName: showPassword ? "eye.slash" : "eye")
                                         .foregroundStyle(.secondary)
                                 }
+                                .accessibilityLabel(showPassword ? "Hide password" : "Show password")
 
                                 Button {
                                     UIPasteboard.general.string = currentPassword
@@ -128,6 +129,7 @@ struct WiFiShareCardView: View {
                                     Image(systemName: "doc.on.doc")
                                         .foregroundStyle(.secondary)
                                 }
+                                .accessibilityLabel("Copy password")
                             }
 
                             if let qrImage {

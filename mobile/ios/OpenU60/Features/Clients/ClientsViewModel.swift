@@ -28,7 +28,9 @@ final class ClientsViewModel {
             }
             devices = deviceList
         } catch {
-            self.error = error.localizedDescription
+            if !error.isCancellation {
+                self.error = error.localizedDescription
+            }
         }
 
         isLoading = false

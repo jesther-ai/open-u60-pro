@@ -44,7 +44,7 @@ final class SMSForwardViewModel {
                 ?? (data["last_forwarded_id"] as? NSNumber)?.intValue
                 ?? 0
         } catch {
-            showMessage("Failed to load: \(error.localizedDescription)", isError: true)
+            report(error, as: "Failed to load")
         }
         isLoading = false
     }
@@ -65,7 +65,7 @@ final class SMSForwardViewModel {
             config.deleteAfterForward = deleteAfter
             showMessage("Settings saved", isError: false)
         } catch {
-            showMessage("Failed: \(error.localizedDescription)", isError: true)
+            report(error, as: "Failed")
         }
         isLoading = false
     }
@@ -83,7 +83,7 @@ final class SMSForwardViewModel {
             config.enabled = enabled  // re-assert in case refresh() overwrote during await
         } catch {
             config.enabled = previous  // revert on failure
-            showMessage("Failed: \(error.localizedDescription)", isError: true)
+            report(error, as: "Failed")
         }
     }
 
@@ -102,7 +102,7 @@ final class SMSForwardViewModel {
             showMessage("Rule created", isError: false)
             await refresh()
         } catch {
-            showMessage("Failed: \(error.localizedDescription)", isError: true)
+            report(error, as: "Failed")
         }
         isLoading = false
     }
@@ -121,7 +121,7 @@ final class SMSForwardViewModel {
             showMessage("Rule updated", isError: false)
             await refresh()
         } catch {
-            showMessage("Failed: \(error.localizedDescription)", isError: true)
+            report(error, as: "Failed")
         }
         isLoading = false
     }
@@ -132,7 +132,7 @@ final class SMSForwardViewModel {
             config.rules.removeAll { $0.id == id }
             showMessage("Rule deleted", isError: false)
         } catch {
-            showMessage("Failed: \(error.localizedDescription)", isError: true)
+            report(error, as: "Failed")
         }
     }
 
@@ -143,7 +143,7 @@ final class SMSForwardViewModel {
                 config.rules[idx].enabled = enabled
             }
         } catch {
-            showMessage("Failed: \(error.localizedDescription)", isError: true)
+            report(error, as: "Failed")
         }
     }
 
@@ -158,7 +158,7 @@ final class SMSForwardViewModel {
             let _ = try await client.postJSON("/api/sms/forward/test", body: body)
             showMessage("Test message sent", isError: false)
         } catch {
-            showMessage("Test failed: \(error.localizedDescription)", isError: true)
+            report(error, as: "Test failed")
         }
         isLoading = false
     }
@@ -171,7 +171,7 @@ final class SMSForwardViewModel {
             let data = try await client.getJSONArray("/api/sms/forward/log")
             log = data.compactMap { SMSForwardParser.parseLogEntry($0) }
         } catch {
-            showMessage("Failed to load log: \(error.localizedDescription)", isError: true)
+            report(error, as: "Failed to load log")
         }
         isLoading = false
     }
@@ -182,7 +182,7 @@ final class SMSForwardViewModel {
             log = []
             showMessage("Log cleared", isError: false)
         } catch {
-            showMessage("Failed: \(error.localizedDescription)", isError: true)
+            report(error, as: "Failed")
         }
     }
 
@@ -192,7 +192,8 @@ final class SMSForwardViewModel {
             showMessage("Retry succeeded", isError: false)
             await fetchLog()
         } catch {
-            showMessage("Retry failed: \(error.localizedDescription)", isError: true)
+            guard !error.isCancellation else { return }
+            report(error, as: "Retry failed")
             await fetchLog()
         }
     }
@@ -202,5 +203,11 @@ final class SMSForwardViewModel {
     private func showMessage(_ text: String, isError: Bool) {
         message = text
         messageIsError = isError
+    }
+
+    /// Surfaces a failure, except for cancellation — a torn-down screen is not an error.
+    private func report(_ error: Error, as prefix: String) {
+        guard !error.isCancellation else { return }
+        showMessage("\(prefix): \(error.localizedDescription)", isError: true)
     }
 }

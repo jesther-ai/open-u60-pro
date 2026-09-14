@@ -23,6 +23,15 @@ final class SchedulerViewModel {
     private let client: AgentClient
     private let authManager: AuthManager
 
+    /// Wire format for schedule times. The agent compares the stored string byte-for-byte against
+    /// a Rust-formatted `"{:02}:{:02}"`, so the formatter must not emit the device's native digits.
+    private static let wireTimeFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "HH:mm"
+        return formatter
+    }()
+
     init(client: AgentClient, authManager: AuthManager) {
         self.client = client
         self.authManager = authManager
@@ -35,7 +44,9 @@ final class SchedulerViewModel {
             let jobsArray = try await client.getJSONArray("/api/scheduler/jobs")
             jobs = jobsArray.compactMap { SchedulerJob.parse($0) }
         } catch {
-            showMessage("Failed to load: \(error.localizedDescription)", isError: true)
+            if !error.isCancellation {
+                showMessage("Failed to load: \(error.localizedDescription)", isError: true)
+            }
         }
         isLoading = false
     }
@@ -55,19 +66,15 @@ final class SchedulerViewModel {
         if scheduleType == "once" {
             body["schedule"] = ["type": "once", "at": Int(onceDate.timeIntervalSince1970)]
         } else {
-            let formatter = DateFormatter()
-            formatter.dateFormat = "HH:mm"
             body["schedule"] = [
                 "type": "recurring",
-                "time": formatter.string(from: actionTime),
+                "time": Self.wireTimeFormatter.string(from: actionTime),
                 "days": Array(days).sorted()
             ] as [String: Any]
         }
 
         if restoreEnabled && template.supportsRestore {
-            let formatter = DateFormatter()
-            formatter.dateFormat = "HH:mm"
-            var restore: [String: Any] = ["time": formatter.string(from: restoreTime)]
+            var restore: [String: Any] = ["time": Self.wireTimeFormatter.string(from: restoreTime)]
             if let restoreBody = template.restoreBody {
                 restore["body"] = restoreBody
             }
@@ -99,19 +106,15 @@ final class SchedulerViewModel {
         if scheduleType == "once" {
             body["schedule"] = ["type": "once", "at": Int(onceDate.timeIntervalSince1970)]
         } else {
-            let formatter = DateFormatter()
-            formatter.dateFormat = "HH:mm"
             body["schedule"] = [
                 "type": "recurring",
-                "time": formatter.string(from: actionTime),
+                "time": Self.wireTimeFormatter.string(from: actionTime),
                 "days": Array(days).sorted()
             ] as [String: Any]
         }
 
         if restoreEnabled && template.supportsRestore {
-            let formatter = DateFormatter()
-            formatter.dateFormat = "HH:mm"
-            var restore: [String: Any] = ["time": formatter.string(from: restoreTime)]
+            var restore: [String: Any] = ["time": Self.wireTimeFormatter.string(from: restoreTime)]
             if let restoreBody = template.restoreBody {
                 restore["body"] = restoreBody
             }

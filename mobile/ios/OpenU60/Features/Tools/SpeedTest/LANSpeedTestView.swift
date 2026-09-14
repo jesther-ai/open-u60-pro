@@ -1,7 +1,13 @@
 import SwiftUI
 
 struct LANSpeedTestView: View {
-    @Bindable var viewModel: LANSpeedTestViewModel
+    /// Owned as `@State` so a re-evaluated `NavigationLink` destination cannot replace the view
+    /// model (and lose the running test) while the screen is on screen.
+    @State private var viewModel: LANSpeedTestViewModel
+
+    init(viewModel: LANSpeedTestViewModel) {
+        _viewModel = State(initialValue: viewModel)
+    }
 
     var body: some View {
         List {
@@ -24,6 +30,8 @@ struct LANSpeedTestView: View {
                             .animation(.default, value: viewModel.progress)
                     }
                     ProgressView(value: viewModel.progress)
+                        .accessibilityLabel(phaseLabel)
+                        .accessibilityValue("\(Int(viewModel.progress * 100)) percent")
 
                     if viewModel.phase == "download" || viewModel.phase == "upload" {
                         HStack {
@@ -47,6 +55,9 @@ struct LANSpeedTestView: View {
                             Spacer()
                         }
                         .padding(.vertical, 8)
+                        .accessibilityElement(children: .ignore)
+                        .accessibilityLabel("Current speed")
+                        .accessibilityValue(String(format: "%.1f megabits per second", viewModel.liveSpeedMbps))
                     }
 
                     Button("Stop Test", role: .destructive) {
@@ -79,6 +90,8 @@ struct LANSpeedTestView: View {
                     .foregroundStyle(.secondary)
             }
         }
+        // No `onDisappear` teardown: a tab switch must not abort a transfer that is already
+        // paid for. A real pop releases the model and its `deinit` cancels the run.
         .navigationTitle("LAN Speed Test")
     }
 

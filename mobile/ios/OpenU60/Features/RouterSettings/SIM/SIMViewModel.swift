@@ -14,6 +14,9 @@ final class SIMViewModel {
     var isLoading: Bool = false
     var message: String?
     var messageIsError: Bool = false
+    /// Failure text for the presented sheet. `message` renders in the list *behind* the sheet,
+    /// so a wrong PIN would otherwise report nothing at all.
+    var sheetError: String?
 
     // Sheet state
     var showChangePinSheet: Bool = false
@@ -59,10 +62,8 @@ final class SIMViewModel {
             await verifyPin()
         case .enableLock:
             await changePinMode(enable: true)
-            showEnterPinSheet = false
         case .disableLock:
             await changePinMode(enable: false)
-            showEnterPinSheet = false
         }
     }
 
@@ -82,6 +83,7 @@ final class SIMViewModel {
 
     func changePinMode(enable: Bool) async {
         isLoading = true
+        sheetError = nil
 
         do {
             let _ = try await client.postJSON("/api/sim/pin/mode", body: [
@@ -90,10 +92,12 @@ final class SIMViewModel {
                     "pin_encode_flag": "0"
                 ])
             pinInput = ""
+            showEnterPinSheet = false
             showMessage("PIN lock \(enable ? "enabled" : "disabled")", isError: false)
             await refresh()
         } catch {
-            showMessage("Failed: \(error.localizedDescription)", isError: true)
+            pinInput = ""
+            await reportSheetFailure(error)
         }
 
         isLoading = false
@@ -101,11 +105,12 @@ final class SIMViewModel {
 
     func changePin() async {
         guard oldPinInput.count >= 4, newPinInput.count >= 4 else {
-            showMessage("PIN must be at least 4 digits", isError: true)
+            sheetError = "PIN must be at least 4 digits"
             return
         }
 
         isLoading = true
+        sheetError = nil
 
         do {
             let _ = try await client.postJSON("/api/sim/pin/change", body: [
@@ -118,7 +123,8 @@ final class SIMViewModel {
             showChangePinSheet = false
             showMessage("PIN changed successfully", isError: false)
         } catch {
-            showMessage("Failed: \(error.localizedDescription)", isError: true)
+            oldPinInput = ""
+            await reportSheetFailure(error)
         }
 
         isLoading = false
@@ -126,11 +132,12 @@ final class SIMViewModel {
 
     func verifyPin() async {
         guard pinInput.count >= 4 else {
-            showMessage("PIN must be at least 4 digits", isError: true)
+            sheetError = "PIN must be at least 4 digits"
             return
         }
 
         isLoading = true
+        sheetError = nil
 
         do {
             let _ = try await client.postJSON("/api/sim/pin/verify", body: [
@@ -143,7 +150,8 @@ final class SIMViewModel {
             showMessage("PIN verified", isError: false)
             await refresh()
         } catch {
-            showMessage("Failed: \(error.localizedDescription)", isError: true)
+            pinInput = ""
+            await reportSheetFailure(error)
         }
 
         isLoading = false
@@ -151,15 +159,16 @@ final class SIMViewModel {
 
     func verifyPuk() async {
         guard pukInput.count >= 8 else {
-            showMessage("PUK must be at least 8 digits", isError: true)
+            sheetError = "PUK must be at least 8 digits"
             return
         }
         guard newPinInput.count >= 4 else {
-            showMessage("New PIN must be at least 4 digits", isError: true)
+            sheetError = "New PIN must be at least 4 digits"
             return
         }
 
         isLoading = true
+        sheetError = nil
 
         do {
             let _ = try await client.postJSON("/api/sim/pin/verify", body: [
@@ -173,7 +182,8 @@ final class SIMViewModel {
             showMessage("PUK verified, new PIN set", isError: false)
             await refresh()
         } catch {
-            showMessage("Failed: \(error.localizedDescription)", isError: true)
+            pukInput = ""
+            await reportSheetFailure(error)
         }
 
         isLoading = false
@@ -181,11 +191,12 @@ final class SIMViewModel {
 
     func unlockSIM() async {
         guard !nckInput.isEmpty else {
-            showMessage("Unlock code is required", isError: true)
+            sheetError = "Unlock code is required"
             return
         }
 
         isLoading = true
+        sheetError = nil
 
         do {
             let _ = try await client.postJSON("/api/sim/unlock", body: ["nck": nckInput])
@@ -194,7 +205,8 @@ final class SIMViewModel {
             showMessage("SIM unlocked successfully", isError: false)
             await refresh()
         } catch {
-            showMessage("Failed: \(error.localizedDescription)", isError: true)
+            nckInput = ""
+            await reportSheetFailure(error, refreshingLockTrials: true)
         }
 
         isLoading = false
@@ -202,12 +214,37 @@ final class SIMViewModel {
 
     // MARK: - Private
 
+    /// Surfaces a failed attempt inside the presented sheet and re-reads the remaining-attempt
+    /// counters first, so the number the sheet shows is the one the modem actually has left.
+    private func reportSheetFailure(_ error: Error, refreshingLockTrials: Bool = false) async {
+        guard !error.isCancellation else { return }
+        await refreshCounters()
+        if refreshingLockTrials {
+            await refreshLockTrials()
+        }
+        let text = "Failed: \(error.localizedDescription)"
+        sheetError = text
+        showMessage(text, isError: true)
+    }
+
+    private func refreshCounters() async {
+        guard let data = try? await client.getJSON("/api/sim/info") else { return }
+        simInfo = SIMParser.parseSIMInfo(data)
+    }
+
+    private func refreshLockTrials() async {
+        guard let data = try? await client.getJSON("/api/sim/lock-trials") else { return }
+        lockInfo = SIMParser.parseSIMLock(data)
+    }
+
     private func fetchSIMInfo() async -> SIMInfo? {
         do {
             let data = try await client.getJSON("/api/sim/info")
             return SIMParser.parseSIMInfo(data)
         } catch {
-            showMessage("Failed to load SIM info: \(error.localizedDescription)", isError: true)
+            if !error.isCancellation {
+                showMessage("Failed to load SIM info: \(error.localizedDescription)", isError: true)
+            }
             return nil
         }
     }

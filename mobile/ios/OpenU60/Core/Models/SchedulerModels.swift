@@ -17,6 +17,15 @@ struct SchedulerJob: Identifiable {
     var lastRestore: Int?
     var createdAt: Int
 
+    /// Display-only, so it follows the device locale — unlike the "HH:mm" wire format the
+    /// agent parses. Static because `scheduleSummary` is evaluated once per row per render.
+    private static let onceDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+        return formatter
+    }()
+
     static func parse(_ dict: [String: Any]) -> SchedulerJob? {
         guard let id = dict["id"] as? Int,
               let name = dict["name"] as? String,
@@ -61,7 +70,7 @@ struct SchedulerJob: Identifiable {
             } else if scheduleDays == [5,6] {
                 dayStr = "Weekends"
             } else {
-                dayStr = scheduleDays.compactMap { $0 < dayNames.count ? dayNames[$0] : nil }.joined(separator: ", ")
+                dayStr = scheduleDays.compactMap { dayNames.indices.contains($0) ? dayNames[$0] : nil }.joined(separator: ", ")
             }
             if let rt = restoreTime {
                 return "\(dayStr) at \(time) \u{2192} \(rt)"
@@ -70,10 +79,7 @@ struct SchedulerJob: Identifiable {
         case "once":
             if let at = scheduleAt {
                 let date = Date(timeIntervalSince1970: TimeInterval(at))
-                let fmt = DateFormatter()
-                fmt.dateStyle = .medium
-                fmt.timeStyle = .short
-                return "Once: \(fmt.string(from: date))"
+                return "Once: \(Self.onceDateFormatter.string(from: date))"
             }
             return "One-time"
         default:
