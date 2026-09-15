@@ -10,3 +10,6 @@ tiny_http = "0.12"
 sha2 = "0.10"
 ureq = { version = "3", features = ["json"] }
 libc = "0.2"
+# ubus parameter encryption required by 2025-12 firmware (see web_crypto.rs)
+aes-gcm = "0.10"
+rsa = "0.9"

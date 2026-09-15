@@ -7,15 +7,135 @@ use crate::ubus;
 
 const SMS_DB_PATH: &str = "/etc_rw/ztembb/ztesms/sms_db/sms.db";
 
+/// List SMS.
+///
+/// Once a key exists on the device, the firmware returns `number` and `content`
+/// encrypted. They are resolved back to UCS-2 hex here, so clients see exactly
+/// what they always did. Devices that return plaintext are untouched.
 pub fn sms_list(_state: &AppState, body: &[u8]) -> (u16, Value) {
     let parsed: Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(_) => return (400, json!({"ok": false, "error": "invalid JSON"})),
     };
     match ubus::call("zwrt_wms", "zte_libwms_get_sms_data", Some(&parsed.to_string())) {
-        Ok(data) => (200, json!({"ok": true, "data": data})),
+        Ok(mut data) => {
+            resolve_message_fields(&mut data);
+            (200, json!({"ok": true, "data": data}))
+        }
         Err(e) => (503, json!({"ok": false, "error": e})),
     }
+}
+
+/// Resolve encrypted `number`/`content` in a `messages` array in place.
+///
+/// The on-disk WMS database stores both fields as plain UCS-2 hex — only the
+/// ubus layer encrypts them on the way out. Reading the row back from SQLite is
+/// therefore both simpler and *less invasive* than decrypting: the handshake
+/// logs into the web UI, which kicks out whoever is using it, and their next
+/// login invalidates the agent's key in turn.
+///
+/// SQLite is tried first for that reason; decryption stays as the fallback for
+/// devices where the database isn't readable.
+pub fn resolve_message_fields(data: &mut Value) {
+    let Some(messages) = data.get_mut("messages").and_then(|m| m.as_array_mut()) else {
+        return;
+    };
+
+    let encrypted_ids: Vec<i64> = messages
+        .iter()
+        .filter(|m| {
+            ["number", "content"]
+                .iter()
+                .any(|f| m.get(f).and_then(|v| v.as_str()).is_some_and(looks_encrypted))
+        })
+        .filter_map(|m| {
+            m.get("id")
+                .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+        })
+        .collect();
+
+    if encrypted_ids.is_empty() {
+        return;
+    }
+
+    let from_db = db_fetch_fields(&encrypted_ids).unwrap_or_default();
+
+    for msg in messages {
+        let id = msg
+            .get("id")
+            .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())));
+
+        for (idx, field) in ["number", "content"].iter().enumerate() {
+            let Some(raw) = msg.get(field).and_then(|v| v.as_str()) else {
+                continue;
+            };
+            if !looks_encrypted(raw) {
+                continue;
+            }
+
+            let resolved = id
+                .and_then(|i| from_db.get(&i))
+                .map(|pair: &(String, String)| {
+                    if idx == 0 {
+                        pair.0.clone()
+                    } else {
+                        pair.1.clone()
+                    }
+                })
+                .unwrap_or_else(|| crate::web_crypto::maybe_decrypt(raw));
+
+            msg[*field] = Value::String(resolved);
+        }
+    }
+}
+
+/// Same shape as the check in `web_crypto`, kept local so listing never has to
+/// touch the crypto module (and therefore never triggers a handshake).
+fn looks_encrypted(value: &str) -> bool {
+    let v = value.trim();
+    if v.len() < 40 || v.len() % 4 != 0 {
+        return false;
+    }
+    if v.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return false;
+    }
+    v.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=')
+}
+
+/// Read `number`/`content` straight from the WMS database for the given ids.
+fn db_fetch_fields(ids: &[i64]) -> Result<std::collections::HashMap<i64, (String, String)>, String> {
+    if ids.is_empty() {
+        return Ok(Default::default());
+    }
+    let in_clause = ids
+        .iter()
+        .map(|n| n.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!("SELECT id, number, content FROM sms WHERE id IN ({in_clause});");
+    let output = Command::new("/usr/bin/sqlite3")
+        .args(["-cmd", ".timeout 2000", "-readonly", SMS_DB_PATH, &sql])
+        .output()
+        .map_err(|e| format!("spawn sqlite3: {e}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+
+    let mut out = std::collections::HashMap::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        // sqlite3 default output separator is '|', and neither UCS-2 hex field
+        // can contain it.
+        let mut parts = line.splitn(3, '|');
+        let (Some(id), Some(number), Some(content)) = (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        if let Ok(id) = id.trim().parse::<i64>() {
+            out.insert(id, (number.to_string(), content.to_string()));
+        }
+    }
+    Ok(out)
 }
 
 pub fn sms_capacity(_state: &AppState) -> (u16, Value) {
@@ -25,15 +145,104 @@ pub fn sms_capacity(_state: &AppState) -> (u16, Value) {
     }
 }
 
+/// Send an SMS.
+///
+/// Firmware from the 2025-12 build requires `number` and `message_body` to be
+/// encrypted (see `web_crypto`). Clients keep posting plaintext and the
+/// encryption is applied here, so the HTTP API is unchanged.
+///
+/// The device-side key is global and gets overwritten by any web UI login,
+/// hence the single retry with a fresh handshake.
 pub fn sms_send(_state: &AppState, body: &[u8]) -> (u16, Value) {
     let parsed: Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(_) => return (400, json!({"ok": false, "error": "invalid JSON"})),
     };
-    match ubus::call("zwrt_wms", "zte_libwms_send_sms", Some(&parsed.to_string())) {
+
+    match send_via_ubus(&parsed) {
         Ok(data) => (200, json!({"ok": true, "data": data})),
         Err(e) => (503, json!({"ok": false, "error": e})),
     }
+}
+
+/// Send an SMS through ubus.
+///
+/// Public because both `/api/sms/send` and SMS forwarding use it.
+///
+/// Plaintext is tried first whenever the firmware says it is acceptable, since
+/// the encrypted path needs a handshake — and that handshake logs into the web
+/// UI, kicking out whoever is using it. Encryption stays as the fallback for
+/// firmware that demands it.
+pub fn send_via_ubus(params: &Value) -> Result<Value, String> {
+    if let Some(data) = try_plaintext_send(params) {
+        return Ok(data);
+    }
+
+    match send_encrypted(params) {
+        Ok(data) => Ok(data),
+        Err(first) => {
+            // Any web UI login overwrites the key — one retry with a fresh
+            // handshake before giving up.
+            crate::web_crypto::global().invalidate();
+            send_encrypted(params).map_err(|second| format!("{second} (first attempt: {first})"))
+        }
+    }
+}
+
+/// Try sending without encryption by flipping the firmware's own opt-out.
+///
+/// `zwrt_wms.config.sms_no_need_encryption_flag` is the switch behind the
+/// daemon's "Don not require encryption!" path. Setting it to 1 makes the
+/// firmware accept plaintext `number`/`message_body`, which avoids the
+/// handshake entirely — and the handshake is worth avoiding, because it logs
+/// into the web UI and kicks out whoever is using it.
+///
+/// Two details make this safe:
+///   * `uci set` without `uci commit` is enough, so nothing is written to
+///     flash; `uci revert` drops the staged change afterwards.
+///   * the firmware resets the flag to 0 by itself after each send, so it is
+///     effectively a per-message opt-out rather than a persistent setting.
+///
+/// Returns `None` if anything goes wrong, leaving the caller to fall back to
+/// the encrypted path.
+fn try_plaintext_send(params: &Value) -> Option<Value> {
+    const FLAG: &str = "zwrt_wms.config.sms_no_need_encryption_flag";
+
+    if ubus::uci_set_no_commit(FLAG, "1").is_err() {
+        return None;
+    }
+
+    let result = ubus::call("zwrt_wms", "zte_libwms_send_sms", Some(&params.to_string()));
+    let _ = ubus::uci_revert("zwrt_wms");
+
+    match result {
+        Ok(data) => Some(data),
+        Err(e) => {
+            eprintln!("[sms] plaintext send rejected ({e}), falling back to encryption");
+            None
+        }
+    }
+}
+
+fn send_encrypted(parsed: &Value) -> Result<Value, String> {
+    let mut params = parsed.clone();
+    let obj = params
+        .as_object_mut()
+        .ok_or_else(|| "body must be an object".to_string())?;
+
+    for field in ["number", "message_body"] {
+        let plain = obj
+            .get(field)
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("missing '{field}'"))?
+            .to_string();
+        // An already-encrypted value would get encrypted twice, but clients
+        // always post plaintext so that shouldn't happen.
+        let enc = crate::web_crypto::encrypt_field(&plain)?;
+        obj.insert(field.to_string(), Value::String(enc));
+    }
+
+    ubus::call("zwrt_wms", "zte_libwms_send_sms", Some(&params.to_string()))
 }
 
 /// Delete one or more SMS by id.
