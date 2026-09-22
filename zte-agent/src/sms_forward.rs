@@ -539,6 +539,56 @@ pub struct SmsForwarder {
     wan_connected: AtomicBool,
 }
 
+/// `HH:MM:SS` for log lines, so latency can be measured from the log alone.
+/// Note the device clock may be offset from real UTC — compare against itself,
+/// not against other machines.
+fn log_ts() -> String {
+    let mut t: i64 = 0;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::time(&mut t);
+        libc::localtime_r(&t, &mut tm);
+    }
+    format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
+}
+
+/// Read the firmware's received-SMS counter.
+///
+/// `zwrt_wms.config.sms_received_flag` is bumped by the WMS daemon whenever it
+/// stores an incoming message — once per *part*, so a 7-part message advances
+/// it by 7. The value lives in uci runtime state and is not flushed to flash on
+/// every change, so reading it is cheap and causes no wear.
+fn read_received_counter() -> Option<u64> {
+    ubus::uci_get("zwrt_wms.config.sms_received_flag")
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Sleep up to `max_secs`, returning early when the counter moves.
+///
+/// This is what makes delivery prompt without polling the message list: on
+/// firmware where `zwrt_wms_status_event` never fires, the counter is the only
+/// signal that something arrived. Reading it takes well under a millisecond, so
+/// a one-second tick is affordable, and the full interval still elapses as a
+/// backstop in case the counter behaves differently on another build.
+fn wait_for_new_sms(max_secs: u64) {
+    let Some(start_value) = read_received_counter() else {
+        // No counter on this firmware — behave exactly as before.
+        std::thread::sleep(Duration::from_secs(max_secs));
+        return;
+    };
+
+    for _ in 0..max_secs {
+        std::thread::sleep(Duration::from_secs(1));
+        if read_received_counter().is_some_and(|v| v != start_value) {
+            eprintln!("[sms_forward] {} counter moved -> waking up", log_ts());
+            return;
+        }
+    }
+}
+
 impl SmsForwarder {
     pub fn new() -> Self {
         let config = fs::read_to_string(CONFIG_PATH)
@@ -677,8 +727,41 @@ impl SmsForwarder {
         self.init_watermark();
 
         loop {
-            // Wait for event OR 5-min fallback timeout
-            match rx.recv_timeout(Duration::from_secs(300)) {
+            // Wait for an event, the received-SMS counter to move, or the
+            // configured interval to elapse — whichever comes first.
+            //
+            // `zwrt_wms_status_event` is never emitted on some firmware builds
+            // (2025-12 among them). Waiting on the channel alone therefore means
+            // every message waits out the full interval, so the counter is polled
+            // once a second alongside it. Reading it costs well under a
+            // millisecond, and it moves the moment the daemon stores a message.
+            let interval = self.config.lock().unwrap().poll_interval_secs.max(10);
+            let counter_before = read_received_counter();
+            let mut ticks = 0u64;
+
+            let outcome = loop {
+                match rx.recv_timeout(Duration::from_secs(1)) {
+                    Ok(event) => break Ok(Some(event)),
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        ticks += 1;
+                        if counter_before.is_some()
+                            && read_received_counter() != counter_before
+                        {
+                            eprintln!("[sms_forward] {} counter moved -> waking up", log_ts());
+                            break Ok(None);
+                        }
+                        if ticks >= interval {
+                            break Ok(None);
+                        }
+                    }
+                    Err(e) => break Err(e),
+                }
+            };
+
+            match outcome.map_or_else(Err, |opt| match opt {
+                Some(event) => Ok(event),
+                None => Err(mpsc::RecvTimeoutError::Timeout),
+            }) {
                 Ok(event) => {
                     if event["wms_status"].as_str() != Some("new_sms_received") {
                         continue;
@@ -730,11 +813,12 @@ impl SmsForwarder {
         loop {
             self.poll_once();
             let interval = self.config.lock().unwrap().poll_interval_secs.max(10);
-            std::thread::sleep(Duration::from_secs(interval));
+            wait_for_new_sms(interval);
         }
     }
 
     fn process_new_messages(&self, after_id: u64) {
+        eprintln!("[sms_forward] {} fetching messages after id {after_id}", log_ts());
         let messages = match fetch_new_messages(after_id) {
             Ok(msgs) => msgs,
             Err(e) => {
@@ -748,7 +832,8 @@ impl SmsForwarder {
         }
 
         eprintln!(
-            "[sms_forward] found {} new message(s) after id {after_id}",
+            "[sms_forward] {} fetched {} new message(s) after id {after_id}",
+            log_ts(),
             messages.len()
         );
 
@@ -912,8 +997,12 @@ fn forward_with_retry(
     let mut last_err = String::new();
 
     for attempt in 0..MAX_RETRIES {
+        eprintln!("[sms_forward] {} delivering to destination", log_ts());
         match forward_to(dest, sms, agent) {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                eprintln!("[sms_forward] {} delivered", log_ts());
+                return Ok(());
+            }
             Err(e) => {
                 eprintln!(
                     "[sms_forward] attempt {}/{MAX_RETRIES} failed for SMS {} -> {}: {e}",
