@@ -1,11 +1,12 @@
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde_json::{json, Value};
 
+use crate::events::{self, Topic};
 use crate::handlers::AppState;
 
 // --- Data types ---
@@ -63,6 +64,14 @@ const UPLOAD_ROUNDS: usize = 10;
 const PING_COUNT: usize = 10;
 const BUF_SIZE: usize = 16384; // 16 KB
 
+/// Change the progress, then mark the `speedtest` topic stale: the hub
+/// re-reads `GET /api/speedtest/progress` (at most twice a second) only
+/// while a live stream watches it.
+fn update(progress: &Mutex<SpeedTestProgress>, f: impl FnOnce(&mut SpeedTestProgress)) {
+    f(&mut progress.lock().unwrap_or_else(PoisonError::into_inner));
+    events::touch(Topic::Speedtest);
+}
+
 impl SpeedTest {
     pub fn new() -> Self {
         Self {
@@ -94,6 +103,10 @@ impl SpeedTest {
 // --- Server fetching ---
 
 fn fetch_servers() -> Result<Vec<TestServer>, String> {
+    // Tests never reach speedtest.net (they fill the cache: `set_servers`).
+    if cfg!(test) {
+        return Err("no server list in tests".into());
+    }
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(10)))
         .build()
@@ -165,11 +178,10 @@ fn run_test(
         .into();
 
     // --- Latency phase ---
-    {
-        let mut guard = progress.lock().unwrap();
-        guard.phase = Phase::Latency;
-        guard.progress = 0;
-    }
+    update(progress, |p| {
+        p.phase = Phase::Latency;
+        p.progress = 0;
+    });
 
     let ping_url = format!("{}latency.txt", server.base_url);
     let mut rtts = Vec::with_capacity(PING_COUNT);
@@ -190,8 +202,7 @@ fn run_test(
         }
 
         let pct = ((i + 1) as u8 * 20) / PING_COUNT as u8;
-        let mut guard = progress.lock().unwrap();
-        guard.progress = pct;
+        update(progress, |p| p.progress = pct);
     }
 
     if rtts.is_empty() {
@@ -208,18 +219,13 @@ fn run_test(
         0.0
     };
 
-    {
-        let mut guard = progress.lock().unwrap();
-        guard.ping_ms = Some(round2(median_ping));
-        guard.jitter_ms = Some(round2(jitter));
-    }
-
     // --- Download phase ---
-    {
-        let mut guard = progress.lock().unwrap();
-        guard.phase = Phase::Download;
-        guard.progress = 20;
-    }
+    update(progress, |p| {
+        p.ping_ms = Some(round2(median_ping));
+        p.jitter_ms = Some(round2(jitter));
+        p.phase = Phase::Download;
+        p.progress = 20;
+    });
 
     let download_url = format!("{}random4000x4000.jpg", server.base_url);
     let dl_start = Instant::now();
@@ -260,10 +266,19 @@ fn run_test(
                         0.0
                     };
                     let pct = 20 + ((dl_start.elapsed().as_secs_f64() / DOWNLOAD_DURATION.as_secs_f64()) * 40.0).min(40.0) as u8;
-                    let mut guard = progress.lock().unwrap();
-                    guard.live_speed_mbps = round2(speed);
-                    guard.download_bytes = dl_bytes;
-                    guard.progress = pct;
+                    // Every 16 KB read updates the figures; the topic is
+                    // touched once per percent (about every 0.4 s).
+                    let moved = {
+                        let mut guard = progress.lock().unwrap_or_else(PoisonError::into_inner);
+                        let moved = guard.progress != pct;
+                        guard.live_speed_mbps = round2(speed);
+                        guard.download_bytes = dl_bytes;
+                        guard.progress = pct;
+                        moved
+                    };
+                    if moved {
+                        events::touch(Topic::Speedtest);
+                    }
                 }
                 Err(_) => break,
             }
@@ -277,19 +292,14 @@ fn run_test(
         0.0
     };
 
-    {
-        let mut guard = progress.lock().unwrap();
-        guard.download_mbps = Some(round2(dl_speed));
-        guard.download_bytes = dl_bytes;
-        guard.progress = 60;
-    }
-
     // --- Upload phase ---
-    {
-        let mut guard = progress.lock().unwrap();
-        guard.phase = Phase::Upload;
-        guard.live_speed_mbps = 0.0;
-    }
+    update(progress, |p| {
+        p.download_mbps = Some(round2(dl_speed));
+        p.download_bytes = dl_bytes;
+        p.progress = 60;
+        p.phase = Phase::Upload;
+        p.live_speed_mbps = 0.0;
+    });
 
     let upload_buf = vec![0u8; UPLOAD_SIZE];
     let ul_start = Instant::now();
@@ -314,11 +324,12 @@ fn run_test(
         } else {
             0.0
         };
-        let pct = 60 + ((i + 1) as u8 * 40) / UPLOAD_ROUNDS as u8;
-        let mut guard = progress.lock().unwrap();
-        guard.live_speed_mbps = round2(speed);
-        guard.upload_bytes = ul_bytes;
-        guard.progress = pct;
+        let pct = upload_pct(i);
+        update(progress, |p| {
+            p.live_speed_mbps = round2(speed);
+            p.upload_bytes = ul_bytes;
+            p.progress = pct;
+        });
     }
 
     let ul_elapsed = ul_start.elapsed().as_secs_f64();
@@ -328,27 +339,34 @@ fn run_test(
         0.0
     };
 
-    {
-        let mut guard = progress.lock().unwrap();
-        guard.upload_mbps = Some(round2(ul_speed));
-        guard.upload_bytes = ul_bytes;
-        guard.phase = Phase::Complete;
-        guard.progress = 100;
-        guard.live_speed_mbps = 0.0;
-    }
+    update(progress, |p| {
+        p.upload_mbps = Some(round2(ul_speed));
+        p.upload_bytes = ul_bytes;
+        p.phase = Phase::Complete;
+        p.progress = 100;
+        p.live_speed_mbps = 0.0;
+    });
 }
 
 fn set_cancelled(progress: &Arc<Mutex<SpeedTestProgress>>) {
-    let mut guard = progress.lock().unwrap();
-    guard.phase = Phase::Cancelled;
-    guard.live_speed_mbps = 0.0;
+    update(progress, |p| {
+        p.phase = Phase::Cancelled;
+        p.live_speed_mbps = 0.0;
+    });
 }
 
 fn set_error(progress: &Arc<Mutex<SpeedTestProgress>>, msg: &str) {
-    let mut guard = progress.lock().unwrap();
-    guard.phase = Phase::Error;
-    guard.error = Some(msg.to_string());
-    guard.live_speed_mbps = 0.0;
+    update(progress, |p| {
+        p.phase = Phase::Error;
+        p.error = Some(msg.to_string());
+        p.live_speed_mbps = 0.0;
+    });
+}
+
+/// The progress after upload round `i` (0-based): 60 to 100. Counted in
+/// `usize`: `(i + 1) * 40` passes 255 from the 7th round.
+fn upload_pct(i: usize) -> u8 {
+    (60 + (i + 1).min(UPLOAD_ROUNDS) * 40 / UPLOAD_ROUNDS) as u8
 }
 
 fn round2(v: f64) -> f64 {
@@ -372,6 +390,12 @@ pub fn start(state: &AppState, body: &[u8]) -> (u16, Value) {
 
     let server_id = parsed["server_id"].as_u64();
 
+    // A running test is refused before anything is touched (a double start
+    // must not wipe its progress or clear a pending stop).
+    if state.speedtest.is_running() {
+        return (409, json!({"ok": false, "error": "test already running"}));
+    }
+
     let server_list = match get_servers(&state.speedtest.servers_cache) {
         Ok(s) => s,
         Err(e) => return (503, json!({"ok": false, "error": e})),
@@ -389,11 +413,17 @@ pub fn start(state: &AppState, body: &[u8]) -> (u16, Value) {
         }
     };
 
-    // Reset state
+    // Atomically set running=true; if already true, another start won the
+    // race while the server list was read. Only the winner resets the state.
+    if state.speedtest.running.compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed).is_err() {
+        return (409, json!({"ok": false, "error": "test already running"}));
+    }
+
+    // A Stop in the few microseconds between the exchange and this store
+    // is lost (as before this order): the test runs on until stopped again.
     state.speedtest.cancel.store(false, Ordering::Relaxed);
-    {
-        let mut guard = state.speedtest.progress.lock().unwrap();
-        *guard = SpeedTestProgress {
+    update(&state.speedtest.progress, |p| {
+        *p = SpeedTestProgress {
             phase: Phase::Idle,
             progress: 0,
             live_speed_mbps: 0.0,
@@ -406,21 +436,20 @@ pub fn start(state: &AppState, body: &[u8]) -> (u16, Value) {
             server: format!("{} ({})", server.sponsor, server.name),
             error: None,
         };
-    }
-
-    // Atomically set running=true; if already true, another test is in progress
-    if state.speedtest.running.compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed).is_err() {
-        return (409, json!({"ok": false, "error": "test already running"}));
-    }
+    });
 
     let progress = Arc::clone(&state.speedtest.progress);
     let cancel = Arc::clone(&state.speedtest.cancel);
     let running = Arc::clone(&state.speedtest.running);
 
     std::thread::spawn(move || {
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             run_test(&server, &progress, &cancel);
         }));
+        // A panic would leave a running phase behind for good.
+        if run.is_err() {
+            set_error(&progress, "speed test failed");
+        }
         running.store(false, Ordering::Relaxed);
     });
 
@@ -428,7 +457,7 @@ pub fn start(state: &AppState, body: &[u8]) -> (u16, Value) {
 }
 
 pub fn progress(state: &AppState) -> (u16, Value) {
-    let guard = state.speedtest.progress.lock().unwrap();
+    let guard = state.speedtest.progress.lock().unwrap_or_else(PoisonError::into_inner);
     (200, json!({"ok": true, "data": *guard}))
 }
 
@@ -438,4 +467,157 @@ pub fn stop(state: &AppState, _body: &[u8]) -> (u16, Value) {
     }
     state.speedtest.cancel.store(true, Ordering::Relaxed);
     (200, json!({"ok": true, "data": {"status": "stopping"}}))
+}
+
+#[cfg(test)]
+impl SpeedTest {
+    /// A server list as if fetched now (tests never reach speedtest.net).
+    pub fn set_servers(&self, servers: Vec<TestServer>) {
+        *self.servers_cache.lock().unwrap() = (servers, Instant::now());
+    }
+
+    /// One server whose URLs point at `base` (a local address in tests).
+    pub fn test_server(id: u64, base: &str) -> TestServer {
+        TestServer {
+            id,
+            name: "Testville".into(),
+            sponsor: "Example Net".into(),
+            country: "Nowhere".into(),
+            host: "127.0.0.1".into(),
+            url: format!("{base}upload.php"),
+            base_url: base.into(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::events::test_sink;
+
+    fn phase(app: &AppState) -> Value {
+        progress(app).1["data"].clone()
+    }
+
+    /// Every change of the progress marks the `speedtest` topic stale.
+    #[test]
+    fn updates_touch_the_topic() {
+        let app = AppState::new();
+        test_sink::take();
+        update(&app.speedtest.progress, |p| p.progress = 7);
+        set_cancelled(&app.speedtest.progress);
+        assert_eq!(test_sink::take(), [Topic::Speedtest, Topic::Speedtest]);
+        assert_eq!(phase(&app)["phase"], "cancelled");
+        assert_eq!(phase(&app)["progress"], 7);
+    }
+
+    /// The topic costs nothing unwatched: a change only marks it; a
+    /// stream's subscription reads it once, then each change (no cadence).
+    #[test]
+    fn the_topic_is_read_only_while_watched() {
+        use crate::auth::SessionId;
+        use crate::boottime::BootClock;
+        use crate::events::hub::{Hub, SubscribeReq};
+        use crate::events::{readers, Lane};
+        let app = AppState::new();
+        let hub = Arc::new(Hub::new(Arc::new(BootClock)));
+        let far = Instant::now() + Duration::from_secs(3600);
+        test_sink::with_hub(&hub, || {
+            update(&app.speedtest.progress, |p| p.progress = 5);
+            assert_eq!(hub.due_job(Lane::Fast, far), Err(None));
+            let topics = [Topic::Speedtest].into_iter().collect();
+            let _sub = hub.subscribe(SubscribeReq { owner: SessionId::for_test(1), topics, signal_hint: None, replace_same: None }).unwrap();
+            assert_eq!(hub.due_job(Lane::Fast, Instant::now()), Ok(Topic::Speedtest));
+            let started = Instant::now();
+            let out = readers::read(Topic::Speedtest, &app, &hub).unwrap();
+            assert_eq!(out.value.as_ref().unwrap(), &phase(&app));
+            hub.store(Topic::Speedtest, out, started);
+            assert_eq!(hub.due_job(Lane::Fast, far), Err(None));
+            update(&app.speedtest.progress, |p| p.progress = 6);
+            assert_eq!(hub.due_job(Lane::Fast, Instant::now() + Duration::from_millis(600)), Ok(Topic::Speedtest));
+        });
+    }
+
+    /// A second start while a test runs is refused before anything is
+    /// changed: the running test keeps its progress and a pending stop.
+    #[test]
+    fn a_second_start_keeps_the_running_test() {
+        let app = AppState::new();
+        app.speedtest.set_servers(vec![SpeedTest::test_server(7, "http://127.0.0.1:9/")]);
+        update(&app.speedtest.progress, |p| {
+            p.phase = Phase::Download;
+            p.progress = 42;
+            p.server = "Example Net (Testville)".into();
+        });
+        app.speedtest.running.store(true, Ordering::SeqCst);
+        app.speedtest.cancel.store(true, Ordering::SeqCst);
+        test_sink::take();
+        let (status, v) = start(&app, br#"{"server_id":7}"#);
+        assert_eq!((status, v["error"].as_str()), (409, Some("test already running")));
+        let p = phase(&app);
+        assert_eq!((p["phase"].as_str(), p["progress"].as_u64()), (Some("download"), Some(42)));
+        assert!(app.speedtest.cancel.load(Ordering::SeqCst), "the stop was cleared");
+        assert!(test_sink::take().is_empty());
+        app.speedtest.running.store(false, Ordering::SeqCst);
+        assert_eq!(start(&app, br#"{"server_id":8}"#).0, 404);
+        assert_eq!(phase(&app)["progress"], 42);
+    }
+
+    /// The upload rounds move the bar from 60 to 100 without wrapping.
+    #[test]
+    fn upload_progress_climbs_to_100() {
+        let pcts: Vec<u8> = (0..UPLOAD_ROUNDS).map(upload_pct).collect();
+        assert_eq!(pcts, [64, 68, 72, 76, 80, 84, 88, 92, 96, 100]);
+    }
+
+    /// Starts at the same moment: exactly one wins the compare-exchange,
+    /// the others answer 409 (the test holds in its latency phase against
+    /// a local server that accepts and never answers).
+    #[test]
+    fn concurrent_starts_start_one() {
+        use std::net::TcpListener;
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}/", l.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for s in l.incoming().flatten() {
+                held.push(s);
+            }
+        });
+        for round in 0..10 {
+            let app = Arc::new(AppState::new());
+            app.speedtest.set_servers(vec![SpeedTest::test_server(7, &base)]);
+            let barrier = Arc::new(std::sync::Barrier::new(8));
+            let threads: Vec<_> = (0..8)
+                .map(|_| {
+                    let (app, b) = (Arc::clone(&app), Arc::clone(&barrier));
+                    std::thread::spawn(move || {
+                        b.wait();
+                        start(&app, br#"{"server_id":7}"#).0
+                    })
+                })
+                .collect();
+            let codes: Vec<u16> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+            assert_eq!(codes.iter().filter(|c| **c == 200).count(), 1, "round {round}: {codes:?}");
+            assert_eq!(codes.iter().filter(|c| **c == 409).count(), 7, "round {round}: {codes:?}");
+            app.speedtest.cancel.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// A test against a server that cannot be reached ends as an error
+    /// and is no longer running.
+    #[test]
+    fn an_unreachable_server_ends_in_an_error() {
+        let app = AppState::new();
+        app.speedtest.set_servers(vec![SpeedTest::test_server(7, "http://127.0.0.1:9/")]);
+        assert_eq!(start(&app, br#"{"server_id":7}"#).0, 200);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while app.speedtest.is_running() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let p = phase(&app);
+        assert!(!app.speedtest.is_running());
+        assert_eq!((p["phase"].as_str(), p["error"].as_str()), (Some("error"), Some("all ping attempts failed")));
+        assert_eq!(p["server"], "Example Net (Testville)");
+    }
 }

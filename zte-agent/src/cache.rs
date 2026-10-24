@@ -18,7 +18,7 @@
 
 use std::collections::HashMap;
 use std::sync::mpsc::Receiver;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -113,14 +113,31 @@ impl Entry {
     }
 }
 
+/// Told about every invalidation (key, settle window), after the key's
+/// lock is released (the event hub).
+type Observer = Box<dyn Fn(Key, Option<Duration>) + Send + Sync>;
+
 pub struct UbusCache {
     slots: Mutex<HashMap<Key, Arc<Entry>>>,
+    observer: OnceLock<Observer>,
 }
 
 impl UbusCache {
     pub fn new() -> Self {
         UbusCache {
             slots: Mutex::new(HashMap::new()),
+            observer: OnceLock::new(),
+        }
+    }
+
+    /// Set once at startup; a second call is ignored.
+    pub fn set_observer(&self, f: Observer) {
+        let _ = self.observer.set(f);
+    }
+
+    fn observe(&self, key: Key, settle: Option<Duration>) {
+        if let Some(f) = self.observer.get() {
+            f(key, settle);
         }
     }
 
@@ -141,6 +158,7 @@ impl UbusCache {
         ttl: Duration,
         fetch: impl FnOnce() -> Result<Value, E>,
     ) -> Result<Value, E> {
+        crate::httpd::gate::debug_assert_may_block();
         let entry = self.slot(key);
         if let Some(value) = entry.state().fresh(ttl, Instant::now()) {
             return Ok(value.clone());
@@ -171,12 +189,14 @@ impl UbusCache {
     /// never stored, so a value that predates the trigger cannot outlive it.
     pub fn invalidate(&self, key: Key) {
         self.slot(key).invalidate(None);
+        self.observe(key, None);
     }
 
     /// [`invalidate`](Self::invalidate) and cap the effective TTL at
     /// [`SETTLE_TTL`] for `window`.
     pub fn invalidate_with_settle(&self, key: Key, window: Duration) {
         self.slot(key).invalidate(Some(window));
+        self.observe(key, Some(window));
     }
 
     /// `zte_nwinfo_api nwinfo_get_netinfo`, memoised for `max_age`. The
@@ -647,5 +667,28 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(cache.peek(SIM_INFO), None);
+    }
+    #[test]
+    fn observer_runs_after_the_key_lock_is_released() {
+        let cache = Arc::new(UbusCache::new());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (c, log) = (Arc::downgrade(&cache), Arc::clone(&seen));
+        let reentered = std::sync::atomic::AtomicBool::new(false);
+        cache.set_observer(Box::new(move |key, settle| {
+            log.lock().unwrap().push((key, settle));
+            // Re-entrant (once): the slot that was just invalidated is free again.
+            if key == WAN && !reentered.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                if let Some(c) = c.upgrade() {
+                    c.invalidate(WAN);
+                }
+            }
+        }));
+        cache.invalidate_with_settle(MODEM_DATA, SETTLE_WINDOW);
+        cache.on_event("zwrt_card_state_event", &json!({}));
+        cache.invalidate(WAN);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [(MODEM_DATA, Some(SETTLE_WINDOW)), (SIM_INFO, None), (WAN, None), (WAN, None)]
+        );
     }
 }

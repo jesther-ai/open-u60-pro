@@ -4,6 +4,7 @@ use serde_json::Value;
 
 /// Call `ubus call <object> <method> [<params>]` and parse JSON output.
 pub fn call(object: &str, method: &str, params: Option<&str>) -> Result<Value, String> {
+    crate::httpd::gate::debug_assert_may_block();
     let mut cmd = Command::new("ubus");
     cmd.args(["call", object, method]);
     if let Some(p) = params {
@@ -31,6 +32,7 @@ pub fn call(object: &str, method: &str, params: Option<&str>) -> Result<Value, S
 
 /// `ubus send <event> <payload>`: broadcasts an agent event to other processes on the router.
 pub fn send(event: &str, payload: &Value) -> Result<(), String> {
+    crate::httpd::gate::debug_assert_may_block();
     let output = send_command(event, payload)
         .output()
         .map_err(|e| format!("ubus exec: {e}"))?;
@@ -52,6 +54,7 @@ fn send_command(event: &str, payload: &Value) -> Command {
 
 /// Run `uci get <key>` and return the value.
 pub fn uci_get(key: &str) -> Result<String, String> {
+    crate::httpd::gate::debug_assert_may_block();
     let output = Command::new("uci")
         .args(["get", key])
         .output()
@@ -66,6 +69,7 @@ pub fn uci_get(key: &str) -> Result<String, String> {
 /// Run `uci -q show <target>`: one fork for a whole section, as
 /// `config.section.option='value'` lines.
 pub fn uci_show(target: &str) -> Result<String, String> {
+    crate::httpd::gate::debug_assert_may_block();
     let output = Command::new("uci")
         .args(["-q", "show", target])
         .output()
@@ -79,6 +83,7 @@ pub fn uci_show(target: &str) -> Result<String, String> {
 /// Run `uci set <key>=<value>` followed by `uci commit <config>`.
 #[allow(dead_code)]
 pub fn uci_set(key: &str, value: &str) -> Result<(), String> {
+    crate::httpd::gate::debug_assert_may_block();
     uci_set_no_commit(key, value)?;
     let config = key.split('.').next().unwrap_or(key);
     uci_commit(config)
@@ -153,6 +158,7 @@ mod uci_show_tests {
 }
 
 pub fn uci_set_no_commit(key: &str, value: &str) -> Result<(), String> {
+    crate::httpd::gate::debug_assert_may_block();
     let set_out = Command::new("uci")
         .args(["set", &format!("{key}={value}")])
         .output()
@@ -168,6 +174,7 @@ pub fn uci_set_no_commit(key: &str, value: &str) -> Result<(), String> {
 
 /// Run `uci commit <config>`.
 pub fn uci_commit(config: &str) -> Result<(), String> {
+    crate::httpd::gate::debug_assert_may_block();
     let commit_out = Command::new("uci")
         .args(["commit", config])
         .output()

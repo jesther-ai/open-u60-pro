@@ -37,6 +37,8 @@ use serde_json::{json, Value};
 use crate::cache;
 use crate::conn_watchdog::unix_now;
 use crate::esim_download::DownloadCtl;
+use crate::events::watched::Watched;
+use crate::events::Topic;
 use crate::handlers::AppState;
 
 /// Every card-only command observed on the router finished in under 4 s.
@@ -47,7 +49,7 @@ const DOWNLOAD_LIMIT: Duration = Duration::from_secs(300);
 /// An unanswered preview is cancelled (reason timeout) so the server session ends cleanly.
 const PREVIEW_LIMIT: Duration = Duration::from_secs(120);
 /// A finished download's result is reported for this long, then the status reads `idle` again.
-const RESULT_KEEP_SECS: u64 = 600;
+pub(crate) const RESULT_KEEP_SECS: u64 = 600;
 /// After a switch the WAN is down while the modem reattaches; the connectivity policies hold off.
 pub const SWITCH_GUARD_SECS: u64 = 300;
 /// The firmware's SIM reload and radio restart take about 3–8 s after `enable`.
@@ -90,13 +92,13 @@ struct Inner {
     busy: AtomicBool,
     /// `mono_secs()` of the last successful profile switch (0 = none).
     switched_at: AtomicU64,
-    download: Mutex<Download>,
+    download: Watched<Download>,
     /// The running download's decisions (preview answer, cancel).
     control: DownloadControl,
     /// Last good profile list, and whether it may be out of date.
     inventory: Mutex<Inventory>,
     /// The last profile switch, verified card → modem → data.
-    switch: Mutex<Switch>,
+    switch: Watched<Switch>,
     /// Identifies this agent run (start time, ms): clients must drop cached state when it changes.
     instance: u64,
     /// Operator receipts (SGP.22 notifications) waiting on the card.
@@ -433,10 +435,10 @@ impl Esim {
             inner: Arc::new(Inner {
                 busy: AtomicBool::new(false),
                 switched_at: AtomicU64::new(0),
-                download: Mutex::new(Download::default()),
+                download: Watched::new(Download::default(), Topic::EsimDownload),
                 control: DownloadControl::default(),
                 inventory: Mutex::new(Inventory::default()),
-                switch: Mutex::new(Switch::default()),
+                switch: Watched::new(Switch::default(), Topic::EsimSwitch),
                 instance: crate::sim_identity::agent_instance(),
                 receipts: Mutex::new(Receipts::default()),
                 lock_path,
@@ -1930,6 +1932,7 @@ const WORKER_GRACE: Duration = Duration::from_secs(5);
 /// Runs one card command (`esim_native::run`) on a worker thread, so a stalled modem (QRTR flow
 /// control can block a send indefinitely) can't hold the caller past `limit`.
 fn card(args: &[&str], limit: Duration) -> Result<Value, CardError> {
+    crate::httpd::gate::debug_assert_may_block();
     let (node, slot) = card_target().map_err(CardError::Config)?;
     if CARD_WORKER_RUNNING.swap(true, Ordering::SeqCst) {
         return Err(CardError::NotStarted("the previous eSIM command is still finishing".into()));

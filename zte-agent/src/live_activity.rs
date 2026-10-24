@@ -188,6 +188,11 @@ impl LiveActivity {
             }),
         }
     }
+    /// UTC checked over TLS against a time server within the last 6 hours
+    /// (unix seconds), if any: the LAN HTTPS certificates' dates (`tls`).
+    pub fn verified_utc(&self) -> Option<u64> {
+        self.trusted_now()
+    }
     pub fn status(&self) -> (u16, Value) {
         let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         (
@@ -461,13 +466,13 @@ fn provider_token(provider: &Provider, issued: u64) -> String {
     let signature: Signature = provider.key.sign(input.as_bytes());
     format!("{input}.{}", URL_SAFE_NO_PAD.encode(signature.to_bytes()))
 }
-fn number(data: &Value, key: &str, min: f64, max: f64) -> Option<f64> {
+pub(crate) fn number(data: &Value, key: &str, min: f64, max: f64) -> Option<f64> {
     data[key]
         .as_f64()
         .or_else(|| data[key].as_str()?.parse().ok())
         .filter(|v| v.is_finite() && *v >= min && *v <= max)
 }
-fn bars(rsrp: Option<f64>) -> Option<u8> {
+pub(crate) fn bars(rsrp: Option<f64>) -> Option<u8> {
     rsrp.map(|v| {
         if v >= -80.0 {
             4
@@ -482,7 +487,7 @@ fn bars(rsrp: Option<f64>) -> Option<u8> {
         }
     })
 }
-fn lte_carrier_count(data: &Value) -> Option<usize> {
+pub(crate) fn lte_carrier_count(data: &Value) -> Option<usize> {
     let mut carriers = std::collections::HashSet::new();
     for row in data["lteca"].as_str()?.split(';') {
         let columns: Vec<_> = row.split(',').collect();

@@ -30,8 +30,10 @@ TRACE=0
 if [ -d $TR/events/sched/sched_process_fork ]; then
   echo 0 > $TR/tracing_on
   echo > $TR/trace
-  # Named threads (la-push, http-0, ...) no longer have comm "zte-agent", so trace every
-  # fork with its TGID and let analyze.py keep the ones whose parent is in the agent.
+  # Named threads (la-push, hub-ubus, event-bus, ...) no longer have comm "zte-agent", so trace
+  # every fork with its TGID and let analyze.py keep the ones whose parent is in the agent.
+  # The listener's http-blk threads exit 10 s after their last request: only the forks and
+  # the process totals count them, not the per-thread t0/t1 snapshots.
   TGID0=$(cat $TR/options/record-tgid); BUF0=$(cut -d" " -f1 $TR/buffer_size_kb)
   echo 1 > $TR/options/record-tgid
   echo 4096 > $TR/buffer_size_kb

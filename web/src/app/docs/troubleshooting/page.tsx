@@ -83,10 +83,10 @@ ssh -p 2222 root@192.168.0.1 'sh /data/local/tmp/start_zte_agent.sh'`}
           CORS Errors
         </h2>
         <p className="text-sm text-text-dim">
-          The zte-agent serves with permissive CORS headers by default. If
-          you&apos;re seeing CORS errors, ensure you&apos;re connecting to the
-          correct IP and port (9090), and that no proxy or VPN is
-          interfering.
+          The zte-agent sends no CORS headers, and it refuses requests from
+          other websites that change settings, so a page on another site
+          cannot use the API from your browser. Use the native apps, or the
+          agent&apos;s own web UI at http://192.168.0.1:9090/.
         </p>
       </section>
     </div>

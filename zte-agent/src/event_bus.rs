@@ -1,4 +1,5 @@
 use std::io::BufRead;
+use std::panic::AssertUnwindSafe;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -11,9 +12,19 @@ const IGNORED_EVENTS: &[&str] = &["zwrt_deviceui_event.touchstatus"];
 /// delivered in-process only: never asked of `ubus listen`, and skipped if it shows them anyway.
 pub const AGENT_EVENT_PREFIX: &str = "zte_agent.";
 
+/// Handles events itself (`subscribe_fn`): called with the event name and payload.
+pub type Handler = Arc<dyn Fn(&str, &Value) + Send + Sync>;
+
+/// Where an event goes: a channel for the payload, or a handler that runs
+/// on the dispatching thread (no channel, no thread of its own).
+enum Sink {
+    Channel(mpsc::Sender<Value>),
+    Call(Handler),
+}
+
 struct Subscriber {
     event: String,
-    tx: mpsc::Sender<Value>,
+    tx: Sink,
 }
 
 pub struct EventBus {
@@ -34,9 +45,23 @@ impl EventBus {
         let mut subs = self.subscribers.lock().unwrap();
         subs.push(Subscriber {
             event: event_name.to_string(),
-            tx,
+            tx: Sink::Channel(tx),
         });
         rx
+    }
+
+    /// `handler` gets each of these events with its name, on the thread that
+    /// dispatches it (the `ubus listen` reader, or an agent event's publisher)
+    /// while the subscriber list is locked: it must return quickly and must
+    /// not block or publish. Same rules as `subscribe`: firmware names before `start`.
+    pub fn subscribe_fn(&self, names: &[&str], handler: Handler) {
+        let mut subs = self.subscribers.lock().unwrap();
+        for &name in names {
+            subs.push(Subscriber {
+                event: name.to_string(),
+                tx: Sink::Call(Arc::clone(&handler)),
+            });
+        }
     }
 
     /// Spawn the listener thread. Call this after all firmware subscriptions
@@ -45,7 +70,8 @@ impl EventBus {
     /// agent. Agent events (`AGENT_EVENT_PREFIX`) can be subscribed at any time.
     pub fn start(self: &Arc<Self>) {
         let bus = Arc::clone(self);
-        std::thread::spawn(move || bus.run_loop());
+        // Named: it also runs the event hub's handler, and power traces count per thread.
+        crate::system::spawn_named("event-bus", move || bus.run_loop());
     }
 
     /// Delivers an agent event to its in-process subscribers, as if `ubus listen` had read it.
@@ -54,7 +80,7 @@ impl EventBus {
     }
 
     /// The `ubus listen` argument list derived from the current subscribers.
-    fn listen_patterns(&self) -> Vec<String> {
+    pub(crate) fn listen_patterns(&self) -> Vec<String> {
         let subs = self.subscribers.lock().unwrap();
         listen_patterns(subs.iter().map(|s| s.event.as_str()))
     }
@@ -130,7 +156,17 @@ impl EventBus {
                 // The channel is unbounded, so send() never blocks; it only
                 // fails once the receiver has been dropped, in which case the
                 // event is simply not delivered to that subscriber.
-                let _ = sub.tx.send(payload.clone());
+                match &sub.tx {
+                    Sink::Channel(tx) => drop(tx.send(payload.clone())),
+                    // A panicking handler must not poison the subscriber
+                    // list: every later dispatch (and publish) would panic.
+                    Sink::Call(handler) => {
+                        let call = AssertUnwindSafe(|| handler(event_name, payload));
+                        if std::panic::catch_unwind(call).is_err() {
+                            eprintln!("[event_bus] handler for {event_name} panicked");
+                        }
+                    }
+                }
             }
         }
     }
@@ -291,6 +327,54 @@ mod tests {
         assert!(charger_rx.try_recv().is_err());
         assert!(sms_rx.try_recv().is_err());
         assert!(touch_rx.recv_timeout(Duration::from_millis(10)).is_err());
+    }
+
+    #[test]
+    fn subscribe_fn_gets_name_and_payload_on_the_dispatching_thread() {
+        let bus = EventBus::new();
+        let plain = bus.subscribe("zwrt_servicestatus");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        let me = std::thread::current().id();
+        let names = ["zwrt_servicestatus", "zwrt_wms_status_event", "zte_agent.sim_identity"];
+        bus.subscribe_fn(
+            &names,
+            Arc::new(move |name: &str, payload: &Value| {
+                // Synchronous: the reader thread itself, no channel.
+                assert_eq!(std::thread::current().id(), me);
+                log.lock().unwrap().push((name.to_owned(), payload.clone()));
+            }),
+        );
+        // The listen filter is the same as for plain subscriptions.
+        assert_eq!(bus.listen_patterns(), ["zwrt_servicestatus", "zwrt_wms_status_event"]);
+        bus.read_events(Cursor::new(concat!(
+            "{ \"zwrt_wms_status_event\": {\"wms_status\": \"new_sms_received\"} }\n",
+            "{ \"zwrt_servicestatus\": {\"network_type\": \"ENDC\"} }\n",
+        )));
+        bus.publish("zte_agent.sim_identity", &serde_json::json!({"phase": "online"}));
+        let seen = seen.lock().unwrap();
+        let got: Vec<_> = seen.iter().map(|(n, p)| (n.as_str(), p.clone())).collect();
+        assert_eq!(
+            got,
+            [
+                ("zwrt_wms_status_event", serde_json::json!({"wms_status": "new_sms_received"})),
+                ("zwrt_servicestatus", serde_json::json!({"network_type": "ENDC"})),
+                ("zte_agent.sim_identity", serde_json::json!({"phase": "online"})),
+            ]
+        );
+        assert_eq!(plain.try_recv().unwrap(), serde_json::json!({"network_type": "ENDC"}));
+    }
+
+    #[test]
+    fn a_panicking_handler_does_not_break_the_bus() {
+        let bus = EventBus::new();
+        bus.subscribe_fn(&["zwrt_servicestatus"], Arc::new(|_: &str, _: &Value| panic!("handler panic (expected by this test)")));
+        let rx = bus.subscribe("zwrt_servicestatus");
+        for _ in 0..2 {
+            bus.read_events(Cursor::new("{ \"zwrt_servicestatus\": {\"network_type\": \"LTE\"} }\n"));
+            assert_eq!(rx.try_recv().unwrap(), serde_json::json!({"network_type": "LTE"}));
+        }
+        assert!(!bus.subscribers.is_poisoned());
     }
 
     #[test]

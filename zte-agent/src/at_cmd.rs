@@ -75,6 +75,7 @@ impl AtPort {
 /// Holds `AT_LOCK` for the whole exchange (port probe included) so no two
 /// commands ever share the node's receive queue.
 pub fn send(at_port: &AtPort, command: &str, timeout_secs: u64) -> Result<String, String> {
+    crate::httpd::gate::debug_assert_may_block();
     let _g = lock_port();
     let port = at_port.probe().ok_or("no serial port found")?;
     let script = format!(

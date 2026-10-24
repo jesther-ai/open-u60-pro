@@ -7,7 +7,6 @@ edition = "2021"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tiny_http = "0.12"
 sha2 = "0.10"
 ureq = { version = "3", features = ["json"] }
 libc = "0.2"
@@ -18,3 +17,49 @@ httpdate = "1"
 # SGP.22 card commands: LGPL-2.1-only Rust translation of lpac's libeuicc (see euicc/).
 euicc = { path = "../euicc" }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# LAN HTTPS (`tls`, `httpd::tls`): the server side of the TLS stack reqwest
+# already links (same versions and features), and ring for the router's own
+# CA (P-256 keys, ECDSA signatures, digests).
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+ring = "0.17"
+# Auth tokens, login form MACs and constant-time compares (all already linked via p256/ring).
+getrandom = "0.2"
+hmac = "0.12"
+subtle = { version = "2.6", default-features = false }
+# HTTP listener: axum routing on a hyper http1 server, one current-thread
+# tokio runtime. hyper, tokio and tower are already linked via reqwest; no
+# axum `http1` (that only feeds `axum::serve`, whose auto builder links an h2 server),
+# no `query`/`form` (the web UI parses its few form fields and query values itself).
+axum = { version = "0.8.9", default-features = false, features = ["tokio"] }
+hyper = { version = "1.11", default-features = false, features = ["server", "http1"] }
+hyper-util = { version = "0.1.20", default-features = false, features = ["tokio"] }
+tokio = { version = "1.50", default-features = false, features = ["rt", "net", "time", "sync"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+tower = { version = "0.5", default-features = false, features = ["util"] }
+# Web UI: HTML templates (no "axum" feature; responses are built by hand) and
+# the identity fallback for the embedded .gz assets (decoder already linked via ureq).
+maud = "0.27"
+flate2 = "1"
+# Web UI: the Share Wi-Fi join QR code, drawn as inline SVG (MIT, no dependencies).
+qrcodegen = "1.8"
+# Web UI, eSIM › Add eSIM: the QR code in an uploaded photo, read on the router
+# (`web::qr_decode`, in a child process): JPEG at a reduced IDCT scale (no rayon;
+# its own decode threads, one per colour component), PNG with limits, rqrr
+# without its `image` dependency.
+rqrr = { version = "0.11", default-features = false }
+jpeg-decoder = { version = "0.3", default-features = false }
+png = "0.18"
+# Web UI, Add eSIM's photo upload: the multipart delimiter search (`web::upload`;
+# already linked via serde_json, same features).
+memchr = "2"
+
+[build-dependencies]
+# build.rs: asset hashing, gzip and icon PNGs (host-only; both already in Cargo.lock).
+flate2 = "1"
+sha2 = "0.10"
+
+[dev-dependencies]
+tokio = { version = "1.50", features = ["rt", "macros", "time", "test-util"] }
+# web::qr_decode tests: photos with codes, as phones save them.
+jpeg-encoder = "0.6"
+crc32fast = "1"

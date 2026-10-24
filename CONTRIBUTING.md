@@ -13,7 +13,7 @@ Thanks for your interest in contributing! This guide will help you get started.
 
 | Component | Path | Description |
 |---|---|---|
-| zte-agent | `zte-agent/` | Rust HTTP agent (Axum) running on the device, exposes REST API on port 9090 |
+| zte-agent | `zte-agent/` | Rust HTTP agent (Axum) running on the device: REST API, live updates (`/api/events`) and a browser UI on port 9090 |
 | iOS app | `mobile/ios/` | SwiftUI companion app |
 | Android app | `mobile/android/` | Jetpack Compose companion app |
 

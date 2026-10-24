@@ -1,0 +1,2 @@
+# Vendored Datastar bundle: byte-identical to upstream (SHA-256 pinned in zte-agent/build.rs).
+zte-agent/src/web/assets/*.js -text

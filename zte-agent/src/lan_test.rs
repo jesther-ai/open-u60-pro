@@ -1,57 +1,47 @@
-use std::io::{self, Read};
-use std::time::Instant;
+use std::convert::Infallible;
+use std::time::{Duration, Instant};
 
+use axum::body::{Body, Bytes};
+use futures_util::StreamExt;
 use serde_json::{json, Value};
-use tiny_http::{Header, Request, Response, StatusCode};
+use tokio::sync::OwnedSemaphorePermit;
 
-/// Zero-fill reader — generates zeros on the fly, no heap allocation.
-struct ZeroReader {
-    remaining: usize,
-}
-
-impl Read for ZeroReader {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if self.remaining == 0 {
-            return Ok(0);
-        }
-        let n = buf.len().min(self.remaining);
-        buf[..n].fill(0);
-        self.remaining -= n;
-        Ok(n)
-    }
-}
+/// Download chunk size.
+const CHUNK: usize = 64 * 1024;
 
 /// GET /api/lan/ping — empty 200 for RTT measurement.
 pub fn ping() -> (u16, Value) {
     (200, json!({"ok": true}))
 }
 
-/// GET /api/lan/download?size=N — streams N bytes of zeros.
-/// Called before body is read; responds directly on the request.
-pub fn download(request: Request, size: usize) {
-    let reader = ZeroReader { remaining: size };
-    let response = Response::new(
-        StatusCode(200),
-        vec![Header::from_bytes("Content-Type", "application/octet-stream").unwrap()],
-        reader,
-        Some(size),
-        None,
-    );
-    let _ = request.respond(response);
+/// GET /api/lan/download?size=N — streams N zero bytes as slices of one
+/// 64 KiB buffer per stream (a static buffer would sit in .rodata and cost
+/// 64 KiB of binary). The buffer and the stream permit are released when the
+/// body ends or the client goes away.
+pub fn download_body(size: usize, permit: OwnedSemaphorePermit) -> Body {
+    let zeros = Bytes::from(vec![0u8; size.min(CHUNK)]);
+    Body::from_stream(futures_util::stream::unfold(
+        (size, zeros, permit),
+        |(left, zeros, permit)| async move {
+            if left == 0 {
+                return None;
+            }
+            let n = left.min(zeros.len());
+            Some((Ok::<_, Infallible>(zeros.slice(..n)), (left - n, zeros, permit)))
+        },
+    ))
 }
 
 /// POST /api/lan/upload — reads and discards body, returns measured throughput.
-pub fn upload(request: &mut Request) -> (u16, Value) {
+/// A read error (client gone) or nothing new for `idle` (a phone that left
+/// mid-upload) ends the count.
+pub async fn upload(body: Body, permit: OwnedSemaphorePermit, idle: Duration) -> (u16, Value) {
+    let _permit = permit;
     let start = Instant::now();
-    let mut buf = [0u8; 16384];
     let mut total: u64 = 0;
-    let reader = request.as_reader();
-    loop {
-        match reader.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => total += n as u64,
-            Err(_) => break,
-        }
+    let mut chunks = body.into_data_stream();
+    while let Ok(Some(Ok(chunk))) = tokio::time::timeout(idle, chunks.next()).await {
+        total += chunk.len() as u64;
     }
     let elapsed = start.elapsed().as_secs_f64();
     let mbps = if elapsed > 0.0 {

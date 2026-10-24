@@ -80,6 +80,145 @@ SOFTWARE.
 
 `zte-agent/certs/gsma-rsp2-root-ci1.pem` is the public root certificate of the GSMA eSIM certificate issuer. It is embedded in zte-agent so that operator servers' TLS certificates can be verified. See [`zte-agent/certs/README.md`](zte-agent/certs/README.md) for how it was checked.
 
+## Datastar (MIT)
+
+`zte-agent/src/web/assets/datastar-1.0.4.js` is [Datastar](https://github.com/starfederation/datastar) v1.0.4, the release bundle `bundles/datastar.js` at tag `v1.0.4`, vendored byte-identical (SHA-256 `727844adfc825ee651fb93c544a2a739986f9a21820a94524b35f0cac470cf91`, checked by `zte-agent/build.rs`). It is embedded in zte-agent and served to browsers by the web UI. Its license, from `LICENSE.md` at that tag:
+
+```
+Copyright © Star Federation
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+```
+
+## QR Code generator library (MIT)
+
+The web UI's Share Wi-Fi page draws its join QR code with the [`qrcodegen`](https://crates.io/crates/qrcodegen) crate 1.8.0 ([QR Code generator library](https://www.nayuki.io/page/qr-code-generator-library), Rust version). The crate ships no separate license file; its notice, from the head of `src/lib.rs`:
+
+```
+QR Code generator library (Rust)
+
+Copyright (c) Project Nayuki. (MIT License)
+https://www.nayuki.io/page/qr-code-generator-library
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software is furnished to do so,
+subject to the following conditions:
+- The above copyright notice and this permission notice shall be included in
+  all copies or substantial portions of the Software.
+- The Software is provided "as is", without warranty of any kind, express or
+  implied, including but not limited to the warranties of merchantability,
+  fitness for a particular purpose and noninfringement. In no event shall the
+  authors or copyright holders be liable for any claim, damages or other
+  liability, whether in an action of contract, tort or otherwise, arising from,
+  out of or in connection with the Software or the use or other dealings in the
+  Software.
+```
+
+## quirc (ISC), inside rqrr
+
+The web UI reads the eSIM QR code in an uploaded photo with the [`rqrr`](https://crates.io/crates/rqrr) crate 0.11.0 ((MIT OR Apache-2.0) AND ISC), which is based on quirc. Its `LICENSE-ISC`:
+
+```
+quirc -- QR-code recognition library
+Copyright (C) 2010-2012 Daniel Beer <dlbeer@gmail.com>
+
+ISC License
+===========
+
+Permission to use, copy, modify, and/or distribute this software for
+any purpose with or without fee is hereby granted, provided that the
+above copyright notice and this permission notice appear in all
+copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL
+WARRANTIES WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE
+AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL
+DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR
+PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER
+TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
+PERFORMANCE OF THIS SOFTWARE.
+```
+
+## BSD-3-Clause crates (matchit, subtle)
+
+Two of the Rust crates below are under the BSD 3-Clause License, which asks binary redistributions to reproduce the notice: `matchit` 0.8.4 (MIT AND BSD-3-Clause; its route tree derives from httprouter, `LICENSE.httprouter` in the crate) and `subtle` 2.6.1 (`LICENSE` in the crate).
+
+matchit:
+
+```
+BSD 3-Clause License
+
+Copyright (c) 2013, Julien Schmidt
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its
+   contributors may be used to endorse or promote products derived from
+   this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
+
+subtle:
+
+```
+Copyright (c) 2016-2017 Isis Agora Lovecruft, Henry de Valence. All rights reserved.
+Copyright (c) 2016-2024 Isis Agora Lovecruft. All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are
+met:
+
+1. Redistributions of source code must retain the above copyright
+notice, this list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright
+notice, this list of conditions and the following disclaimer in the
+documentation and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its
+contributors may be used to endorse or promote products derived from
+this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS
+IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
+PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED
+TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
+
 ## Rust crates
 
 zte-agent links these crates from crates.io (for the router target), each under the license shown. Each crate's license text and copyright notices are in its published source.
@@ -87,8 +226,9 @@ zte-agent links these crates from crates.io (for the router target), each under 
 | Crate | Version | License |
 |---|---|---|
 | adler2 | 2.0.1 | 0BSD OR MIT OR Apache-2.0 |
-| ascii | 1.1.0 | Apache-2.0 OR MIT |
 | atomic-waker | 1.1.2 | Apache-2.0 OR MIT |
+| axum | 0.8.9 | MIT |
+| axum-core | 0.5.6 | MIT |
 | base16ct | 0.2.0 | Apache-2.0 OR MIT |
 | base64 | 0.22.1 | MIT OR Apache-2.0 |
 | base64ct | 1.8.3 | Apache-2.0 OR MIT |
@@ -96,26 +236,22 @@ zte-agent links these crates from crates.io (for the router target), each under 
 | block-buffer | 0.10.4 | MIT OR Apache-2.0 |
 | bytes | 1.11.1 | MIT |
 | cfg-if | 1.0.4 | MIT OR Apache-2.0 |
-| chacha20 | 0.10.2 | MIT OR Apache-2.0 |
-| chunked_transfer | 1.5.0 | MIT OR Apache-2.0 |
 | const-oid | 0.9.6 | Apache-2.0 OR MIT |
-| cookie | 0.18.1 | MIT OR Apache-2.0 |
-| cookie_store | 0.22.1 | MIT OR Apache-2.0 |
 | cpufeatures | 0.2.17 | MIT OR Apache-2.0 |
 | crc32fast | 1.5.0 | MIT OR Apache-2.0 |
 | crypto-bigint | 0.5.5 | Apache-2.0 OR MIT |
 | crypto-common | 0.1.7 | MIT OR Apache-2.0 |
 | der | 0.7.10 | Apache-2.0 OR MIT |
-| deranged | 0.5.8 | MIT OR Apache-2.0 |
 | digest | 0.10.7 | MIT OR Apache-2.0 |
 | displaydoc | 0.2.5 | MIT OR Apache-2.0 |
-| document-features | 0.2.12 | MIT OR Apache-2.0 |
 | ecdsa | 0.16.9 | Apache-2.0 OR MIT |
 | elliptic-curve | 0.13.8 | Apache-2.0 OR MIT |
 | equivalent | 1.0.2 | Apache-2.0 OR MIT |
+| fdeflate | 0.3.7 | MIT OR Apache-2.0 |
 | ff | 0.13.1 | MIT/Apache-2.0 |
 | flate2 | 1.1.9 | MIT OR Apache-2.0 |
 | fnv | 1.0.7 | Apache-2.0 / MIT |
+| foldhash | 0.2.0 | Zlib |
 | form_urlencoded | 1.2.2 | MIT OR Apache-2.0 |
 | futures-channel | 0.3.34 | MIT OR Apache-2.0 |
 | futures-core | 0.3.34 | MIT OR Apache-2.0 |
@@ -123,12 +259,15 @@ zte-agent links these crates from crates.io (for the router target), each under 
 | futures-sink | 0.3.34 | MIT OR Apache-2.0 |
 | futures-task | 0.3.34 | MIT OR Apache-2.0 |
 | futures-util | 0.3.34 | MIT OR Apache-2.0 |
+| g2gen | 1.2.2 | MIT/Apache-2.0 |
+| g2p | 1.2.2 | MIT/Apache-2.0 |
+| g2poly | 1.2.2 | MIT/Apache-2.0 |
 | generic-array | 0.14.7 | MIT |
 | getrandom | 0.2.17 | MIT OR Apache-2.0 |
-| getrandom | 0.4.3 | MIT OR Apache-2.0 |
 | group | 0.13.0 | MIT/Apache-2.0 |
 | h2 | 0.4.19 | MIT |
 | hashbrown | 0.16.1 | MIT OR Apache-2.0 |
+| hashbrown | 0.17.1 | MIT OR Apache-2.0 |
 | hmac | 0.12.1 | MIT OR Apache-2.0 |
 | http | 1.4.0 | MIT OR Apache-2.0 |
 | http-body | 1.1.0 | MIT |
@@ -150,37 +289,36 @@ zte-agent links these crates from crates.io (for the router target), each under 
 | indexmap | 2.13.0 | Apache-2.0 OR MIT |
 | ipnet | 2.12.2 | MIT OR Apache-2.0 |
 | itoa | 1.0.17 | MIT OR Apache-2.0 |
+| jpeg-decoder | 0.3.2 | MIT OR Apache-2.0 |
 | libc | 0.2.182 | MIT OR Apache-2.0 |
 | litemap | 0.8.1 | Unicode-3.0 |
-| litrs | 1.0.0 | MIT OR Apache-2.0 |
 | log | 0.4.29 | MIT OR Apache-2.0 |
-| lru-slab | 0.1.3 | MIT OR Apache-2.0 OR Zlib |
+| lru | 0.18.5 | MIT |
+| matchit | 0.8.4 | MIT AND BSD-3-Clause |
+| maud | 0.27.0 | MIT OR Apache-2.0 |
+| maud_macros | 0.27.0 | MIT OR Apache-2.0 |
 | memchr | 2.8.0 | Unlicense OR MIT |
+| mime | 0.3.17 | MIT OR Apache-2.0 |
 | miniz_oxide | 0.8.9 | MIT OR Zlib OR Apache-2.0 |
 | mio | 1.1.1 | MIT |
-| num-conv | 0.2.0 | MIT OR Apache-2.0 |
 | once_cell | 1.21.3 | MIT OR Apache-2.0 |
 | p256 | 0.13.2 | Apache-2.0 OR MIT |
 | pem-rfc7468 | 0.7.0 | Apache-2.0 OR MIT |
 | percent-encoding | 2.3.2 | MIT OR Apache-2.0 |
 | pin-project-lite | 0.2.17 | Apache-2.0 OR MIT |
 | pkcs8 | 0.10.2 | Apache-2.0 OR MIT |
+| png | 0.18.1 | MIT OR Apache-2.0 |
 | potential_utf | 0.1.4 | Unicode-3.0 |
-| powerfmt | 0.2.0 | MIT OR Apache-2.0 |
 | primeorder | 0.13.6 | Apache-2.0 OR MIT |
 | proc-macro2 | 1.0.106 | MIT OR Apache-2.0 |
-| quinn | 0.11.12 | MIT OR Apache-2.0 |
-| quinn-proto | 0.11.18 | MIT OR Apache-2.0 |
-| quinn-udp | 0.5.15 | MIT OR Apache-2.0 |
+| proc-macro2-diagnostics | 0.10.1 | MIT/Apache-2.0 |
+| qrcodegen | 1.8.0 | MIT |
 | quote | 1.0.44 | MIT OR Apache-2.0 |
-| rand | 0.10.2 | MIT OR Apache-2.0 |
-| rand_core | 0.10.1 | MIT OR Apache-2.0 |
 | rand_core | 0.6.4 | MIT OR Apache-2.0 |
-| rand_pcg | 0.10.2 | MIT OR Apache-2.0 |
 | reqwest | 0.12.28 | MIT OR Apache-2.0 |
 | rfc6979 | 0.4.0 | Apache-2.0 OR MIT |
 | ring | 0.17.14 | Apache-2.0 AND ISC |
-| rustc-hash | 2.1.3 | Apache-2.0 OR MIT |
+| rqrr | 0.11.0 | (MIT OR Apache-2.0) AND ISC |
 | rustls | 0.23.37 | Apache-2.0 OR ISC OR MIT |
 | rustls-pki-types | 1.14.0 | MIT OR Apache-2.0 |
 | rustls-webpki | 0.103.9 | ISC |
@@ -201,18 +339,11 @@ zte-agent links these crates from crates.io (for the router target), each under 
 | stable_deref_trait | 1.2.1 | MIT OR Apache-2.0 |
 | subtle | 2.6.1 | BSD-3-Clause |
 | syn | 2.0.117 | MIT OR Apache-2.0 |
-| syn | 3.0.5 | MIT OR Apache-2.0 |
 | sync_wrapper | 1.0.2 | Apache-2.0 |
 | synstructure | 0.13.2 | MIT |
-| thiserror | 2.0.20 | MIT OR Apache-2.0 |
-| thiserror-impl | 2.0.20 | MIT OR Apache-2.0 |
-| time | 0.3.47 | MIT OR Apache-2.0 |
-| time-core | 0.1.8 | MIT OR Apache-2.0 |
-| time-macros | 0.2.27 | MIT OR Apache-2.0 |
-| tiny_http | 0.12.0 | MIT OR Apache-2.0 |
 | tinystr | 0.8.2 | Unicode-3.0 |
-| tinyvec | 1.13.3 | Zlib OR Apache-2.0 OR MIT |
 | tokio | 1.50.0 | MIT |
+| tokio-macros | 2.6.1 | MIT |
 | tokio-rustls | 0.26.5 | MIT OR Apache-2.0 |
 | tokio-util | 0.7.19 | MIT |
 | tower | 0.5.3 | MIT |

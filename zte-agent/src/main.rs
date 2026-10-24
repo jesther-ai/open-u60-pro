@@ -2,6 +2,7 @@ mod at_cmd;
 mod at_terminal;
 mod auth;
 mod bearer;
+mod boottime;
 mod cache;
 mod cell;
 mod charge_policy;
@@ -12,7 +13,9 @@ mod esim;
 mod esim_download;
 mod esim_native;
 mod event_bus;
+mod events;
 mod handlers;
+mod httpd;
 mod key_log;
 mod lan_test;
 mod live_activity;
@@ -33,8 +36,10 @@ mod stk;
 mod system;
 mod tailscale;
 mod telephony;
+mod tls;
 mod ubus;
 mod usb;
+mod web;
 mod wifi;
 mod wifi_watchdog;
 
@@ -44,8 +49,8 @@ use event_bus::EventBus;
 use handlers::AppState;
 
 const DEFAULT_BIND: &str = "0.0.0.0:9090";
-// 4 workers: tailscale setup/logout are legitimately slow (up to ~1-2 min
-// against the control plane) and must not starve the rest of the API.
+// General-lane permits: API calls that may block at once (slow calls such as
+// Tailscale setup have their own 2-permit lane, `httpd::SLOW_PERMITS`).
 const DEFAULT_THREADS: usize = 4;
 
 fn main() {
@@ -53,6 +58,10 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(String::as_str) == Some("esim-native") {
         std::process::exit(esim_native::cli(&args[2..]));
+    }
+    // `zte-agent qr-decode photo.jpg` times one QR decode of the web UI's eSIM upload.
+    if args.get(1).map(String::as_str) == Some("qr-decode") {
+        std::process::exit(web::qr_decode::cli(&args[2..]));
     }
 
     let bind = std::env::var("ZTE_AGENT_BIND").unwrap_or_else(|_| DEFAULT_BIND.to_string());
@@ -96,6 +105,7 @@ fn main() {
         .collect();
     // Power-state events for the standby Wi-Fi guard (unless opted out).
     let standby_rx = standby_guard::subscribe(&event_bus);
+    events::start(&state, &event_bus);
     event_bus.start();
 
     Arc::clone(&state.cache).start_event_invalidation(cache_events);
@@ -120,6 +130,12 @@ fn main() {
         busy_check(&state),
         connwd_wan_rx,
     );
+
+    // LAN HTTPS: load the certificates if it is on, write the local name
+    // for dnsmasq again (/tmp is tmpfs), issue again for a new address.
+    // Once, off the HTTP thread; the listener starts when it is on.
+    let tls = Arc::clone(&state.tls);
+    system::spawn_named("tls-start", move || tls.start());
 
     // Firmware bug guards: zte_post_wifi.sh can spin forever after any Wi-Fi
     // start (watched through the script's open, no timer between launches),

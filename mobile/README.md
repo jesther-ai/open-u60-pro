@@ -164,6 +164,8 @@ Router operations use typed REST endpoints on `zte-agent`. Key router endpoint g
 1. Set `ZTE_AGENT_PASSWORD` env var when starting the agent
 2. `POST /api/auth/login` with `{"password": "..."}` → receive bearer token
 3. Include `Authorization: Bearer <token>` on all subsequent requests
+4. Tokens are 64 hex characters, expire after 1 h without use (24 h at most), and can be dropped after 32 newer logins. On 401, log in again once; on 429, wait `Retry-After` seconds; on `503 agent busy, retry`, retry after `Retry-After`. Live updates: [events.md](../zte-agent/docs/events.md).
+5. Without an agent password the API only answers requests addressed to an IP address, a name listed in `ZTE_AGENT_UI_HOSTS` on the router, or (over Tailscale) the router's Tailscale name; other host names get `403 host not allowed`.
 
 ## Signal Color Thresholds
 

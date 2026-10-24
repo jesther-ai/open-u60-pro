@@ -1,14 +1,15 @@
 use std::sync::Arc;
-use std::io::Read;
 
 use serde_json::{json, Value};
-use tiny_http::{Header, Method, Request, Response, Server};
 
 use crate::at_terminal;
+use crate::auth::{AuthState, Kind, PeerKey, SessionId};
 use crate::cell;
 use crate::conn_watchdog;
 use crate::device_ext;
 use crate::esim;
+use crate::httpd::gate::Lane;
+use crate::httpd::guard::{self, HostPolicy, ReqHeaders};
 use crate::lan_test;
 use crate::scheduler;
 use crate::handlers::{self, AppState};
@@ -25,151 +26,206 @@ use crate::telephony;
 use crate::usb;
 use crate::wifi;
 
-pub fn start(bind: &str, threads: usize, state: Arc<AppState>) {
-    // Bind ourselves so TCP keepalive can be set on the listener; accepted
-    // sockets inherit it. tiny_http parks one thread per client connection
-    // with no timeout, so a phone that vanishes without closing (Wi-Fi roam,
-    // sleep) would otherwise pin a thread and two fds forever.
-    let listener = match std::net::TcpListener::bind(bind) {
-        Ok(l) => l,
-        Err(_) => {
-            std::process::exit(1);
+/// HTTP method as `route()` sees it, independent of the listener's types.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Method {
+    Get,
+    Post,
+    Put,
+    Delete,
+    /// HEAD, OPTIONS, PATCH, ...: no route matches.
+    Other,
+}
+
+impl From<&axum::http::Method> for Method {
+    fn from(m: &axum::http::Method) -> Self {
+        match m.as_str() {
+            "GET" => Method::Get,
+            "POST" => Method::Post,
+            "PUT" => Method::Put,
+            "DELETE" => Method::Delete,
+            _ => Method::Other,
         }
-    };
-    set_tcp_keepalive(&listener);
-    let server = match Server::from_listener(listener, None) {
-        Ok(s) => s,
-        Err(_) => {
-            std::process::exit(1);
-        }
-    };
-    // Seed the CPU tracker with initial sample (speed tracker is demand-driven)
-    state.cpu.sample();
-
-    let server = Arc::new(server);
-    let mut handles = Vec::new();
-
-    for i in 0..threads {
-        let server = Arc::clone(&server);
-        let state = Arc::clone(&state);
-        let handle = crate::system::spawn_named(&format!("http-{i}"), move || {
-            loop {
-                let request = match server.recv() {
-                    Ok(r) => r,
-                    Err(_) => {
-                        continue;
-                    }
-                };
-                handle_request(request, &state);
-            }
-        });
-        handles.push(handle);
-    }
-
-    for h in handles {
-        let _ = h.join();
     }
 }
 
-/// SO_KEEPALIVE with a 5 min idle / 60 s interval / 3 probes: a dead peer is
-/// detected within ~8 min and its tiny_http thread exits. Linux only; the
-/// values are inherited by accepted sockets.
-#[cfg(target_os = "linux")]
-fn set_tcp_keepalive(listener: &std::net::TcpListener) {
-    use std::os::unix::io::AsRawFd;
-    let fd = listener.as_raw_fd();
-    let opts: [(libc::c_int, libc::c_int, libc::c_int); 4] = [
-        (libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1),
-        (libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, 300),
-        (libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, 60),
-        (libc::IPPROTO_TCP, libc::TCP_KEEPCNT, 3),
-    ];
-    for (level, name, value) in opts {
-        // SAFETY: fd is a valid open socket owned by `listener`; `value` outlives the call.
-        let rc = unsafe {
-            libc::setsockopt(
-                fd,
-                level,
-                name,
-                &value as *const libc::c_int as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            )
+/// Request body caps (413 JSON above them). No app request comes close.
+pub const API_BODY_MAX: usize = 64 * 1024;
+pub const LIVE_ACTIVITY_BODY_MAX: usize = 4096;
+pub const LOGIN_BODY_MAX: usize = 1024;
+const LAN_DOWNLOAD_DEFAULT: usize = 50 * 1024 * 1024;
+const LAN_DOWNLOAD_MAX: usize = 200 * 1024 * 1024;
+
+/// What `precheck` needs to know about a request; the body is not read yet.
+pub struct ReqInfo<'a> {
+    pub method: Method,
+    /// Without the query string.
+    pub path: &'a str,
+    pub query: Option<&'a str>,
+    /// The value after `Bearer ` (case-sensitive) of the first Authorization header.
+    pub bearer: Option<&'a str>,
+    pub headers: ReqHeaders<'a>,
+    /// The peer is this device: Tailscale clients (userspace networking).
+    pub loopback: bool,
+    /// Over the LAN HTTPS listener (`httpd::tls`).
+    pub secure: bool,
+}
+
+pub struct PreEnv<'a> {
+    pub auth: &'a AuthState,
+    pub hosts: &'a HostPolicy,
+    pub ts_names: &'a dyn Fn() -> Vec<String>,
+}
+
+/// The listener's next step for a request.
+#[derive(Debug, PartialEq)]
+pub enum Pre {
+    /// Final answer; the body is left unread.
+    Reply(u16, Value),
+    /// `POST /api/auth/login`: read at most `LOGIN_BODY_MAX`, needs the peer address.
+    Login,
+    LanDownload { size: usize },
+    LanUpload,
+    /// `GET /api/events`: a stream for this bearer token.
+    Events { owner: SessionId },
+    /// Read at most `body_limit` bytes, then `route()`.
+    Dispatch { body_limit: usize },
+}
+
+/// Everything decided before the body is read: auth, Host and Origin checks,
+/// the routes that bypass `route()`, and the body limit. Pure apart from the
+/// auth lookups, so every listener shares the exact same behaviour.
+pub fn precheck(req: &ReqInfo, env: &PreEnv) -> Pre {
+    let has_password = env.auth.has_password();
+    let mut principal = None;
+    if req.path != "/api/auth/login" && has_password {
+        principal = req.bearer.and_then(|t| env.auth.authenticate(Kind::Bearer, t));
+        if principal.is_none() {
+            return refuse(401, "unauthorized");
+        }
+    }
+    // Refuse names a rebinding attack would use (any IP literal and the
+    // device's own names pass): without a password for every request (the
+    // API is open), with one for browser requests (`Origin` or
+    // `Sec-Fetch-Site`; the apps send neither), so a rebound page cannot
+    // try passwords at the login route or use up its rate limit.
+    if !has_password || req.headers.origin.is_some() || req.headers.sec_fetch_site.is_some() {
+        let Some(host) = req.headers.host else {
+            return refuse(400, "missing host");
         };
-        if rc != 0 {
-            eprintln!("[server] setsockopt({level},{name}) failed: {}", std::io::Error::last_os_error());
+        if !env.hosts.allows_via(host, req.loopback, req.secure, env.ts_names) {
+            return refuse(403, "host not allowed");
         }
     }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn set_tcp_keepalive(_listener: &std::net::TcpListener) {}
-
-fn handle_request(mut request: Request, state: &AppState) {
-    let method = request.method().clone();
-    let url = request.url().to_string();
-    // Strip query string for routing
-    let path = url.split('?').next().unwrap_or(&url);
-
-    // Auth check — skip for login endpoint
-    let needs_auth = path != "/api/auth/login";
-    if needs_auth {
-        let authorized = request
-            .headers()
-            .iter()
-            .find(|h| h.field.as_str().to_ascii_lowercase() == "authorization")
-            .and_then(|h| h.value.as_str().strip_prefix("Bearer "))
-            .map(|token| state.auth.validate(token))
-            .unwrap_or(false);
-
-        if !state.auth.has_password() {
-            // No password set — allow unauthenticated access
-        } else if !authorized {
-            respond(request, 401, json!({"ok": false, "error": "unauthorized"}));
-            return;
-        }
+    if guard::api_mutation_refused(req.method, &req.headers) {
+        return refuse(403, "cross-origin request refused");
     }
-
-    // LAN test: download streams raw bytes, upload reads body incrementally.
-    // Handle BEFORE the body is fully read into memory.
-    match (&method, path) {
-        (&Method::Get, "/api/lan/download") => {
-            let size = parse_query_usize(&url, "size").unwrap_or(50 * 1024 * 1024);
-            let size = size.min(200 * 1024 * 1024); // cap at 200 MB
-            lan_test::download(request, size);
-            return;
+    match (req.method, req.path) {
+        (Method::Post, "/api/auth/login") => return Pre::Login,
+        // Answered here, without a hand-off, so the RTT measurement stays honest.
+        (Method::Get, "/api/lan/ping") => {
+            let (status, body) = lan_test::ping();
+            return Pre::Reply(status, body);
         }
-        (&Method::Post, "/api/lan/upload") => {
-            let (status, body_json) = lan_test::upload(&mut request);
-            respond(request, status, body_json);
-            return;
+        (Method::Get, "/api/lan/download") => {
+            let size = parse_query_usize(req.query, "size").unwrap_or(LAN_DOWNLOAD_DEFAULT);
+            return Pre::LanDownload { size: size.min(LAN_DOWNLOAD_MAX) };
+        }
+        (Method::Post, "/api/lan/upload") => return Pre::LanUpload,
+        // Streams belong to a token (their expiry and per-token cap), so
+        // they need a password.
+        (Method::Get, "/api/events") => {
+            return match principal {
+                Some(p) => Pre::Events { owner: p.id },
+                None => refuse(403, "agent password required"),
+            };
         }
         _ => {}
     }
-
-    if path.starts_with("/api/live-activity") && !state.auth.has_password() {
-        respond(request, 403, json!({"ok": false, "error": "agent password required"}));
-        return;
+    let live_activity = req.path.starts_with("/api/live-activity");
+    if live_activity && !has_password {
+        return refuse(403, "agent password required");
     }
-
-    // Read body
-    let mut body = Vec::new();
-    if path.starts_with("/api/live-activity") {
-        let _ = std::io::Read::read_to_end(&mut request.as_reader().take(4097), &mut body);
-        if body.len() > 4096 {
-            respond(request, 413, json!({"ok": false, "error": "body too large"}));
-            return;
-        }
-    } else {
-        let _ = std::io::Read::read_to_end(&mut request.as_reader(), &mut body);
+    Pre::Dispatch {
+        body_limit: if live_activity { LIVE_ACTIVITY_BODY_MAX } else { API_BODY_MAX },
     }
-
-    let (status, body_json) = route(&method, path, state, &body);
-    respond(request, status, body_json);
 }
 
-fn parse_query_usize(url: &str, key: &str) -> Option<usize> {
-    let query = url.split('?').nth(1)?;
-    for pair in query.split('&') {
+/// `{"ok":false,"error":…}` built in one place (each `json!` site costs code size).
+fn refuse(status: u16, error: &str) -> Pre {
+    Pre::Reply(status, error_body(error))
+}
+
+pub(crate) fn error_body(error: &str) -> Value {
+    json!({"ok": false, "error": error})
+}
+
+/// Serve the API on `bind`; never returns.
+pub fn start(bind: &str, threads: usize, state: Arc<AppState>) {
+    crate::httpd::serve(bind, threads, state);
+}
+
+/// A reply serialised for the wire: compact JSON, as before.
+pub struct Encoded {
+    pub status: u16,
+    pub body: Vec<u8>,
+    /// Seconds for a `Retry-After` header (429 replies with `retry_after`).
+    pub retry_after: Option<u64>,
+}
+
+pub fn encode((status, body): (u16, Value)) -> Encoded {
+    let retry_after = if status == 429 { body["retry_after"].as_u64() } else { None };
+    Encoded {
+        status,
+        body: serde_json::to_vec(&body).unwrap_or_default(),
+        retry_after,
+    }
+}
+
+/// Which gate lane a `route()` call waits in. Slow: calls that can take tens
+/// of seconds or minutes (eSIM card commands, Tailscale setup, AT/STK/USSD
+/// waits, modem scans and mode changes, outbound HTTP, dnsmasq restarts), so
+/// they can never use up the permits the quick reads need. The eSIM state
+/// polls, the cached Tailscale status, the STK menu/session snapshots (the
+/// STK worker's memory) and call control (one short AT command each, and a
+/// hang-up must not wait behind a Tailscale setup) stay General.
+pub fn lane(method: Method, path: &str) -> Lane {
+    use Method::{Delete, Get, Post};
+    let slow = match (method, path) {
+        (Get, "/api/esim/switch")
+        | (Get | Delete, "/api/esim/download")
+        | (Post, "/api/esim/download/confirm" | "/api/esim/download/cancel")
+        | (Get, "/api/tailscale/status")
+        | (Get, "/api/stk/menu" | "/api/stk/session") => false,
+        (_, p) if p.starts_with("/api/esim/") || p.starts_with("/api/tailscale/") => true,
+        (_, p) if p.starts_with("/api/ussd/") || p.starts_with("/api/stk/") => true,
+        (Post, p) if p.starts_with("/api/sim/") || p.starts_with("/api/cell/") => true,
+        (
+            Post,
+            "/api/at/send"
+            | "/api/modem/online"
+            | "/api/modem/airplane"
+            | "/api/modem/scan"
+            | "/api/modem/register"
+            | "/api/sms/forward/test"
+            | "/api/sms/forward/retry"
+            | "/api/speedtest/start"
+            | "/api/doh/enable"
+            | "/api/doh/disable",
+        ) => true,
+        (Get, "/api/speedtest/servers") => true,
+        _ => false,
+    };
+    if slow {
+        Lane::Slow
+    } else {
+        Lane::General
+    }
+}
+
+/// Same loop as before; `size` without `=` or with a bad number is `None`.
+pub fn parse_query_usize(query: Option<&str>, key: &str) -> Option<usize> {
+    for pair in query?.split('&') {
         let mut kv = pair.splitn(2, '=');
         if kv.next()? == key {
             return kv.next()?.parse().ok();
@@ -179,12 +235,17 @@ fn parse_query_usize(url: &str, key: &str) -> Option<usize> {
 }
 
 pub fn route(method: &Method, path: &str, state: &AppState, body: &[u8]) -> (u16, Value) {
+    crate::httpd::gate::debug_assert_may_block();
+    if *method != Method::Get {
+        crate::httpd::gate::debug_assert_may_change(path);
+    }
     match (method, path) {
         (&Method::Get, "/api/live-activity") => state.live_activity.status(),
         (&Method::Put, "/api/live-activity") => state.live_activity.register(body),
         (&Method::Delete, "/api/live-activity") => state.live_activity.unregister(),
         // Auth
-        (&Method::Post, "/api/auth/login") => handlers::login(state, body),
+        // Reached only in-process (the listener takes the Login path), so no peer address.
+        (&Method::Post, "/api/auth/login") => handlers::login(state, body, PeerKey::UNKNOWN),
         // Device info (sysfs)
         (&Method::Get, "/api/device") => handlers::device(state),
         (&Method::Get, "/api/battery") => handlers::battery(state),
@@ -364,6 +425,8 @@ pub fn route(method: &Method, path: &str, state: &AppState, body: &[u8]) -> (u16
         (&Method::Post, "/api/doh/cache/clear") => doh_cache_clear(state),
         // Tailscale remote management
         (&Method::Get, "/api/tailscale/status") => tailscale::status(state),
+        // LAN HTTPS (docs/web-ui.md, "LAN HTTPS"): read-only for the apps.
+        (&Method::Get, "/api/https") => state.tls.status_json(),
         (&Method::Post, "/api/tailscale/setup") => tailscale::setup(state, body),
         (&Method::Post, "/api/tailscale/login-url") => tailscale::login_url(state),
         (&Method::Post, "/api/tailscale/enable") => tailscale::enable(state),
@@ -444,11 +507,197 @@ fn doh_cache_clear(state: &AppState) -> (u16, Value) {
     (200, json!({"ok": true}))
 }
 
-fn respond(request: Request, status: u16, body: Value) {
-    let body_str = serde_json::to_string(&body).unwrap_or_default();
-    let content_type = Header::from_bytes("Content-Type", "application/json").unwrap();
-    let response = Response::from_string(body_str)
-        .with_status_code(status)
-        .with_header(content_type);
-    let _ = request.respond(response);
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::Kind;
+    use std::net::SocketAddr;
+
+    const PW: &str = "test-password";
+
+    fn peer(n: u8) -> PeerKey {
+        PeerKey::from(SocketAddr::from(([10, 0, 200, n], 5000)))
+    }
+
+    fn with_password() -> AuthState {
+        let auth = AuthState::new();
+        auth.set_password(PW);
+        auth
+    }
+
+    fn ts_names() -> Vec<String> {
+        vec!["u60-pro".into()]
+    }
+
+    /// A request from a Tailscale client (loopback); `lan` for one from the LAN.
+    fn info<'a>(method: Method, path: &'a str, query: Option<&'a str>, bearer: Option<&'a str>, headers: ReqHeaders<'a>) -> ReqInfo<'a> {
+        ReqInfo { method, path, query, bearer, headers, loopback: true, secure: false }
+    }
+
+    fn lan(req: ReqInfo<'_>) -> ReqInfo<'_> {
+        ReqInfo { loopback: false, ..req }
+    }
+
+    fn host(h: &str) -> ReqHeaders<'_> {
+        ReqHeaders { host: Some(h), ..ReqHeaders::default() }
+    }
+
+    fn run(auth: &AuthState, req: &ReqInfo) -> Pre {
+        let hosts = HostPolicy::new(Vec::new());
+        precheck(req, &PreEnv { auth, hosts: &hosts, ts_names: &ts_names })
+    }
+
+    fn reply(status: u16, error: &str) -> Pre {
+        Pre::Reply(status, json!({"ok": false, "error": error}))
+    }
+
+    const DISPATCH: Pre = Pre::Dispatch { body_limit: API_BODY_MAX };
+
+    #[test]
+    fn precheck_with_password() {
+        let auth = with_password();
+        let token = auth.login(PW, Kind::Bearer, peer(1), &[]).unwrap();
+        let t = Some(token.token.expose());
+        let h = host("192.168.0.1:9090");
+        // The login route is exempt from the token check.
+        assert_eq!(run(&auth, &info(Method::Post, "/api/auth/login", None, None, h)), Pre::Login);
+        assert_eq!(run(&auth, &info(Method::Get, "/api/device", None, None, h)), reply(401, "unauthorized"));
+        assert_eq!(run(&auth, &info(Method::Get, "/api/device", None, Some("nope"), h)), reply(401, "unauthorized"));
+        assert_eq!(run(&auth, &info(Method::Get, "/api/lan/ping", None, None, h)), reply(401, "unauthorized"));
+        assert_eq!(run(&auth, &info(Method::Get, "/api/device", None, t, h)), DISPATCH);
+        // With a password the apps' Host is not checked (they may use any name; browsers: below).
+        assert_eq!(run(&auth, &info(Method::Get, "/api/device", None, t, host("evil.com"))), DISPATCH);
+        assert_eq!(run(&auth, &info(Method::Get, "/api/device", None, t, ReqHeaders::default())), DISPATCH);
+        // A valid token does not make a cross-origin mutation acceptable.
+        let cross = ReqHeaders { origin: Some("http://evil.com"), ..h };
+        assert_eq!(
+            run(&auth, &info(Method::Post, "/api/device/reboot", None, t, cross)),
+            reply(403, "cross-origin request refused")
+        );
+        assert_eq!(run(&auth, &info(Method::Get, "/api/device", None, t, cross)), DISPATCH);
+        let site = ReqHeaders { sec_fetch_site: Some("cross-site"), ..h };
+        assert_eq!(
+            run(&auth, &info(Method::Put, "/api/wifi/settings", None, t, site)),
+            reply(403, "cross-origin request refused")
+        );
+        assert_eq!(
+            run(&auth, &info(Method::Get, "/api/live-activity", None, t, h)),
+            Pre::Dispatch { body_limit: LIVE_ACTIVITY_BODY_MAX }
+        );
+        assert_eq!(
+            run(&auth, &info(Method::Put, "/api/live-activity/x", None, t, h)),
+            Pre::Dispatch { body_limit: LIVE_ACTIVITY_BODY_MAX }
+        );
+        assert_eq!(run(&auth, &info(Method::Get, "/api/lan/ping", None, t, h)), Pre::Reply(200, json!({"ok": true})));
+        assert_eq!(run(&auth, &info(Method::Post, "/api/lan/upload", None, t, h)), Pre::LanUpload);
+        assert_eq!(run(&auth, &info(Method::Other, "/", None, t, h)), DISPATCH);
+        // Event streams carry the token's session.
+        assert_eq!(
+            run(&auth, &info(Method::Get, "/api/events", Some("topics=sms"), t, h)),
+            Pre::Events { owner: token.id }
+        );
+        assert_eq!(run(&auth, &info(Method::Get, "/api/events", None, None, h)), reply(401, "unauthorized"));
+        assert_eq!(run(&auth, &info(Method::Post, "/api/events", None, t, h)), DISPATCH);
+    }
+
+    #[test]
+    fn precheck_with_password_host_checks_browser_requests() {
+        let auth = with_password();
+        let rebound = ReqHeaders {
+            host: Some("evil.example:9090"),
+            origin: Some("http://evil.example:9090"),
+            ..ReqHeaders::default()
+        };
+        // A rebound page posting passwords: refused before the limiter.
+        let login = lan(info(Method::Post, "/api/auth/login", None, None, rebound));
+        assert_eq!(run(&auth, &login), reply(403, "host not allowed"));
+        let fetch_site = ReqHeaders { origin: None, sec_fetch_site: Some("same-origin"), ..rebound };
+        assert_eq!(run(&auth, &lan(info(Method::Post, "/api/auth/login", None, None, fetch_site))), reply(403, "host not allowed"));
+        let no_host = ReqHeaders { host: None, ..rebound };
+        assert_eq!(run(&auth, &lan(info(Method::Post, "/api/auth/login", None, None, no_host))), reply(400, "missing host"));
+        for _ in 0..40 {
+            assert_eq!(run(&auth, &login), reply(403, "host not allowed"));
+        }
+        assert!(auth.login(PW, Kind::Bearer, peer(9), &[]).is_ok(), "the limiter was touched");
+        // The apps send no Origin: any name, as before.
+        let app = ReqHeaders { origin: None, ..rebound };
+        assert_eq!(run(&auth, &lan(info(Method::Post, "/api/auth/login", None, None, app))), Pre::Login);
+        // A browser on an allowed name still gets the same-origin rules.
+        let same = ReqHeaders { host: Some("192.168.0.1:9090"), origin: Some("http://192.168.0.1:9090"), ..rebound };
+        assert_eq!(run(&auth, &lan(info(Method::Post, "/api/auth/login", None, None, same))), Pre::Login);
+        // Tailscale names count only for Tailscale (loopback) peers.
+        let ts = ReqHeaders { host: Some("u60-pro:9090"), origin: Some("http://u60-pro:9090"), ..rebound };
+        assert_eq!(run(&auth, &info(Method::Post, "/api/auth/login", None, None, ts)), Pre::Login);
+        assert_eq!(run(&auth, &lan(info(Method::Post, "/api/auth/login", None, None, ts))), reply(403, "host not allowed"));
+    }
+
+    #[test]
+    fn precheck_without_password() {
+        let auth = AuthState::new();
+        let h = host("192.168.0.1:9090");
+        // Open, but Host-checked.
+        assert_eq!(run(&auth, &info(Method::Get, "/api/device", None, None, h)), DISPATCH);
+        assert_eq!(run(&auth, &info(Method::Get, "/api/device", None, None, host("u60-pro:9090"))), DISPATCH);
+        assert_eq!(run(&auth, &info(Method::Get, "/api/device", None, None, host("localhost"))), DISPATCH);
+        // The device's own names only from loopback (Tailscale) peers.
+        assert_eq!(run(&auth, &lan(info(Method::Get, "/api/device", None, None, host("u60-pro:9090")))), reply(403, "host not allowed"));
+        assert_eq!(run(&auth, &lan(info(Method::Get, "/api/device", None, None, host("localhost")))), reply(403, "host not allowed"));
+        assert_eq!(run(&auth, &lan(info(Method::Get, "/api/device", None, None, h))), DISPATCH);
+        assert_eq!(run(&auth, &info(Method::Get, "/api/device", None, None, host("evil.com:9090"))), reply(403, "host not allowed"));
+        assert_eq!(run(&auth, &info(Method::Get, "/api/device", None, None, ReqHeaders::default())), reply(400, "missing host"));
+        assert_eq!(run(&auth, &info(Method::Post, "/api/auth/login", None, None, host("evil.com"))), reply(403, "host not allowed"));
+        // Cross-origin mutations are refused; same-origin ones pass.
+        let cross = ReqHeaders { origin: Some("http://evil.com"), ..h };
+        assert_eq!(run(&auth, &info(Method::Post, "/api/device/reboot", None, None, cross)), reply(403, "cross-origin request refused"));
+        let same = ReqHeaders { origin: Some("http://192.168.0.1:9090"), ..h };
+        assert_eq!(run(&auth, &info(Method::Post, "/api/device/reboot", None, None, same)), DISPATCH);
+        assert_eq!(run(&auth, &info(Method::Post, "/api/auth/login", None, None, h)), Pre::Login);
+        assert_eq!(
+            run(&auth, &info(Method::Get, "/api/live-activity", None, None, h)),
+            reply(403, "agent password required")
+        );
+        assert_eq!(
+            run(&auth, &info(Method::Delete, "/api/live-activity", None, None, h)),
+            reply(403, "agent password required")
+        );
+        assert_eq!(run(&auth, &info(Method::Get, "/api/lan/ping", Some("x=1"), None, h)), Pre::Reply(200, json!({"ok": true})));
+        // Wrong method: not special, falls through to route()'s 404.
+        assert_eq!(run(&auth, &info(Method::Post, "/api/lan/ping", None, None, h)), DISPATCH);
+        assert_eq!(
+            run(&auth, &info(Method::Get, "/api/events", Some("topics=sms"), None, h)),
+            reply(403, "agent password required")
+        );
+        assert_eq!(run(&auth, &info(Method::Get, "/api/events", None, None, host("evil.com"))), reply(403, "host not allowed"));
+    }
+
+    #[test]
+    fn precheck_lan_download_size() {
+        let auth = AuthState::new();
+        let h = host("192.168.0.1");
+        let size = |q| match run(&auth, &info(Method::Get, "/api/lan/download", q, None, h)) {
+            Pre::LanDownload { size } => size,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(size(None), 50 * 1024 * 1024);
+        assert_eq!(size(Some("size=1024")), 1024);
+        assert_eq!(size(Some("x=1&size=2048")), 2048);
+        assert_eq!(size(Some("size=abc")), 50 * 1024 * 1024);
+        assert_eq!(size(Some("size=-1")), 50 * 1024 * 1024);
+        assert_eq!(size(Some("size")), 50 * 1024 * 1024);
+        assert_eq!(size(Some("size=")), 50 * 1024 * 1024);
+        assert_eq!(size(Some("size=999999999999")), 200 * 1024 * 1024);
+        assert_eq!(size(Some("")), 50 * 1024 * 1024);
+    }
+
+    #[test]
+    fn method_from_http() {
+        use axum::http::Method as M;
+        assert_eq!(Method::from(&M::GET), Method::Get);
+        assert_eq!(Method::from(&M::POST), Method::Post);
+        assert_eq!(Method::from(&M::PUT), Method::Put);
+        assert_eq!(Method::from(&M::DELETE), Method::Delete);
+        assert_eq!(Method::from(&M::HEAD), Method::Other);
+        assert_eq!(Method::from(&M::PATCH), Method::Other);
+        assert_eq!(Method::from(&M::from_bytes(b"get").unwrap()), Method::Other);
+    }
 }

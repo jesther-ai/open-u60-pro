@@ -7,7 +7,7 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
-use std::sync::{mpsc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use codec::Command;
@@ -33,16 +33,42 @@ struct Worker {
     wake: File,
 }
 
+/// Called on the worker thread when what `GET /api/stk/session` answers changes.
+pub type OnChange = Arc<dyn Fn() + Send + Sync>;
+
+/// What `GET /api/stk/session` answers, as the worker last published it.
+type Shown = Arc<Mutex<Option<Reply>>>;
+
 /// One owner of the RIL stream prevents competing readers and crossed STK sessions.
 pub struct StkService {
     worker: Mutex<Option<Worker>>,
+    on_change: OnceLock<OnChange>,
+    shown: Shown,
 }
 
 impl StkService {
     pub fn new() -> Self {
         Self {
             worker: Mutex::new(None),
+            on_change: OnceLock::new(),
+            shown: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// What `GET /api/stk/session` answers, from memory: the worker's last
+    /// published state (no worker yet: no session). Never starts the worker
+    /// or waits for it (the live hub's `stk` topic reads this).
+    #[allow(dead_code)] // the stk_probe example has no hub
+    pub fn session_view(&self) -> Reply {
+        self.shown.lock().unwrap_or_else(PoisonError::into_inner).clone().unwrap_or_else(|| error(503, ""))
+    }
+
+    /// Tell `f` (the live hub's `stk` topic) whenever the session's state changes: a SIM
+    /// command, a reply, the session ending. A status read changes nothing, so it never calls.
+    /// Set once, before the first request.
+    #[allow(dead_code)] // the stk_probe example has no hub
+    pub fn on_change(&self, f: OnChange) {
+        let _ = self.on_change.set(f);
     }
 
     pub fn request(&self, action: &'static str, body: &[u8]) -> Reply {
@@ -67,9 +93,11 @@ impl StkService {
                     return error(503, "cannot start STK worker");
                 }
             };
+            let changed = self.on_change.get().cloned();
+            let shown = Arc::clone(&self.shown);
             if std::thread::Builder::new()
                 .name("stk-ril".into())
-                .spawn(move || run(rx, wake_rx, SOCKET))
+                .spawn(move || run(rx, wake_rx, SOCKET, changed, &shown))
                 .is_err()
             {
                 return error(503, "cannot start STK worker");
@@ -93,6 +121,7 @@ impl StkService {
             Err(mpsc::TrySendError::Full(_)) => return error(503, "STK request queue busy"),
             Err(mpsc::TrySendError::Disconnected(_)) => {
                 *guard = None;
+                *self.shown.lock().unwrap_or_else(PoisonError::into_inner) = None;
                 return error(503, "STK worker stopped; retry loading the menu");
             }
         }
@@ -543,13 +572,14 @@ impl Session {
 /// Worker loop. Without a session it parks in `recv()`; with one it parks in `poll()` on the RIL
 /// socket and the wake pipe, with a timeout only while a deadline is pending, so an idle toolkit
 /// session costs no wakeups at all.
-fn run(rx: mpsc::Receiver<Request>, wake: File, path: &str) {
+fn run(rx: mpsc::Receiver<Request>, wake: File, path: &str, changed: Option<OnChange>, shown: &Mutex<Option<Reply>>) {
     let mut session: Option<Session> = None;
     let mut last_error = String::new();
+    let changed = changed.as_deref();
     loop {
         if session.is_none() {
             match rx.recv() {
-                Ok(req) => dispatch(req, &mut session, &mut last_error, path),
+                Ok(req) => serve(req, &mut session, &mut last_error, path, shown, changed),
                 Err(_) => return,
             }
             continue;
@@ -559,7 +589,7 @@ fn run(rx: mpsc::Receiver<Request>, wake: File, path: &str) {
         drain_wake(&wake);
         loop {
             match rx.try_recv() {
-                Ok(req) => dispatch(req, &mut session, &mut last_error, path),
+                Ok(req) => serve(req, &mut session, &mut last_error, path, shown, changed),
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => return,
             }
@@ -573,6 +603,49 @@ fn run(rx: mpsc::Receiver<Request>, wake: File, path: &str) {
             .and_then(|()| s.check_deadlines());
         if let Err(e) = result {
             invalidate(&mut session, &mut last_error, e);
+        }
+        publish(&session, &last_error, shown, changed);
+    }
+}
+
+/// One request, then the state published. A read's ("menu", "status")
+/// answer, which is always immediate, goes out after the publish, so a
+/// page that opened the menu and then reads the topic sees what it did.
+fn serve(mut req: Request, session: &mut Option<Session>, last_error: &mut String, path: &str, shown: &Mutex<Option<Reply>>, changed: Option<&(dyn Fn() + Send + Sync)>) {
+    let read = matches!(req.action, "menu" | "status").then(|| {
+        let (tx, rx) = mpsc::channel();
+        (std::mem::replace(&mut req.reply, tx), rx)
+    });
+    dispatch(req, session, last_error, path);
+    publish(session, last_error, shown, changed);
+    if let Some((reply, rx)) = read {
+        if let Ok(answer) = rx.try_recv() {
+            let _ = reply.send(answer);
+        }
+    }
+}
+
+/// What `GET /api/stk/session` answers now.
+fn view(session: &Option<Session>, last_error: &str) -> Reply {
+    match session {
+        Some(s) => s.snapshot(),
+        None => error(503, last_error),
+    }
+}
+
+/// The hub's `stk` topic follows the worker (`StkService::on_change`): what
+/// `GET /api/stk/session` answers is kept in `shown` (the topic reads it from memory,
+/// `StkService::session_view`), and when it changes (a SIM command, a reply, the session
+/// ending) the hub is told, so a watching stream re-reads the topic. A read changes nothing,
+/// so it never calls again; with no stream open the hub reads nothing.
+fn publish(session: &Option<Session>, last_error: &str, shown: &Mutex<Option<Reply>>, changed: Option<&(dyn Fn() + Send + Sync)>) {
+    let now = view(session, last_error);
+    let mut cur = shown.lock().unwrap_or_else(PoisonError::into_inner);
+    if cur.as_ref() != Some(&now) {
+        *cur = Some(now);
+        drop(cur);
+        if let Some(f) = changed {
+            f();
         }
     }
 }
@@ -637,6 +710,28 @@ mod tests {
             peer,
         )
     }
+    /// The live topic reads the worker's state from memory: nothing before
+    /// a worker exists (never started by the read); a read's answer goes out
+    /// after the state is published, so what the page reads next matches it.
+    #[test]
+    fn the_session_view_is_read_from_memory() {
+        let service = StkService::new();
+        assert_eq!(service.session_view(), error(503, ""));
+        assert!(service.worker.lock().unwrap().is_none());
+        let (s, _peer) = session();
+        let mut live = Some(s);
+        let mut last_error = String::new();
+        let (tx, rx) = mpsc::channel();
+        serve(Request { action: "status", body: json!({}), reply: tx }, &mut live, &mut last_error, "", &service.shown, None);
+        let answer = rx.recv().unwrap();
+        assert_eq!((answer.0, service.session_view()), (200, answer.clone()));
+        // A failed session: the route's answer, from memory.
+        invalidate(&mut live, &mut last_error, "RIL socket disconnected".into());
+        let (tx, rx) = mpsc::channel();
+        serve(Request { action: "status", body: json!({}), reply: tx }, &mut live, &mut last_error, "", &service.shown, None);
+        assert_eq!((rx.recv().unwrap(), service.session_view()), (view(&None, &last_error), view(&None, &last_error)));
+    }
+
     #[test]
     fn successful_initialization_does_not_claim_sim_support() {
         let (mut s, _peer) = session();
@@ -842,6 +937,55 @@ mod tests {
         .unwrap();
         assert_eq!(rx.recv().unwrap().0, 409);
         assert_eq!(s.pending.len(), 1);
+    }
+
+    /// The `stk` topic is told only when what `GET /api/stk/session` answers changes: a
+    /// status read (the hub's own) never calls it.
+    #[test]
+    fn the_topic_follows_changes_of_the_session_answer_only() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = AtomicUsize::new(0);
+        let f = || {
+            calls.fetch_add(1, Ordering::Relaxed);
+        };
+        let taken = || calls.swap(0, Ordering::Relaxed);
+        let shown = Mutex::new(None);
+        let mut live: Option<Session> = None;
+        publish(&live, "", &shown, Some(&f));
+        publish(&live, "", &shown, Some(&f));
+        assert_eq!(taken(), 1);
+        let (mut s, _peer) = session();
+        let (tx, rx) = mpsc::channel();
+        s.handle_request(Request { action: "status", body: json!({}), reply: tx }).unwrap();
+        assert_eq!(rx.recv().unwrap().0, 200);
+        live = Some(s);
+        publish(&live, "", &shown, Some(&f));
+        let (tx, rx) = mpsc::channel();
+        if let Some(s) = live.as_mut() {
+            s.handle_request(Request { action: "status", body: json!({}), reply: tx }).unwrap();
+        }
+        assert_eq!(rx.recv().unwrap().0, 200);
+        publish(&live, "", &shown, Some(&f));
+        assert_eq!(taken(), 1);
+        // A SIM command arrives: one call.
+        let cmd =
+            Command::parse(&codec::unhex("D00F8103092400820281828F04014F6E65").unwrap()).unwrap();
+        if let Some(s) = live.as_mut() {
+            s.proactive(cmd).unwrap();
+        }
+        publish(&live, "", &shown, Some(&f));
+        publish(&live, "", &shown, Some(&f));
+        assert_eq!(taken(), 1);
+        // The session fails: one more.
+        let mut last_error = String::new();
+        invalidate(&mut live, &mut last_error, "RIL socket disconnected".into());
+        publish(&live, &last_error, &shown, Some(&f));
+        publish(&live, &last_error, &shown, Some(&f));
+        assert_eq!(taken(), 1);
+        // What the topic reads from memory is what the route would answer.
+        assert_eq!(shown.lock().unwrap().clone(), Some(view(&live, &last_error)));
+        // Without a hook nothing is called.
+        publish(&None, "other", &shown, None);
     }
 
     #[test]

@@ -877,6 +877,55 @@ impl TailscaleManager {
         )
     }
 
+    /// Host names the HTTP Host allowlist accepts for the tailnet: the
+    /// configured hostname, the MagicDNS name and its first label (which
+    /// differs from the hostname after a collision or an admin rename),
+    /// lowercased and de-duplicated; empty while Tailscale is disabled.
+    /// Never blocks: `None` if `config` (held across flash writes) or
+    /// `last_status` is locked or poisoned; the caller keeps its last answer.
+    pub fn ui_host_names(&self) -> Option<Vec<String>> {
+        let hostname = {
+            let cfg = self.config.try_lock().ok()?;
+            if !cfg.enabled {
+                return Some(Vec::new());
+            }
+            cfg.hostname.to_ascii_lowercase()
+        };
+        let dns_name = {
+            let status = self.last_status.try_lock().ok()?;
+            status.0["dns_name"].as_str().map(str::to_ascii_lowercase)
+        };
+        let mut names = vec![hostname];
+        if let Some(dns) = dns_name {
+            let dns = dns.strip_suffix('.').unwrap_or(&dns);
+            names.push(dns.to_owned());
+            names.push(dns.split('.').next().unwrap_or_default().to_owned());
+        }
+        let mut unique: Vec<String> = Vec::with_capacity(names.len());
+        for n in names {
+            if !n.is_empty() && !unique.contains(&n) {
+                unique.push(n);
+            }
+        }
+        Some(unique)
+    }
+
+    /// A manager with the given config and cached status, for tests of
+    /// callers (no file is read, nothing is started).
+    #[cfg(test)]
+    pub(crate) fn for_test(cfg: TsConfig, status: Value) -> Self {
+        let mgr = Self::new();
+        *mgr.config.lock().unwrap() = cfg;
+        *mgr.last_status.lock().unwrap() = (status, 0);
+        mgr
+    }
+
+    /// Holds `config` as a flash write would, for contention tests.
+    #[cfg(test)]
+    pub(crate) fn lock_config_for_test(&self) -> std::sync::MutexGuard<'_, TsConfig> {
+        self.config.lock().unwrap()
+    }
+
     // --- Wakelock ---
 
     fn acquire_wakelock(&self) {

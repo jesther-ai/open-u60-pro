@@ -103,12 +103,13 @@ fn has_enabled_job(data: &SchedulerData) -> bool {
     data.jobs.iter().any(|j| j.enabled)
 }
 
-fn parse_method(s: &str) -> Option<tiny_http::Method> {
+fn parse_method(s: &str) -> Option<crate::server::Method> {
+    use crate::server::Method;
     match s {
-        "GET" => Some(tiny_http::Method::Get),
-        "POST" => Some(tiny_http::Method::Post),
-        "PUT" => Some(tiny_http::Method::Put),
-        "DELETE" => Some(tiny_http::Method::Delete),
+        "GET" => Some(Method::Get),
+        "POST" => Some(Method::Post),
+        "PUT" => Some(Method::Put),
+        "DELETE" => Some(Method::Delete),
         _ => None,
     }
 }
@@ -531,6 +532,17 @@ mod tests {
             data: Mutex::new(SchedulerData { jobs }),
             changed: Condvar::new(),
         }
+    }
+
+    #[test]
+    fn parse_method_maps_to_route_methods() {
+        use crate::server::Method;
+        assert_eq!(parse_method("GET"), Some(Method::Get));
+        assert_eq!(parse_method("POST"), Some(Method::Post));
+        assert_eq!(parse_method("PUT"), Some(Method::Put));
+        assert_eq!(parse_method("DELETE"), Some(Method::Delete));
+        assert_eq!(parse_method("get"), None);
+        assert_eq!(parse_method("HEAD"), None);
     }
 
     #[test]

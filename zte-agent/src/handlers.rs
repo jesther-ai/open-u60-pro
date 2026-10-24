@@ -3,7 +3,7 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 
 use crate::at_cmd::AtPort;
-use crate::auth::AuthState;
+use crate::auth::{self, AuthState, Kind, LoginError, PeerKey};
 use crate::cache::{self, UbusCache};
 use crate::charge_policy::ChargeLimitEnforcer;
 use crate::scheduler::Scheduler;
@@ -13,7 +13,7 @@ use crate::ubus;
 
 pub struct AppState {
     pub live_activity: Arc<crate::live_activity::LiveActivity>,
-    pub auth: AuthState,
+    pub auth: Arc<AuthState>,
     pub cpu: CpuTracker,
     pub speed: SpeedTracker,
     pub proc_tracker: ProcessTracker,
@@ -37,13 +37,19 @@ pub struct AppState {
     pub ussd_prompt_at: std::sync::atomic::AtomicU64,
     /// Tracks the active SIM's identity across profile switches and swaps (see sim_identity.rs).
     pub sim_identity: Arc<crate::sim_identity::SimIdentity>,
+    /// Live updates for `GET /api/events` (see events/); no threads until `events::start`.
+    pub hub: Arc<crate::events::Hub>,
+    /// LAN HTTPS with the router's own CA (see tls/); nothing until `start` or Turn On.
+    pub tls: Arc<crate::tls::Tls>,
 }
 
 impl AppState {
     pub fn new() -> Self {
+        let live_activity = Arc::new(crate::live_activity::LiveActivity::new());
         Self {
-            live_activity: Arc::new(crate::live_activity::LiveActivity::new()),
-            auth: AuthState::new(),
+            tls: Arc::new(crate::tls::Tls::router(Arc::clone(&live_activity))),
+            live_activity,
+            auth: Arc::new(AuthState::new()),
             cpu: CpuTracker::new(),
             speed: SpeedTracker::new(),
             proc_tracker: ProcessTracker::new(),
@@ -62,12 +68,14 @@ impl AppState {
             call_active: std::sync::atomic::AtomicBool::new(false),
             ussd_prompt_at: std::sync::atomic::AtomicU64::new(0),
             sim_identity: Arc::new(crate::sim_identity::SimIdentity::new()),
+            hub: Arc::new(crate::events::Hub::new(Arc::new(crate::boottime::BootClock))),
         }
     }
 }
 
-/// POST /api/auth/login — body: {"password": "..."}
-pub fn login(state: &AppState, body: &[u8]) -> (u16, Value) {
+/// POST /api/auth/login — body: {"password": "..."}. `peer` is the socket
+/// address the login rate limit keys on.
+pub fn login(state: &AppState, body: &[u8], peer: PeerKey) -> (u16, Value) {
     let parsed: Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(_) => return (400, json!({"ok": false, "error": "invalid JSON"})),
@@ -76,9 +84,18 @@ pub fn login(state: &AppState, body: &[u8]) -> (u16, Value) {
         Some(p) => p,
         None => return (400, json!({"ok": false, "error": "missing 'password' field"})),
     };
-    match state.auth.login(password) {
-        Some(token) => (200, json!({"ok": true, "data": {"token": token}})),
-        None => (401, json!({"ok": false, "error": "invalid password"})),
+    match state.auth.login(password, Kind::Bearer, peer, &[]) {
+        Ok(issued) => (200, json!({"ok": true, "data": {"token": issued.token.expose()}})),
+        Err(LoginError::NoPassword | LoginError::BadPassword) => {
+            (401, json!({"ok": false, "error": "invalid password"}))
+        }
+        // The listener copies `retry_after` into a Retry-After header.
+        Err(LoginError::RateLimited { retry_after }) => (
+            429,
+            json!({"ok": false, "error": "too many login attempts",
+                   "retry_after": auth::retry_after_secs(retry_after)}),
+        ),
+        Err(LoginError::Entropy) => (503, json!({"ok": false, "error": "entropy unavailable"})),
     }
 }
 
@@ -433,5 +450,33 @@ config other 'other'
             uci_config_option("config s s\n\toption o v\n", "s", "o").as_deref(),
             Some("v")
         );
+    }
+}
+
+#[cfg(test)]
+mod login_tests {
+    use super::*;
+    use crate::auth::{AuthConfig, FailRng, SeqRng};
+    use crate::boottime::FakeClock;
+    use std::net::SocketAddr;
+
+    fn peer(n: u8) -> PeerKey {
+        PeerKey::from(SocketAddr::from(([10, 0, 210, n], 5000)))
+    }
+
+    #[test]
+    fn login_entropy_and_no_password_replies() {
+        let body = br#"{"password":"x"}"#;
+        let mut st = AppState::new();
+        st.auth = Arc::new(AuthState::with_parts(FakeClock::at_secs(1), Box::new(FailRng), AuthConfig::default()));
+        st.auth.set_password("x");
+        assert_eq!(login(&st, body, peer(1)), (503, json!({"ok": false, "error": "entropy unavailable"})));
+
+        // No password set: the same 401 as a wrong one, and never rate limited.
+        let mut st = AppState::new();
+        st.auth = Arc::new(AuthState::with_parts(FakeClock::at_secs(1), Box::new(SeqRng::new()), AuthConfig::default()));
+        for _ in 0..10 {
+            assert_eq!(login(&st, body, peer(2)), (401, json!({"ok": false, "error": "invalid password"})));
+        }
     }
 }

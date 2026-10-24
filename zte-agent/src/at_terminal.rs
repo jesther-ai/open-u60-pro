@@ -5,6 +5,12 @@ use serde_json::{json, Value};
 use crate::at_cmd;
 use crate::handlers::AppState;
 
+/// The command as it is sent: shell-dangerous characters stripped. The web
+/// UI checks this form of a command (its dangerous-command question).
+pub(crate) fn sanitize(command: &str) -> String {
+    command.chars().filter(|c| !matches!(c, '\'' | '`' | '$' | ';' | '|' | '&')).collect()
+}
+
 /// POST /api/at/send — execute an AT command
 /// Body: {"command": "AT+CSQ", "timeout": 3}
 pub fn at_send(state: &AppState, body: &[u8]) -> (u16, Value) {
@@ -30,11 +36,7 @@ pub fn at_send(state: &AppState, body: &[u8]) -> (u16, Value) {
         .max(1)
         .min(30);
 
-    // Sanitize: strip shell-dangerous characters
-    let sanitized: String = command
-        .chars()
-        .filter(|c| !matches!(c, '\'' | '`' | '$' | ';' | '|' | '&'))
-        .collect();
+    let sanitized = sanitize(command);
 
     if sanitized.is_empty() {
         return (400, json!({"ok": false, "error": "command is empty after sanitization"}));
