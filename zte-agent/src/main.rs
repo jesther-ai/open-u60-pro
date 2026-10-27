@@ -7,6 +7,10 @@ mod cache;
 mod cell;
 mod charge_policy;
 mod conn_watchdog;
+mod client_details;
+mod console;
+mod dashboard;
+mod dashboard_extra;
 mod device_ext;
 pub mod doh;
 mod esim;
@@ -106,6 +110,7 @@ fn main() {
     // Power-state events for the standby Wi-Fi guard (unless opted out).
     let standby_rx = standby_guard::subscribe(&event_bus);
     events::start(&state, &event_bus);
+    state.dashboard.start(Arc::clone(&state),Arc::clone(&event_bus));
     event_bus.start();
 
     Arc::clone(&state.cache).start_event_invalidation(cache_events);

@@ -88,6 +88,7 @@ pub enum Pre {
     LanUpload,
     /// `GET /api/events`: a stream for this bearer token.
     Events { owner: SessionId },
+    Dashboard,
     /// Read at most `body_limit` bytes, then `route()`.
     Dispatch { body_limit: usize },
 }
@@ -134,6 +135,9 @@ pub fn precheck(req: &ReqInfo, env: &PreEnv) -> Pre {
         (Method::Post, "/api/lan/upload") => return Pre::LanUpload,
         // Streams belong to a token (their expiry and per-token cap), so
         // they need a password.
+        (Method::Get, "/api/dashboard/events") => {
+            return if principal.is_some() { Pre::Dashboard } else { refuse(403,"agent password required") };
+        }
         (Method::Get, "/api/events") => {
             return match principal {
                 Some(p) => Pre::Events { owner: p.id },
@@ -192,6 +196,7 @@ pub fn encode((status, body): (u16, Value)) -> Encoded {
 pub fn lane(method: Method, path: &str) -> Lane {
     use Method::{Delete, Get, Post};
     let slow = match (method, path) {
+        (Get, "/api/network/client-details") => true,
         (Get, "/api/esim/switch")
         | (Get | Delete, "/api/esim/download")
         | (Post, "/api/esim/download/confirm" | "/api/esim/download/cancel")
@@ -234,7 +239,7 @@ pub fn parse_query_usize(query: Option<&str>, key: &str) -> Option<usize> {
     None
 }
 
-pub fn route(method: &Method, path: &str, state: &AppState, body: &[u8]) -> (u16, Value) {
+fn route_inner(method: &Method, path: &str, state: &AppState, body: &[u8]) -> (u16, Value) {
     crate::httpd::gate::debug_assert_may_block();
     if *method != Method::Get {
         crate::httpd::gate::debug_assert_may_change(path);
@@ -252,6 +257,7 @@ pub fn route(method: &Method, path: &str, state: &AppState, body: &[u8]) -> (u16
         (&Method::Get, "/api/cpu") => handlers::cpu(state),
         (&Method::Get, "/api/memory") => handlers::memory(state),
         // Network
+        (&Method::Get, "/api/network/client-details") => { let reading=state.client_details.snapshot(); (if reading["ok"]==true {200} else {503},reading) },
         (&Method::Get, "/api/network/signal") => handlers::network_signal(state),
         (&Method::Get, "/api/network/traffic") => handlers::network_traffic(state),
         (&Method::Get, "/api/network/speed") => handlers::network_speed(state),
@@ -413,9 +419,9 @@ pub fn route(method: &Method, path: &str, state: &AppState, body: &[u8]) -> (u16
         (&Method::Post, "/api/esim/delete") => esim::delete(state, body),
         (&Method::Post, "/api/esim/download") => esim::download_start(state, body),
         (&Method::Get, "/api/esim/download") => esim::download_status(state),
-        (&Method::Delete, "/api/esim/download") => esim::download_dismiss(state),
+        (&Method::Delete, "/api/esim/download") => esim::download_dismiss_for(state, body),
         (&Method::Post, "/api/esim/download/confirm") => esim::download_confirm(state, body),
-        (&Method::Post, "/api/esim/download/cancel") => esim::download_cancel(state),
+        (&Method::Post, "/api/esim/download/cancel") => esim::download_cancel_for(state, body),
         // DoH
         (&Method::Get, "/api/doh/status") => doh_status(state),
         (&Method::Put, "/api/doh/config") => doh_config_set(state, body),
@@ -505,6 +511,15 @@ fn doh_cache_list(state: &AppState) -> (u16, Value) {
 fn doh_cache_clear(state: &AppState) -> (u16, Value) {
     state.doh.clear_cache();
     (200, json!({"ok": true}))
+}
+
+
+pub fn route(method: &Method, path: &str, state: &AppState, body: &[u8]) -> (u16, Value) {
+    let reply = route_inner(method,path,state,body);
+    if reply.0 < 300 && matches!(method,Method::Put|Method::Post|Method::Delete) && path != "/api/auth/login" {
+        state.dashboard.request_refresh();
+    }
+    reply
 }
 
 #[cfg(test)]

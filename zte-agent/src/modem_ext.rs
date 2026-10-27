@@ -103,7 +103,8 @@ pub fn modem_network_mode_set(state: &AppState, body: &[u8]) -> (u16, Value) {
     }
 }
 
-pub fn modem_scan(_state: &AppState) -> (u16, Value) {
+pub fn modem_scan(state: &AppState) -> (u16, Value) {
+    note_user_modem_change(state);
     match ubus::call("zte_nwinfo_api", "nwinfo_manual_scan", Some("{}")) {
         Ok(data) => (200, json!({"ok": true, "data": data})),
         Err(e) => (503, json!({"ok": false, "error": e})),
@@ -124,11 +125,12 @@ pub fn modem_scan_results(_state: &AppState) -> (u16, Value) {
     }
 }
 
-pub fn modem_register(_state: &AppState, body: &[u8]) -> (u16, Value) {
+pub fn modem_register(state: &AppState, body: &[u8]) -> (u16, Value) {
     let parsed: Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(_) => return (400, json!({"ok": false, "error": "invalid JSON"})),
     };
+    note_user_modem_change(state);
     match ubus::call("zte_nwinfo_api", "nwinfo_manual_register", Some(&parsed.to_string())) {
         Ok(data) => (200, json!({"ok": true, "data": data})),
         Err(e) => (503, json!({"ok": false, "error": e})),

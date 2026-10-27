@@ -739,6 +739,22 @@ pub fn switch_status(state: &AppState) -> (u16, Value) {
     (200, json!({"ok": true, "data": view}))
 }
 
+/// The web stream reads saved state only: it never opens a card channel or sends receipts.
+pub(crate) fn dashboard_status(state: &AppState) -> Value {
+    let inner = &state.esim.inner;
+    let inventory = inner.inventory.lock().unwrap();
+    let loaded = inventory.profiles.is_some();
+    let view = inventory.view(inner.instance, inner.busy.load(Ordering::Acquire));
+    drop(inventory);
+    json!({"ok":true,"data":{
+        "agent_instance":inner.instance,"inventory_loaded":loaded,"inventory":view,
+        "switch":switch_status(state).1["data"],
+        "download":download_status(state).1["data"],
+        "receipts":inner.receipts.lock().unwrap().view(true),
+        "password_required":!state.auth.has_password(),
+    }})
+}
+
 /// GET /api/esim/chip — card identity and capacity.
 pub fn chip(state: &AppState) -> (u16, Value) {
     let inner = &state.esim.inner;
@@ -1433,6 +1449,9 @@ pub fn download_confirm(state: &AppState, body: &[u8]) -> (u16, Value) {
     };
     let inner = &state.esim.inner;
     let mut d = inner.download.lock().unwrap();
+    if let Err(reply) = check_download_selection(inner.instance, &d, &parsed) {
+        return reply;
+    }
     if d.state != "confirm" {
         return error(409, "no download is waiting for confirmation");
     }
@@ -1456,9 +1475,16 @@ fn installing_step(step: &str) -> bool {
 /// POST /api/esim/download/cancel — stops a running download at its next step; an ES9+ request
 /// already running ends within its timeout. At the preview it postpones, so the QR code stays
 /// usable.
-pub fn download_cancel(state: &AppState) -> (u16, Value) {
+pub fn download_cancel_for(state: &AppState, body: &[u8]) -> (u16, Value) {
+    let parsed = match download_selection(body) {
+        Ok(value) => value,
+        Err(reply) => return reply,
+    };
     let inner = &state.esim.inner;
     let mut d = inner.download.lock().unwrap();
+    if let Err(reply) = check_download_selection(inner.instance, &d, &parsed) {
+        return reply;
+    }
     if d.state == "running" && installing_step(&d.step) {
         return error(409, "the profile is being installed and can't be cancelled now");
     }
@@ -1495,13 +1521,42 @@ pub fn download_status(state: &AppState) -> (u16, Value) {
 }
 
 /// DELETE /api/esim/download — dismisses a finished result (the app's "close" on the result card).
-pub fn download_dismiss(state: &AppState) -> (u16, Value) {
-    let mut d = state.esim.inner.download.lock().unwrap();
+pub fn download_dismiss_for(state: &AppState, body: &[u8]) -> (u16, Value) {
+    let parsed = match download_selection(body) {
+        Ok(value) => value,
+        Err(reply) => return reply,
+    };
+    let inner = &state.esim.inner;
+    let mut d = inner.download.lock().unwrap();
+    if let Err(reply) = check_download_selection(inner.instance, &d, &parsed) {
+        return reply;
+    }
     if !d.is_finished() && !d.state.is_empty() && d.state != "idle" {
         return error(409, "a download is still in progress");
     }
     *d = Download::default();
     (200, json!({"ok": true, "data": d.view()}))
+}
+
+fn download_selection(body: &[u8]) -> Result<Value, (u16, Value)> {
+    // Older clients send no body for cancel/dismiss.
+    if body.is_empty() {
+        return Ok(json!({}));
+    }
+    serde_json::from_slice(body).map_err(|_| error(400, "invalid JSON"))
+}
+
+fn check_download_selection(instance: u64, download: &Download, body: &Value) -> Result<(), (u16, Value)> {
+    let Some(expected) = body.get("expected") else {
+        return Ok(());
+    };
+    let (Some(agent), Some(started)) = (expected["agent_instance"].as_u64(), expected["started_at"].as_u64()) else {
+        return Err(error(400, "expected download must include agent_instance and started_at"));
+    };
+    if agent != instance || started != download.started_at {
+        return Err(error(409, "the download changed; review its current status before continuing"));
+    }
+    Ok(())
 }
 
 /// Lists the receipts waiting on the card (guard held) and merges them into the saved state.
@@ -1987,6 +2042,29 @@ fn card(args: &[&str], limit: Duration) -> Result<Value, CardError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn download_selection_rejects_another_job_or_agent_before_acting() {
+        let download = Download { started_at: 123, ..Download::default() };
+        assert!(check_download_selection(10, &download, &json!({"expected":{"agent_instance":10,"started_at":123}})).is_ok());
+        assert_eq!(check_download_selection(10, &download, &json!({"expected":{"agent_instance":10,"started_at":124}})).unwrap_err().0, 409);
+        assert_eq!(check_download_selection(10, &download, &json!({"expected":{"agent_instance":11,"started_at":123}})).unwrap_err().0, 409);
+        assert_eq!(check_download_selection(10, &download, &json!({"expected":{}})).unwrap_err().0, 400);
+        assert!(check_download_selection(10, &download, &download_selection(b"").unwrap()).is_ok());
+    }
+
+    #[test]
+    fn dashboard_status_reads_saved_state_while_card_is_busy() {
+        let state = AppState::new();
+        state.esim.inner.busy.store(true, Ordering::Release);
+        state.esim.inner.inventory.lock().unwrap().record(list(), 123);
+        let status = dashboard_status(&state);
+        assert_eq!(status["data"]["inventory_loaded"], true);
+        assert_eq!(status["data"]["inventory"]["profiles"].as_array().unwrap().len(), 3);
+        assert_eq!(status["data"]["inventory"]["updating"], true);
+        assert_eq!(status["data"]["password_required"], true);
+        assert!(state.esim.inner.receipts.lock().unwrap().pending.is_none());
+    }
 
     const LIST: &str = r#"{"type":"lpa","payload":{"code":0,"message":"success","data":[{"iccid":"8963000000000000001","isdpAid":"A0000005591010FFFFFFFF8900001000","profileState":"enabled","profileNickname":"Smart","serviceProviderName":"SMART","profileName":"Operational","iconType":"png","icon":"iVBORw0KGgo=","profileClass":"operational"},{"iccid":"8963000000000000002","isdpAid":"A0000005591010FFFFFFFF8900001100","profileState":"disabled","profileNickname":null,"serviceProviderName":"GOMO","profileName":"Globe Philippines ODC","iconType":"none","icon":null,"profileClass":"operational"},{"iccid":"8963000000000000003","isdpAid":"A0000005591010FFFFFFFF8900001200","profileState":"disabled","profileNickname":null,"serviceProviderName":"Test","profileName":"Test","iconType":"none","icon":null,"profileClass":"test"}]}}"#;
 

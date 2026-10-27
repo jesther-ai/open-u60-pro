@@ -12,6 +12,8 @@ use crate::system::{self, CpuTracker, ProcessTracker, SpeedTracker};
 use crate::ubus;
 
 pub struct AppState {
+    pub client_details: crate::client_details::ClientMonitor,
+    pub dashboard: Arc<crate::dashboard::Dashboard>,
     pub live_activity: Arc<crate::live_activity::LiveActivity>,
     pub auth: Arc<AuthState>,
     pub cpu: CpuTracker,
@@ -47,6 +49,8 @@ impl AppState {
     pub fn new() -> Self {
         let live_activity = Arc::new(crate::live_activity::LiveActivity::new());
         Self {
+            client_details: crate::client_details::ClientMonitor::default(),
+            dashboard: Arc::new(crate::dashboard::Dashboard::default()),
             tls: Arc::new(crate::tls::Tls::router(Arc::clone(&live_activity))),
             live_activity,
             auth: Arc::new(AuthState::new()),

@@ -1,0 +1,18 @@
+const assert=require('node:assert/strict'),E=require('../esim-model.js'),A=require('../addresses.js');
+const id='08963000000000000001';
+assert.equal(E.iccid(id),id);assert.equal(E.iccid('8963000000000000001F'),'8963000000000000001');
+for(const bad of [8963000000000000001,'12','89630000000000000001F','123e4567890123456789'])assert.throws(()=>E.iccid(bad));
+assert.throws(()=>E.inventory({profiles:[{iccid:8963000000000000001}]}));
+assert.equal(E.nickname('  Work  '),'Work');assert.equal(E.nickname(''),'');assert.throws(()=>E.nickname('😀'.repeat(17)));assert.throws(()=>E.nickname('bad\nname'));
+assert.deepEqual(E.activation(' LPA:1$operator.example$ABC-123 '),{activation_code:'LPA:1$operator.example$ABC-123',preview:true});
+assert.throws(()=>E.activation('LPA:1$operator.example$ID$$1'));assert.equal(E.activation('LPA:1$operator.example$ID$$1','secret').confirmation_code,'secret');
+assert.throws(()=>E.activation('https://operator.example/code'));assert.throws(()=>E.activation('LPA:1$operator.example/path$ID'));assert.throws(()=>E.activation('LPA:1$operator.example$ID with spaces'));
+assert.equal(E.older({agent_instance:1,generation:2,observed_seq:5,observed_at:200},{agent_instance:1,generation:2,observed_seq:6,observed_at:100}),true,'sequence wins over a jumping wall clock');
+assert.equal(E.older({agent_instance:2,generation:0},{agent_instance:1,generation:9}),false,'a restarted agent begins a new sequence');
+assert.equal(E.switchBusy({state:'reloading'}),true);assert.equal(E.switchBusy({state:'connected'}),false);assert.match(E.switchMessage({state:'no_data',reason:'roaming_off'}),/Roaming is off/);
+assert.deepEqual(E.warnings({switch_warnings:['manual_apn','roaming_off']},{manual_apn:{apn:'internet'}}).length,2);
+const wan={up:true,'ipv4-address':[{address:'10.0.0.2'},{address:'10.0.0.2'},{address:'0.0.0.0'}],'ipv6-address':[{address:'2001:db8::1'}]},wan6={'ipv6-address':[{address:'::'},{address:'2001:db8::1'},{address:'2001:db8::2'}],'ipv6-prefix':[{address:'2001:db8:1::'}]};
+assert.deepEqual(A.collect(wan,wan6),{ipv4:['10.0.0.2'],ipv6:['2001:db8::1','2001:db8::2']});
+assert.deepEqual(A.collect(null,{'ipv6-prefix':[{address:'2001:db8::'}]}),{ipv4:[],ipv6:[]},'delegated prefixes are not interface addresses');
+assert.deepEqual(A.collect(null,wan6).ipv4,[]);assert.deepEqual(A.collect(null,null),{ipv4:[],ipv6:[]});
+console.log('Passed: eSIM identifiers, validation, clock-independent ordering, switch warnings, dual-stack WAN address collection, deduplication and delegated-prefix separation.');

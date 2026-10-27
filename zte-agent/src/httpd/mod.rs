@@ -422,7 +422,7 @@ impl Drop for PeerSlot {
 /// API fallback (no per-route registration, so there is no automatic 405
 /// and no HEAD-to-GET routing for `/api`).
 pub fn app(ctx: Ctx) -> Router {
-    Router::new().merge(crate::web::router(&ctx)).fallback(api::api_entry).with_state(ctx)
+    Router::new().merge(crate::web::router(&ctx)).merge(crate::console::router()).fallback(api::api_entry).with_state(ctx)
 }
 
 /// SO_KEEPALIVE with a 5 min idle / 60 s interval / 3 probes: a dead peer is

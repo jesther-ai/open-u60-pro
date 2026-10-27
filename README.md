@@ -1,5 +1,6 @@
 <div align="center">
 
+<p><strong>iOS companion app</strong></p>
 <p>
 <img src="mobile/ios/screenshots/dashboard.png" alt="Dashboard" width="250">&nbsp;&nbsp;<img src="mobile/ios/screenshots/connection-signal.png" alt="Connection and signal" width="250">&nbsp;&nbsp;<img src="mobile/ios/screenshots/esim-profiles.png" alt="eSIM profiles" width="250">
 </p>
@@ -19,7 +20,7 @@ customization, and more.
 [![Website](https://img.shields.io/badge/website-open--u60--pro.vercel.app-blue.svg)](https://open-u60-pro.vercel.app)
 [![Release](https://img.shields.io/github/v/release/jesther-ai/open-u60-pro)](https://github.com/jesther-ai/open-u60-pro/releases/latest)
 
-**Download:** [latest release](https://github.com/jesther-ai/open-u60-pro/releases/latest) · **What's new:** [CHANGELOG.md](CHANGELOG.md) · **Screenshots:** [by feature](#screenshots) · **Web UI:** [in your browser](#web-ui)
+**Download:** [latest release](https://github.com/jesther-ai/open-u60-pro/releases/latest) · **What's new:** [CHANGELOG.md](CHANGELOG.md) · **Screenshots:** [by feature](#screenshots) · **Web UIs:** [responsive console](#responsive-web-console) · [server-rendered UI](#web-ui)
 
 </div>
 
@@ -99,6 +100,12 @@ cargo build --release --target aarch64-unknown-linux-musl -p zte-agent
 
 Open `http://192.168.0.1:9090/` on the router's Wi-Fi for a dashboard, connection & signal, and the most-used settings, with nothing to install. See [Web UI](#web-ui).
 
+### Responsive Web Console
+
+Open **`http://192.168.0.1:9090/console/`** on the router’s network. The console is embedded in the agent binary, with no separate frontend server or cloud service. When LAN HTTPS is enabled, use `/console/` on that same HTTPS address. It uses the current agent’s rate-limited bearer sign-in, Host/Origin checks and elapsed-time session expiry; the existing `/ui/`, browser-session authentication, HTTPS settings and full feature set remain available.
+
+The five sections cover Dashboard, Network, SMS, Tools and Settings. They include LTE/NR carrier aggregation and SA/NSA, WAN IPv4/IPv6, offline statistics, Wi-Fi/mobile/APN settings, connected-device traffic and observed peaks, eSIM management, SMS actions/forwarding, operator scanning, diagnostics, LAN/DHCP, firewall, port forwarding, UPnP, DMZ and QoS. Only fields reported by the firmware are presented as measurements or limits. See the [screenshots](#new-responsive-web-ui) and [developer guide](zte-agent/docs/responsive-console.md).
+
 ### Mobile Companion Apps
 
 Native apps that connect directly over WiFi -- no computer needed.
@@ -114,9 +121,34 @@ Native apps that connect directly over WiFi -- no computer needed.
 
 ## Screenshots
 
+### New responsive Web UI
+
+The Rust agent now also includes a responsive browser console at **`http://192.168.0.1:9090/console/`**, alongside the existing server-rendered UI at `/ui/`. The console has phone, tablet and desktop layouts, Light/Dark/System themes, streamed SSE updates, animated measurements and smooth page/dialog transitions. Phones keep all five main tabs available in the bottom bar, including short landscape layouts and keyboard changes.
+
+**Desktop · Light**
+
+<img src="zte-agent/ui/screenshots/dashboard-desktop-light.png" alt="Responsive Web UI on desktop in light mode, showing both WAN IP versions, live traffic, battery and carrier aggregation" width="1100">
+
+| Phone · Light | Tablet · Dark |
+|:---:|:---:|
+| <img src="zte-agent/ui/screenshots/dashboard-mobile-light.png" alt="Phone Web UI with WAN IPv4 and IPv6, live rates and fixed five-tab bottom navigation" width="250"> | <img src="zte-agent/ui/screenshots/signal-tablet-dark.png" alt="Tablet Web UI in dark mode with expandable navigation, 5G NSA status and carrier measurements" width="500"> |
+
+<details>
+<summary>More Web UI previews: dark dashboard, connected devices and eSIM management</summary>
+
+<p><img src="zte-agent/ui/screenshots/dashboard-desktop-dark.png" alt="Desktop Web UI dashboard in dark mode" width="1100"></p>
+<p><img src="zte-agent/ui/screenshots/devices-desktop-light.png" alt="Connected Devices with sample MAC/IP addresses, current traffic, observed peaks and separately reported limits" width="1100"></p>
+<p><img src="zte-agent/ui/screenshots/esim-desktop-dark.png" alt="eSIM management in dark mode with active and inactive sample profiles and masked identifiers" width="1100"></p>
+
+</details>
+
+These Web UI captures use **fictional demonstration data** and documentation address ranges. They contain no live router captures, passwords, messages or personal device identifiers. Per-device limits remain “Not reported” when firmware does not supply them. See [Responsive web console](#responsive-web-console) for setup and developer notes.
+
+### iOS companion app
+
 From the iOS app on iPhone. Personal identifiers (ICCID digits, cell IDs) are masked in these images.
 
-### Dashboard and signal
+#### Dashboard and signal
 
 The Dashboard shows the operator, network type, live traffic, battery, CPU temperature and connected devices. Tap **Connection & signal** for 5G NR and LTE readings (RSRP, RSRQ, SINR, RSSI), band, channel, bandwidth, the operator's speed cap, and a signal history chart.
 
@@ -124,7 +156,7 @@ The Dashboard shows the operator, network type, live traffic, battery, CPU tempe
 |:---:|:---:|
 | <img src="mobile/ios/screenshots/dashboard.png" alt="Dashboard with operator, 5G NSA, live traffic, battery, CPU temperature, and connected devices" width="220"> | <img src="mobile/ios/screenshots/connection-signal.png" alt="Connection and signal screen with 5G NR and LTE anchor readings, data session, and signal history chart" width="220"> |
 
-### eSIM profiles
+#### eSIM profiles
 
 With an eSIM card such as the [9eSIM B1](docs/9esim-b1.md) in the SIM slot, **Router → eSIM Profiles** lists the operator profiles on the card. Swipe right on a profile to switch to it; the app shows each step until mobile data is back. Setup: [eSIM profiles](#esim-profiles-optional).
 
@@ -132,7 +164,7 @@ With an eSIM card such as the [9eSIM B1](docs/9esim-b1.md) in the SIM slot, **Ro
 |:---:|:---:|
 | <img src="mobile/ios/screenshots/esim-profiles.png" alt="eSIM Profiles screen listing four operator profiles with the active one marked" width="220"> | <img src="mobile/ios/screenshots/esim-switching.png" alt="Profile switch in progress: switch profile and reload SIM done, connecting to network" width="220"> |
 
-### Battery and power
+#### Battery and power
 
 Battery details, USB-C mode (charge your phone from the router's battery), and device controls: charge limit, power-save mode, fast boot and auto sleep.
 
@@ -140,7 +172,7 @@ Battery details, USB-C mode (charge your phone from the router's battery), and d
 |:---:|:---:|:---:|
 | <img src="mobile/ios/screenshots/battery-details.png" alt="Battery details: capacity, charging status, voltage, current, power, temperature, time to full" width="220"> | <img src="mobile/ios/screenshots/usb-mode.png" alt="USB Mode sheet showing USB-C connected with a Fast Charging button" width="220"> | <img src="mobile/ios/screenshots/device-controls.png" alt="Device controls: charge limit at 85 percent, power-save mode, fast boot, auto sleep" width="220"> |
 
-### Lock Screen
+#### Lock Screen
 
 Live modem signal on the Lock Screen and in the Dynamic Island: see [iOS Live Activities](#ios-live-activities).
 

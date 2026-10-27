@@ -91,6 +91,11 @@ pub async fn api_entry(State(ctx): State<Ctx>, req: Request) -> Response {
             let resp = events(&ctx, owner, parts.uri.query());
             finish_early(headers, body.into_data_stream(), 0, resp).await
         }
+        Pre::Dashboard => {
+            let token=header(headers,"authorization").and_then(|v|v.strip_prefix("Bearer ")).unwrap_or("").to_owned();
+            let resp=crate::dashboard::response(Arc::clone(&ctx.app),parts.uri.to_string(),token);
+            finish_early(headers,body.into_data_stream(),0,resp).await
+        }
         Pre::Dispatch { body_limit } => {
             let body = match read_capped(headers, body, body_limit, ctx.body_wait).await {
                 Ok(body) => body,

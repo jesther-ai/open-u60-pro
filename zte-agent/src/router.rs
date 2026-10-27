@@ -1,6 +1,7 @@
 use std::net::Ipv4Addr;
 
 use serde_json::{json, Value};
+use std::sync::Mutex;
 
 use crate::handlers::AppState;
 use crate::ubus;
@@ -54,19 +55,44 @@ pub fn router_dns_set(_state: &AppState, body: &[u8]) -> (u16, Value) {
 }
 
 pub fn router_lan_get(_state: &AppState) -> (u16, Value) {
-    let ip = ubus::uci_get("network.lan.ipaddr").unwrap_or_default();
-    let mask = ubus::uci_get("network.lan.netmask").unwrap_or_default();
-    let ignore = ubus::uci_get("dhcp.lan.ignore").unwrap_or_default();
-    let start = ubus::uci_get("dhcp.lan.start").unwrap_or_default();
-    let limit = ubus::uci_get("dhcp.lan.limit").unwrap_or_default();
-    let lease = ubus::uci_get("dhcp.lan.leasetime").unwrap_or_default();
-    let end = compute_dhcp_end(&ip, &mask, &start, &limit);
-    (200, json!({"ok": true, "data": {
-        "lan_ipaddr": ip, "lan_netmask": mask,
-        "dhcp_enable": if ignore == "1" { "0" } else { "1" },
-        "dhcp_start": start, "dhcp_end": end,
-        "dhcp_lease_time": lease
-    }}))
+    let read = || -> Result<_, String> {
+        let network = ubus::uci_show_map(&ubus::uci_show("network.lan")?);
+        let dhcp = ubus::uci_show_map(&ubus::uci_show("dhcp.lan")?);
+        let required = |map: &std::collections::HashMap<String, String>, key: &str| {
+            map.get(key)
+                .filter(|value| !value.is_empty())
+                .cloned()
+                .ok_or_else(|| format!("LAN setting {key} is unavailable"))
+        };
+        let ip = required(&network, "network.lan.ipaddr")?;
+        let mask = required(&network, "network.lan.netmask")?;
+        let start = required(&dhcp, "dhcp.lan.start")?;
+        let limit = required(&dhcp, "dhcp.lan.limit")?;
+        let lease = required(&dhcp, "dhcp.lan.leasetime")?;
+        let end = strict_compute_dhcp_end(&ip, &mask, &start, &limit)
+            .ok_or_else(|| "The reported DHCP pool is invalid".to_string())?;
+        Ok((
+            ip,
+            mask,
+            start,
+            lease,
+            end,
+            dhcp.get("dhcp.lan.ignore").is_some_and(|v| v == "1"),
+        ))
+    };
+    let (ip, mask, start, lease, end, ignored) = match read() {
+        Ok(values) => values,
+        Err(error) => return (503, json!({"ok":false,"error":error})),
+    };
+    (
+        200,
+        json!({"ok": true, "data": {
+            "lan_ipaddr": ip, "lan_netmask": mask,
+            "dhcp_enable": if ignored { "0" } else { "1" },
+            "dhcp_start": start, "dhcp_end": end,
+            "dhcp_lease_time": lease
+        }}),
+    )
 }
 
 /// The DHCP range's last address from UCI's `start` offset and `limit`:
@@ -75,6 +101,7 @@ pub fn router_lan_get(_state: &AppState) -> (u16, Value) {
 /// inside the subnet). On a /24 this is the old answer (the last octet
 /// replaced) for every range that fits the subnet. Without a usable address
 /// or netmask (/8 to /30), the old answer.
+#[cfg(test)]
 fn compute_dhcp_end(base_ip: &str, netmask: &str, start: &str, limit: &str) -> String {
     let start_num: u32 = start.parse().unwrap_or(100);
     let limit_num: u32 = limit.parse().unwrap_or(50);
@@ -198,11 +225,41 @@ pub fn router_firewall_port_forward_get(_state: &AppState) -> (u16, Value) {
 }
 
 pub fn router_firewall_port_forward_set(_state: &AppState, body: &[u8]) -> (u16, Value) {
-    let parsed: Value = match serde_json::from_slice(body) {
+    let mut parsed: Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(_) => return (400, json!({"ok": false, "error": "invalid JSON"})),
     };
-    match ubus::call("zwrt_router.api", "router_set_portforward", Some(&parsed.to_string())) {
+    // Rule ids can be array positions. Serialize agent writes and check the browser's
+    // reviewed list immediately before deleting; native callers may omit this guard.
+    static WRITES: Mutex<()> = Mutex::new(());
+    let _guard = WRITES.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(expected) = parsed
+        .as_object_mut()
+        .and_then(|object| object.remove("expected_rules"))
+    {
+        if parsed["action"] != "delete" || !expected.is_array() {
+            return (
+                400,
+                json!({"ok":false,"error":"expected_rules requires a delete and a rule array"}),
+            );
+        }
+        let current = match ubus::call("zwrt_router.api", "router_get_portforward_rule", Some("{}"))
+        {
+            Ok(data) => data,
+            Err(error) => return (503, json!({"ok":false,"error":error})),
+        };
+        if !reviewed_port_rules_match(&expected, &current, &parsed["id"]) {
+            return (
+                409,
+                json!({"ok":false,"error":"Port-forward rules changed. Review the current list before deleting."}),
+            );
+        }
+    }
+    match ubus::call(
+        "zwrt_router.api",
+        "router_set_portforward",
+        Some(&parsed.to_string()),
+    ) {
         Ok(data) => (200, json!({"ok": true, "data": data})),
         Err(e) => (503, json!({"ok": false, "error": e})),
     }
@@ -418,5 +475,120 @@ mod tests {
         assert_eq!(compute_dhcp_end("192.168.0.1", "255.0.255.0", "200", "100"), "192.168.0.299");
         assert_eq!(compute_dhcp_end("", "", "", ""), "192.168.0.149");
         assert_eq!(compute_dhcp_end("192.168.0.1", "255.255.255.0", "0", "0"), "192.168.0.0");
+    }
+}
+
+fn strict_compute_dhcp_end(base_ip: &str, netmask: &str, start: &str, limit: &str) -> Option<String> {
+    let ip = u32::from(base_ip.parse::<Ipv4Addr>().ok()?);
+    let mask = u32::from(netmask.parse::<Ipv4Addr>().ok()?);
+    let inverse = !mask;
+    if !(3..0x8000_0000).contains(&inverse) || inverse & (inverse + 1) != 0 {
+        return None;
+    }
+    let network = ip & mask;
+    let offset: u32 = start.parse().ok()?;
+    let count: u32 = limit.parse().ok()?;
+    let end = offset.checked_add(count.checked_sub(1)?)?;
+    if offset == 0 || end >= inverse {
+        return None;
+    }
+    Some(Ipv4Addr::from(network.checked_add(end)?).to_string())
+}
+
+fn reviewed_port_rules_match(expected: &Value, current: &Value, id: &Value) -> bool {
+    let Some(rules) = current.get("rule_list").and_then(Value::as_array) else {
+        return false;
+    };
+    if current.get("rule_list") != Some(expected) {
+        return false;
+    }
+    let Some(id) = id.as_str() else {
+        return false;
+    };
+    rules
+        .iter()
+        .enumerate()
+        .filter(|(index, rule)| {
+            let reported = rule.get("id");
+            match reported {
+                Some(Value::String(value)) => value == id,
+                Some(Value::Number(value)) => value.to_string() == id,
+                None | Some(Value::Null) => index.to_string() == id,
+                _ => false,
+            }
+        })
+        .count()
+        == 1
+}
+#[cfg(test)]
+mod console_routing_tests {
+    use super::*;
+
+    #[test]
+    fn dhcp_end_crosses_octets_using_the_actual_subnet() {
+        assert_eq!(
+            strict_compute_dhcp_end("192.168.1.1", "255.255.254.0", "250", "30"),
+            Some("192.168.1.23".into())
+        );
+    }
+
+    #[test]
+    fn dhcp_end_preserves_a_standard_pool() {
+        assert_eq!(
+            strict_compute_dhcp_end("192.168.0.1", "255.255.255.0", "100", "50"),
+            Some("192.168.0.149".into())
+        );
+    }
+
+    #[test]
+    fn dhcp_end_rejects_invalid_configuration_without_inventing_defaults() {
+        for (mask, start, count) in [
+            ("255.255.255.0", "250", "10"),
+            ("255.255.255.0", "100", "0"),
+            ("255.0.255.0", "100", "50"),
+            ("255.255.255.0", "4294967295", "2"),
+            ("255.255.255.0", "bad", "50"),
+        ] {
+            assert_eq!(strict_compute_dhcp_end("192.168.0.1", mask, start, count), None);
+        }
+    }
+
+    #[test]
+    fn reviewed_rule_deletion_rejects_a_shifted_or_missing_list() {
+        let reviewed = json!([{"name":"First"},{"name":"Second"}]);
+        assert!(!reviewed_port_rules_match(
+            &reviewed,
+            &json!({"rule_list":[{"name":"Second"}]}),
+            &json!("0")
+        ));
+        assert!(!reviewed_port_rules_match(
+            &reviewed,
+            &json!({}),
+            &json!("0")
+        ));
+    }
+
+    #[test]
+    fn reviewed_rule_deletion_accepts_numeric_ids_and_position_fallbacks() {
+        for (rules, id) in [
+            (json!([{"name":"Position"}]), "0"),
+            (json!([{"id":42,"name":"Explicit"}]), "42"),
+        ] {
+            assert!(reviewed_port_rules_match(
+                &rules,
+                &json!({"rule_list":rules}),
+                &json!(id)
+            ));
+        }
+    }
+
+    #[test]
+    fn reviewed_rule_deletion_rejects_duplicate_ids() {
+        let rules = json!([{"id":"0","name":"First"},{"id":"0","name":"Second"}]);
+        assert!(!reviewed_port_rules_match(
+            &rules,
+            &json!({"rule_list":rules}),
+            &json!("0")
+        ));
     }
 }

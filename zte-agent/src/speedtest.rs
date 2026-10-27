@@ -94,6 +94,18 @@ impl SpeedTest {
         }
     }
 
+    fn prepare_run(&self, server: String) -> bool {
+        // A second client must not reset the measurements of the active test.
+        if self.running.compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed).is_err() { return false; }
+        self.cancel.store(false, Ordering::Relaxed);
+        update(&self.progress, |progress| *progress = SpeedTestProgress {
+            phase: Phase::Idle, progress: 0, live_speed_mbps: 0.0,
+            ping_ms: None, jitter_ms: None, download_mbps: None, upload_mbps: None,
+            download_bytes: 0, upload_bytes: 0, server, error: None,
+        });
+        true
+    }
+
     /// True while a test is in progress (the modem policies hold off).
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::Relaxed)
@@ -413,30 +425,9 @@ pub fn start(state: &AppState, body: &[u8]) -> (u16, Value) {
         }
     };
 
-    // Atomically set running=true; if already true, another start won the
-    // race while the server list was read. Only the winner resets the state.
-    if state.speedtest.running.compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed).is_err() {
-        return (409, json!({"ok": false, "error": "test already running"}));
+    if !state.speedtest.prepare_run(format!("{} ({})", server.sponsor, server.name)) {
+        return (409, json!({"ok":false,"error":"test already running"}));
     }
-
-    // A Stop in the few microseconds between the exchange and this store
-    // is lost (as before this order): the test runs on until stopped again.
-    state.speedtest.cancel.store(false, Ordering::Relaxed);
-    update(&state.speedtest.progress, |p| {
-        *p = SpeedTestProgress {
-            phase: Phase::Idle,
-            progress: 0,
-            live_speed_mbps: 0.0,
-            ping_ms: None,
-            jitter_ms: None,
-            download_mbps: None,
-            upload_mbps: None,
-            download_bytes: 0,
-            upload_bytes: 0,
-            server: format!("{} ({})", server.sponsor, server.name),
-            error: None,
-        };
-    });
 
     let progress = Arc::clone(&state.speedtest.progress);
     let cancel = Arc::clone(&state.speedtest.cancel);
@@ -458,7 +449,9 @@ pub fn start(state: &AppState, body: &[u8]) -> (u16, Value) {
 
 pub fn progress(state: &AppState) -> (u16, Value) {
     let guard = state.speedtest.progress.lock().unwrap_or_else(PoisonError::into_inner);
-    (200, json!({"ok": true, "data": *guard}))
+    let mut data = json!(&*guard);
+    data["running"] = json!(state.speedtest.is_running());
+    (200, json!({"ok": true, "data": data}))
 }
 
 pub fn stop(state: &AppState, _body: &[u8]) -> (u16, Value) {
@@ -619,5 +612,21 @@ mod tests {
         assert!(!app.speedtest.is_running());
         assert_eq!((p["phase"].as_str(), p["error"].as_str()), (Some("error"), Some("all ping attempts failed")));
         assert_eq!(p["server"], "Example Net (Testville)");
+    }
+}
+
+#[cfg(test)]
+mod dashboard_tests {
+    use super::*;
+    #[test]
+    fn duplicate_speed_test_start_preserves_active_measurements_and_cancellation() {
+        let test = SpeedTest::new();
+        assert!(test.prepare_run("First server".into()));
+        test.cancel.store(true,Ordering::Relaxed);
+        { let mut progress = test.progress.lock().unwrap(); progress.phase = Phase::Download; progress.download_bytes = 1234; }
+        let previous = json!(&*test.progress.lock().unwrap());
+        assert!(!test.prepare_run("Second server".into()));
+        assert_eq!(json!(&*test.progress.lock().unwrap()), previous);
+        assert!(test.cancel.load(Ordering::Relaxed));
     }
 }
