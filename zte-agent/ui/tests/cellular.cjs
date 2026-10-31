@@ -30,4 +30,6 @@ parsed = parse({...fixture,nrcasig:'',nr5g_rsrp:99999});
 assert.equal(parsed.nr.carriers[0].rsrp,null); assert.equal(parsed.nr.carriers[1].rsrp,null);
 assert.equal(parse({...fixture,network_type:'LTE',nr5g_rsrp:0,nrca:'',lteca_state:'0'}).mode,'4G');
 assert.equal(parse({network_type:'NR-SA',lte_rsrp:-90,wan_active_band:3}).primary,null,'reported LTE must not become the serving summary in SA');
+parsed = parse({network_type:'SA',wan_active_band:'n78',lte_rsrp:0,lte_rsrq:0,lte_rssi:0,lteca:'',nr5g_action_band:'n78',nr5g_action_channel:632640,nr5g_pci:635,nr5g_cell_id:12891590913,nr5g_rsrp:-88,nr5g_rsrq:-11,nr5g_snr:12.9,nr5g_rssi:-73,nrca:''});
+assert.equal(parsed.mode,'5G SA');assert.equal(parsed.lte.carriers.length,0,'an NR-prefixed shared active band must not fabricate an LTE carrier');assert.equal(parsed.nr.carriers.length,1);assert.equal(parsed.nr.carriers[0].band,'n78');
 console.log('Passed: LTE/NR CA parsing, PCI+channel primary matching, SCC measurements, deduplication, SA/NSA, missing and sentinel readings.');
