@@ -12,6 +12,7 @@ mod client_details;
 mod console;
 mod dashboard;
 mod dashboard_extra;
+mod data_usage;
 mod device_ext;
 pub mod doh;
 mod esim;

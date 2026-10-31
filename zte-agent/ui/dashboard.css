@@ -2631,3 +2631,49 @@ dialog[data-motion="closing"]::backdrop { animation: dialog-scrim-out .12s ease-
 .setup-panel { max-width:640px; margin:0 auto; }
 .https-fingerprint { overflow-wrap:anywhere; user-select:all; }
 #https-install .settings-facts dd { font-family:inherit; line-height:1.7; }
+
+/* Data allowance: one clear instrument, with the router counters behind it. */
+.usage-hero { display:grid; grid-template-columns:minmax(210px,320px) minmax(0,1fr); gap:clamp(32px,5vw,76px); align-items:center; padding:32px 0 22px; }
+.usage-dial { --usage-progress:0deg; --usage-color:var(--accent); width:min(100%,260px); aspect-ratio:1; justify-self:center; border-radius:50%; display:grid; place-items:center; background:conic-gradient(var(--usage-color) 0deg var(--usage-progress),var(--track) var(--usage-progress) 360deg); position:relative; }
+.usage-dial::before { content:""; position:absolute; inset:10px; border:1px solid var(--line); border-radius:50%; background:var(--surface); }
+.usage-dial-core { position:relative; z-index:1; width:70%; aspect-ratio:1; border-radius:50%; display:flex; flex-direction:column; align-items:center; justify-content:center; text-align:center; background:var(--surface-soft); border:1px solid var(--line); }
+.usage-dial-core strong { font-size:clamp(27px,4vw,43px); line-height:1; letter-spacing:-2px; }
+.usage-dial-core span { margin-top:12px; color:var(--muted); font:10px var(--mono); letter-spacing:.08em; }
+.usage-dial[data-state="warning"] { --usage-color:var(--warning-accent); }
+.usage-dial[data-state="exceeded"] { --usage-color:var(--signal-weak); }
+.usage-dial[data-state="disabled"],.usage-dial[data-state="unavailable"] { --usage-color:var(--signal-neutral); }
+.usage-summary { min-width:0; }
+.usage-state { display:inline-flex; min-height:28px; align-items:center; padding:5px 10px; border:1px solid var(--live-border); border-radius:999px; color:var(--accent); background:var(--live-surface); font:10px var(--mono); letter-spacing:.04em; text-transform:uppercase; }
+.usage-state[data-state="warning"],.usage-state[data-state="exceeded"] { color:var(--warning-ink); border-color:var(--warning-border); background:var(--warning-surface); }
+.usage-state[data-state="disabled"],.usage-state[data-state="unavailable"] { color:var(--muted); border-color:var(--line); background:var(--surface-soft); }
+.usage-summary h3 { margin:18px 0 8px; font-size:clamp(22px,3vw,34px); letter-spacing:-1px; line-height:1.2; }
+.usage-summary > p { margin:0; max-width:62ch; color:var(--muted); line-height:1.75; }
+.usage-budget-facts { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:18px; margin:30px 0 0; }
+.usage-budget-facts > div { min-width:0; border-left:2px solid var(--line); padding-left:13px; }
+.usage-budget-facts dt { margin-bottom:8px; color:var(--muted); font-size:11px; }
+.usage-budget-facts dd { margin:0; font-size:13px; line-height:1.55; overflow-wrap:anywhere; }
+.usage-periods { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:18px; margin-top:28px; }
+.usage-period { min-width:0; padding:22px; border:1px solid var(--line); border-radius:6px; background:var(--surface-soft); }
+.usage-period-heading { min-height:76px; padding-bottom:20px; border-bottom:1px solid var(--line); }
+.usage-period-heading h3 { margin:0 0 9px; color:var(--muted); font-size:12px; font-weight:600; }
+.usage-period-heading strong { font-size:clamp(20px,2.5vw,28px); letter-spacing:-1px; overflow-wrap:anywhere; }
+.usage-period dl { display:grid; gap:14px; margin:20px 0 0; }
+.usage-period dl > div { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; }
+.usage-period dt { color:var(--muted); font-size:11px; }
+.usage-period dd { margin:0; font-size:11px; text-align:right; overflow-wrap:anywhere; }
+#data-usage-overview > .panel-note { margin-top:24px; }
+@media(max-width:1199px) {
+  .usage-budget-facts { grid-template-columns:repeat(2,minmax(0,1fr)); }
+  .usage-periods { grid-template-columns:minmax(0,1fr); }
+  .usage-period-heading { min-height:0; }
+}
+@media(max-width:767px) {
+  #data-usage-overview > .section-heading { align-items:flex-start; flex-direction:column; gap:16px; }
+  #data-usage-overview > .section-heading .button { width:100%; }
+  .usage-hero { grid-template-columns:minmax(0,1fr); gap:30px; padding-top:24px; }
+  .usage-dial { width:min(74vw,240px); }
+  .usage-summary { text-align:center; }
+  .usage-summary > p { margin-inline:auto; }
+  .usage-budget-facts { text-align:left; gap:22px 10px; }
+  .usage-period { padding:18px; }
+}

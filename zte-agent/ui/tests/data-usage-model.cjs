@@ -1,0 +1,12 @@
+const assert=require('node:assert/strict'),M=require('../data-usage-model.js');
+const sample={day:{tx_bytes:1e6,rx_bytes:4e6,time_secs:3660,tx_packets:10,rx_packets:20},month:{tx_bytes:10e9,rx_bytes:70e9,time_secs:90061,tx_packets:100,rx_packets:200},total:{tx_bytes:30e9,rx_bytes:170e9,time_secs:100000},limit:{available:true,enabled:true,bytes:'100000000000',warning_percent:75,exceeded:false,auto_disconnect:false},cycle:{available:true,enabled:true,reset_day:17},settings_errors:[]};
+let model=M.parse(sample);
+assert.equal(model.day.totalBytes,5e6);assert.equal(model.month.totalBytes,80e9);assert.equal(model.percent,80);assert.equal(model.remainingBytes,20e9);assert.equal(model.state,'warning');
+sample.month.rx_bytes=95e9;model=M.parse(sample);assert.equal(model.state,'exceeded');assert.equal(model.remainingBytes,0);
+sample.limit.enabled=false;model=M.parse(sample);assert.equal(model.state,'disabled');sample.limit.enabled=true;
+sample.limit.available=false;model=M.parse(sample);assert.equal(model.state,'unavailable');sample.limit.available=true;
+sample.limit.exceeded=true;sample.month.rx_bytes=1;model=M.parse(sample);assert.equal(model.state,'exceeded','firmware overflow state wins');
+assert.equal(M.bytes(115964116992),'115.96 GB');assert.equal(M.bytes(0),'0 B');assert.equal(M.bytes(null),'Not reported');
+assert.equal(M.duration(90061),'1d 1h 1m');assert.equal(M.ordinal(1),'1st');assert.equal(M.ordinal(12),'12th');assert.equal(M.ordinal(23),'23rd');
+assert.equal(M.gigabytes(115964116992),'115.964');assert.equal(M.bytesFromGigabytes('100'),100e9);assert.equal(M.bytesFromGigabytes('0.001'),1e6);assert.equal(M.bytesFromGigabytes('1.1234'),null);assert.equal(M.bytesFromGigabytes('0'),null);
+console.log('Passed: data periods, decimal units, cap conversion, billing labels and normal/warning/exceeded/disabled states.');

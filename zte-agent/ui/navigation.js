@@ -38,6 +38,7 @@
       {id:'diagnostics',label:'System diagnostics',title:'System diagnostics',description:'Live resource use, temperatures, processes and interface details.'},
       {id:'radio',label:'Radio diagnostics',title:'Radio diagnostics',description:'Inspect neighboring cells and run a signal quality sweep.'},
       {id:'speedtest',label:'Internet speed test',title:'Internet speed test',description:'Measure the router’s internet connection, with live progress.'},
+      {id:'data',label:'Data usage',title:'Data usage',description:'Track router-measured usage and set a monthly allowance, warning and billing cycle.'},
       {id:'terminal',label:'AT terminal',title:'AT terminal',description:'Send an explicit modem command and inspect its response.'},
       {id:'traffic',label:'Traffic monitor',title:'Traffic monitor',description:'Live transfer rates and interface totals, streamed from the router.'}
     ]},

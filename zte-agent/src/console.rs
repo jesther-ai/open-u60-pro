@@ -289,6 +289,14 @@ fn asset(path: &str) -> Option<(&'static str, &'static str)> {
             "text/javascript; charset=utf-8",
             include_str!("../ui/clients-model.js"),
         )),
+        "/console/a/data-usage-model.js" => Some((
+            "text/javascript; charset=utf-8",
+            include_str!("../ui/data-usage-model.js"),
+        )),
+        "/console/a/data-usage.js" => Some((
+            "text/javascript; charset=utf-8",
+            include_str!("../ui/data-usage.js"),
+        )),
         "/console/a/clients.js" => Some((
             "text/javascript; charset=utf-8",
             include_str!("../ui/clients.js"),
@@ -369,6 +377,7 @@ mod tests {
         for (path, status) in [
             ("/console/", 200),
             ("/console/a/motion.js", 200),
+            ("/console/a/data-usage.js", 200),
             ("/ui/login", 303),
             ("/api/dashboard/events", 401),
         ] {

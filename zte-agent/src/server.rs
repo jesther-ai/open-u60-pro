@@ -6,6 +6,7 @@ use crate::at_terminal;
 use crate::auth::{AuthState, Kind, PeerKey, SessionId};
 use crate::cell;
 use crate::conn_watchdog;
+use crate::data_usage;
 use crate::device_ext;
 use crate::esim;
 use crate::httpd::gate::Lane;
@@ -291,7 +292,9 @@ fn route_inner(method: &Method, path: &str, state: &AppState, body: &[u8]) -> (u
         (&Method::Get, "/api/wifi/guest") => wifi::guest_status(state),
         (&Method::Put, "/api/wifi/guest") => wifi::guest_set(state, body),
         // Modem
-        (&Method::Get, "/api/data-usage") => handlers::data_usage(state),
+        (&Method::Get, "/api/data-usage") => data_usage::get(state),
+        (&Method::Put, "/api/data-usage/limit") => data_usage::set_limit(state, body),
+        (&Method::Put, "/api/data-usage/cycle") => data_usage::set_cycle(state, body),
         (&Method::Get, "/api/modem/status") => handlers::modem_status(state),
         (&Method::Post, "/api/modem/online") => modem_ext::modem_online_user(state),
         (&Method::Get, "/api/modem/data") => modem_ext::modem_data_get(state),
