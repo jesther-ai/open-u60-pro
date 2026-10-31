@@ -69,7 +69,7 @@ const path = require('node:path');
     const summary = page.locator(`.nav-group[data-group="${group}"] > summary`);
     if (await page.evaluate(() => innerWidth < 768)) {
       await summary.click();
-      await page.locator(`#section-tabs a[href="#${group}/${child}"]`).click();
+      await page.locator('#section-page-picker').selectOption(`${group}/${child}`);
     } else {
       const open = await page.locator(`.nav-group[data-group="${group}"]`).getAttribute('open');
       if (open === null) await summary.click();
@@ -79,6 +79,12 @@ const path = require('node:path');
   };
   const live = () => page.waitForFunction(() => document.querySelector('#stream-state').textContent === 'Live');
   await live();
+  assert.equal(await page.locator('#operator').textContent(),'Example Mobile');
+  assert.equal(await page.locator('#network-type').textContent(),'5G NSA');
+  const connectionType = await page.locator('#network-type').evaluate(node=>parseFloat(getComputedStyle(node).fontSize));
+  const connectionStatus = await page.locator('#connection-title').evaluate(node=>parseFloat(getComputedStyle(node).fontSize));
+  const operatorSize = await page.locator('#operator').evaluate(node=>parseFloat(getComputedStyle(node).fontSize));
+  assert.ok(operatorSize > connectionType && connectionType > connectionStatus,'operator, generation and status must have a clear descending type hierarchy');
   assert.equal(await page.locator('#download').textContent(),'123.20');
   assert.equal(await page.locator('#device-count').textContent(),'3');
   assert.equal(await page.locator('#wan-ip').textContent(),'10.154.28.6');

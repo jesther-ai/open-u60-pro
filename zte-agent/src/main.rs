@@ -12,7 +12,9 @@ mod client_details;
 mod console;
 mod dashboard;
 mod dashboard_extra;
+mod data_usage;
 mod device_ext;
+mod dns_control;
 pub mod doh;
 mod esim;
 mod esim_download;
@@ -116,6 +118,7 @@ fn main() {
     let oos_service_rx = event_bus.subscribe("zwrt_servicestatus");
     let connwd_wan_rx = event_bus.subscribe("router_event_wan_connect_status");
     let ttl_wan_rx = event_bus.subscribe("router_event_wan_connect_status");
+    let dns_network_rx = dns_control::subscribe_network_changes(&event_bus);
     let identity_events = sim_identity::FIRMWARE_EVENTS
         .iter()
         .map(|&name| (name, event_bus.subscribe(name)))
@@ -130,7 +133,11 @@ fn main() {
     state.sim_identity.start(Arc::clone(&event_bus), Arc::clone(&state.cache), identity_events);
 
     state.live_activity.start(Arc::clone(&state), apns_events);
+    if let Err(error) = dns_control::prepare_startup(&state) {
+        eprintln!("[dns] startup synchronization failed: {error}");
+    }
     state.doh.auto_start();
+    dns_control::start_network_watch(Arc::clone(&state), dns_network_rx);
     state.scheduler.start(Arc::clone(&state));
     state
         .charge_limit

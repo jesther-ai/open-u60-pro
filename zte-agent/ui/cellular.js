@@ -9,6 +9,10 @@
   const band = (value, rat) => {
     const raw = scalar(value);
     if (!raw || raw === '0') return '';
+    // `wan_active_band` is shared by LTE and NR. In SA the firmware can put
+    // `n78` there while every LTE serving-cell field is empty; never turn an
+    // explicitly NR-prefixed value into a fabricated LTE `B78` carrier.
+    if (rat === 'lte' && /^n\d+$/i.test(raw)) return '';
     const match = raw.match(/^(?:B|n)?(\d+)$/i);
     return match ? `${rat === 'nr' ? 'n' : 'B'}${Number(match[1])}` : raw;
   };

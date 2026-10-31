@@ -57,6 +57,22 @@ struct DNSSettingsView: View {
                 }
             }
 
+            if viewModel.selectedMode == .dot {
+                Section("DNS over TLS") {
+                    TextField("Server (host:853)", text: $viewModel.editDotEndpoint)
+                        .keyboardType(.URL)
+                        .textContentType(.URL)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+
+                    TextField("TLS certificate name", text: $viewModel.editDotServerName)
+                        .keyboardType(.URL)
+                        .textContentType(.URL)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                }
+            }
+
             // MARK: - Apply
 
             Section {
@@ -133,6 +149,7 @@ struct DNSSettingsView: View {
         case .auto: "Use DNS servers assigned by your ISP."
         case .custom: "Use custom DNS servers."
         case .doh: "Encrypt DNS queries over HTTPS."
+        case .dot: "Encrypt DNS queries over TLS."
         }
     }
 

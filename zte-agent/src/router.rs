@@ -43,15 +43,8 @@ pub fn router_dns_get(_state: &AppState) -> (u16, Value) {
     }
 }
 
-pub fn router_dns_set(_state: &AppState, body: &[u8]) -> (u16, Value) {
-    let parsed: Value = match serde_json::from_slice(body) {
-        Ok(v) => v,
-        Err(_) => return (400, json!({"ok": false, "error": "invalid JSON"})),
-    };
-    match ubus::call("zwrt_router.api", "router_set_wan_dns", Some(&parsed.to_string())) {
-        Ok(data) => (200, json!({"ok": true, "data": data})),
-        Err(e) => (503, json!({"ok": false, "error": e})),
-    }
+pub fn router_dns_set(state: &AppState, body: &[u8]) -> (u16, Value) {
+    crate::dns_control::legacy_router_apply(state, body)
 }
 
 pub fn router_lan_get(_state: &AppState) -> (u16, Value) {

@@ -91,6 +91,7 @@ const path = require('node:path');
   const priorReads=count('/api/wifi/status');push();await go('network/clients');await go('network/wifi');assert.equal(count('/api/wifi/status'),priorReads);
   wifi.ssid_2g='Live clean update';push();await page.waitForFunction(()=>document.querySelector('#wifi-config-ssid_2g').value==='Live clean update');
   await go('network/mobile');await page.waitForFunction(()=>!document.querySelector('#mobile-config fieldset').disabled);
+  assert.ok(await page.evaluate(()=>document.querySelector('#mobile-config').getBoundingClientRect().top-document.querySelector('.connection-panel').getBoundingClientRect().bottom>=19),'mobile network keeps a full card gap below the connection summary');
   await page.locator('#mobile-config-enable').selectOption('0');await save('mobile-config');await saved('mobile-config');assert.deepEqual(last('/api/modem/data').body,{cid:1,enable:0,roam_enable:0,connect_mode:1,connect_status:'disconnected'});
   await page.locator('#radio-config-operate_mode').selectOption('LPM');await save('radio-config');await saved('radio-config');assert.equal(last('/api/modem/airplane').body.operate_mode,'LPM');
   await page.locator('#network-mode-config-net_select').selectOption('Only_5G');await save('network-mode-config');await saved('network-mode-config');assert.deepEqual(last('/api/modem/network-mode').body,{net_select:'Only_5G'});

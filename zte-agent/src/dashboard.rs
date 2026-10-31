@@ -58,7 +58,9 @@ const TOPICS: &[&str] = &[
     "esim",
     "power",
     "https",
+    "dns",
 ];
+const DNS_TOPIC: usize = TOPICS.len() - 1;
 const EXTRA_READINGS: &[(&str, u64, usize)] = &[
     ("operators", 2, 0),
     ("forwarding", 2, 1),
@@ -118,6 +120,9 @@ impl Interests {
 }
 
 fn extra_topic(name: &str) -> Option<usize> {
+    if name == "dns_cache" {
+        return Some(DNS_TOPIC);
+    }
     EXTRA_READINGS
         .iter()
         .find(|(key, _, _)| *key == name)
@@ -253,6 +258,9 @@ impl Dashboard {
 
     fn start_extra_collectors(self: &Arc<Self>, app: Arc<AppState>) {
         for (index, topic_name) in TOPICS.iter().enumerate() {
+            if index == DNS_TOPIC {
+                continue;
+            }
             let feed = Arc::clone(self);
             let app = Arc::clone(&app);
             crate::system::spawn_named(&format!("dashboard-{topic_name}"), move || {
@@ -304,6 +312,47 @@ impl Dashboard {
         }
     }
 
+    /// The cache is already in memory, so this collector never makes an HTTP
+    /// request. It runs only while a `topics=dns` dashboard viewer exists and
+    /// publishes a fresh reading when cache keys or query statistics change.
+    /// TTL-only changes stay local to the browser countdown; the one-second
+    /// inspection also detects entries that have reached expiry.
+    fn start_dns_collector(self: &Arc<Self>, app: Arc<AppState>) {
+        let feed = Arc::clone(self);
+        crate::system::spawn_named("dashboard-dns", move || {
+            let mut previous = None;
+            loop {
+                let active = feed
+                    .state
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .extra_clients[DNS_TOPIC]
+                    > 0;
+                if active {
+                    let reading = crate::dns_control::cache(&app).1;
+                    let signature = dns_signature(&reading);
+                    if previous.as_ref() != Some(&signature) {
+                        let mut updates = Readings::new();
+                        updates.insert("dns_cache".into(), reading);
+                        feed.publish(updates);
+                        previous = Some(signature);
+                    }
+                } else {
+                    previous = None;
+                }
+                let guard = feed.state.lock().unwrap_or_else(|p| p.into_inner());
+                if guard.extra_clients[DNS_TOPIC] == 0 {
+                    drop(
+                        feed.changed
+                            .wait_while(guard, |state| state.extra_clients[DNS_TOPIC] == 0),
+                    );
+                } else {
+                    drop(feed.changed.wait_timeout(guard, Duration::from_secs(1)));
+                }
+            }
+        });
+    }
+
     pub fn start(self: &Arc<Self>, state: Arc<AppState>, events: Arc<crate::event_bus::EventBus>) {
         let weak = Arc::downgrade(self);
         let cache = Arc::clone(&state.cache);
@@ -317,6 +366,7 @@ impl Dashboard {
             }),
         );
         self.start_extra_collectors(Arc::clone(&state));
+        self.start_dns_collector(Arc::clone(&state));
         let feed = Arc::clone(self);
         crate::system::spawn_named("dashboard-feed", move || {
             let mut sampled = BTreeMap::<&str, Instant>::new();
@@ -373,6 +423,22 @@ impl Dashboard {
             }
         });
     }
+}
+
+fn dns_signature(reading: &Value) -> Value {
+    let mut keys = reading["data"]["entries"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|entry| {
+            (
+                entry["domain"].as_str().unwrap_or_default().to_string(),
+                entry["type_id"].as_u64().unwrap_or_default(),
+            )
+        })
+        .collect::<Vec<_>>();
+    keys.sort();
+    json!({"keys":keys,"stats":reading["data"]["stats"]})
 }
 
 fn is_sms(name: &str) -> bool {
@@ -563,6 +629,41 @@ pub fn response(app: Arc<AppState>, url: String, token: String) -> axum::respons
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dns_topic_is_private_and_ttl_only_changes_do_not_emit() {
+        let interests = Interests::from_url("/api/dashboard/events?topics=dns");
+        assert!(interests.includes("dns_cache"));
+        assert!(!Interests::default().includes("dns_cache"));
+        let first = json!({"ok":true,"data":{
+            "entries":[{"domain":"example.com","type_id":1,"ttl":60}],
+            "stats":{"cache_hits":2,"cache_misses":1}
+        }});
+        let tick = json!({"ok":true,"data":{
+            "entries":[{"domain":"example.com","type_id":1,"ttl":59}],
+            "stats":{"cache_hits":2,"cache_misses":1}
+        }});
+        assert_eq!(dns_signature(&first), dns_signature(&tick));
+        let hit = json!({"ok":true,"data":{
+            "entries":[{"domain":"example.com","type_id":1,"ttl":58}],
+            "stats":{"cache_hits":3,"cache_misses":1}
+        }});
+        assert_ne!(dns_signature(&first), dns_signature(&hit));
+
+        let feed = Arc::new(Dashboard::default());
+        let _ordinary = feed.subscribe(false).unwrap();
+        let viewer = feed.subscribe(interests).unwrap();
+        feed.publish(BTreeMap::from([("dns_cache".into(), first)]));
+        assert!(!feed.next(0, false).1.contains_key("dns_cache"));
+        assert!(feed.next(0, interests).1.contains_key("dns_cache"));
+        drop(viewer);
+        assert!(!feed
+            .state
+            .lock()
+            .unwrap()
+            .readings
+            .contains_key("dns_cache"));
+    }
 
     #[test]
     fn esim_topic_uses_ninth_bit_and_is_private_to_its_subscribers() {

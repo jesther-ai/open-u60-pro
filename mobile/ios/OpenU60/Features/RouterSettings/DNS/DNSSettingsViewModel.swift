@@ -1,7 +1,7 @@
 import SwiftUI
 
 enum DNSMode: Int, CaseIterable, Identifiable {
-    case auto, custom, doh
+    case auto, custom, doh, dot
 
     var id: Int { rawValue }
 
@@ -10,6 +10,7 @@ enum DNSMode: Int, CaseIterable, Identifiable {
         case .auto: "Auto"
         case .custom: "Custom"
         case .doh: "DoH"
+        case .dot: "DoT"
         }
     }
 }
@@ -32,6 +33,8 @@ final class DNSSettingsViewModel {
     // DoH
     var doh: DoHStatus = .empty
     var editUpstream: String = ""
+    var editDotEndpoint: String = ""
+    var editDotServerName: String = ""
     var cacheEntries: [DoHCacheEntry] = []
     var showCacheInspector: Bool = false
 
@@ -49,70 +52,87 @@ final class DNSSettingsViewModel {
         message = nil
 
         do {
-            let data = try await client.getJSON("/api/router/dns")
-            config = DNSParser.parse(data)
+            let data = try await client.getJSON("/api/dns/status")
+            let mode = data["mode"] as? String ?? "automatic"
+            config = DNSConfig(
+                wanDnsMode: mode == "automatic" ? "auto" : "manual",
+                primaryDns: data["primary"] as? String ?? "",
+                secondaryDns: data["secondary"] as? String ?? "",
+                ipv6PrimaryDns: "",
+                ipv6SecondaryDns: "",
+                ipv6DnsMode: ""
+            )
+            let stats = data["stats"] as? [String: Any] ?? [:]
+            doh = DoHStatus(
+                enabled: data["proxy_running"] as? Bool ?? false,
+                upstreamUrl: data["doh_url"] as? String ?? "",
+                cacheEntries: stats["cache_entries"] as? Int ?? 0,
+                cacheHits: stats["cache_hits"] as? Int ?? 0,
+                cacheMisses: stats["cache_misses"] as? Int ?? 0,
+                queriesTotal: stats["queries_total"] as? Int ?? 0
+            )
             if !initialLoadDone {
                 editPrimary = config.primaryDns
                 editSecondary = config.secondaryDns
-            }
-        } catch {
-            showMessage("Failed to load DNS: \(error.localizedDescription)", isError: true)
-        }
-
-        // DoH status (independent, don't fail the whole refresh)
-        do {
-            let data = try await client.getJSON("/api/doh/status")
-            doh = DoHParser.parse(data)
-            if !initialLoadDone && editUpstream.isEmpty {
                 editUpstream = doh.upstreamUrl
+                editDotEndpoint = data["dot_endpoint"] as? String ?? ""
+                editDotServerName = data["dot_server_name"] as? String ?? ""
+                switch mode {
+                case "manual": selectedMode = .custom
+                case "doh": selectedMode = .doh
+                case "dot": selectedMode = .dot
+                default: selectedMode = .auto
+                }
+                initialLoadDone = true
             }
             if doh.enabled {
                 await refreshCache()
             }
         } catch {
-            doh = .empty
-            if message == nil {
-                showMessage("DoH status unavailable", isError: false)
-            }
-        }
-
-        // Derive mode from state only on initial load
-        if !initialLoadDone {
-            if doh.enabled {
-                selectedMode = .doh
-            } else if config.isManual {
-                selectedMode = .custom
-            } else {
-                selectedMode = .auto
-            }
-            initialLoadDone = true
+            showMessage("Failed to load DNS: \(error.localizedDescription)", isError: true)
         }
 
         isLoading = false
     }
 
     func apply() async {
-        switch selectedMode {
-        case .auto:
-            await applyAuto()
-        case .custom:
-            await applyCustom()
-        case .doh:
-            await applyDoH()
+        if selectedMode != .auto && editPrimary.isEmpty {
+            showMessage("Primary DNS cannot be empty", isError: true)
+            return
         }
-    }
-
-    private func applyAuto() async {
+        if selectedMode != .auto && !isValidIPv4(editPrimary) {
+            showMessage("Invalid primary DNS address", isError: true)
+            return
+        }
+        if !editSecondary.isEmpty && !isValidIPv4(editSecondary) {
+            showMessage("Invalid secondary DNS address", isError: true)
+            return
+        }
+        if selectedMode == .doh && editUpstream.isEmpty {
+            showMessage("DoH upstream URL cannot be empty", isError: true)
+            return
+        }
+        if selectedMode == .dot && (editDotEndpoint.isEmpty || editDotServerName.isEmpty) {
+            showMessage("DoT server and TLS name cannot be empty", isError: true)
+            return
+        }
         isLoading = true
         do {
-            let _ = try await client.putJSON("/api/router/dns", body: [
-                "dns_mode": "auto",
-                "prefer_dns_manual": "",
-                "standby_dns_manual": ""
+            let mode: String = switch selectedMode {
+            case .auto: "automatic"
+            case .custom: "manual"
+            case .doh: "doh"
+            case .dot: "dot"
+            }
+            let _ = try await client.putJSON("/api/dns/apply", body: [
+                "mode": mode,
+                "primary": selectedMode == .auto ? "" : editPrimary,
+                "secondary": selectedMode == .auto ? "" : editSecondary,
+                "doh_url": editUpstream,
+                "dot_endpoint": editDotEndpoint,
+                "dot_server_name": editDotServerName
             ])
-            // Always disable DoH (idempotent, prevents orphaned dnsmasq forwarding)
-            let _ = try await client.postJSON("/api/doh/disable")
-            showMessage("DNS set to Auto", isError: false)
+            showMessage("DNS settings applied and verified", isError: false)
             await refresh()
         } catch {
             showMessage("Failed: \(error.localizedDescription)", isError: true)
@@ -129,85 +149,10 @@ final class DNSSettingsViewModel {
         }
     }
 
-    private func applyCustom() async {
-        guard !editPrimary.isEmpty else {
-            showMessage("Primary DNS cannot be empty", isError: true)
-            return
-        }
-        guard isValidIPv4(editPrimary) else {
-            showMessage("Invalid primary DNS address", isError: true)
-            return
-        }
-        if !editSecondary.isEmpty {
-            guard isValidIPv4(editSecondary) else {
-                showMessage("Invalid secondary DNS address", isError: true)
-                return
-            }
-        }
-        isLoading = true
-        do {
-            let _ = try await client.putJSON("/api/router/dns", body: [
-                "dns_mode": "manual",
-                "prefer_dns_manual": editPrimary,
-                "standby_dns_manual": editSecondary
-            ])
-            // Always disable DoH (idempotent, prevents orphaned dnsmasq forwarding)
-            let _ = try await client.postJSON("/api/doh/disable")
-            showMessage("DNS set to Custom (\(editPrimary))", isError: false)
-            await refresh()
-        } catch {
-            showMessage("Failed: \(error.localizedDescription)", isError: true)
-            isLoading = false
-        }
-    }
-
-    private func applyDoH() async {
-        guard !editPrimary.isEmpty else {
-            showMessage("Primary DNS cannot be empty", isError: true)
-            return
-        }
-        guard isValidIPv4(editPrimary) else {
-            showMessage("Invalid primary DNS address", isError: true)
-            return
-        }
-        if !editSecondary.isEmpty {
-            guard isValidIPv4(editSecondary) else {
-                showMessage("Invalid secondary DNS address", isError: true)
-                return
-            }
-        }
-        guard !editUpstream.isEmpty else {
-            showMessage("DoH upstream URL cannot be empty", isError: true)
-            return
-        }
-        isLoading = true
-        do {
-            // Set manual DNS (DoH local resolver)
-            let _ = try await client.putJSON("/api/router/dns", body: [
-                "dns_mode": "manual",
-                "prefer_dns_manual": editPrimary,
-                "standby_dns_manual": editSecondary
-            ])
-            // Update DoH upstream
-            let _ = try await client.putJSON("/api/doh/config", body: [
-                "upstream_url": editUpstream
-            ])
-            // Enable DoH if not running
-            if !doh.enabled {
-                let _ = try await client.postJSON("/api/doh/enable")
-            }
-            showMessage("DoH enabled with \(editUpstream)", isError: false)
-            await refresh()
-        } catch {
-            showMessage("Failed: \(error.localizedDescription)", isError: true)
-            isLoading = false
-        }
-    }
-
     func clearCache() async {
         isLoading = true
         do {
-            let _ = try await client.postJSON("/api/doh/cache/clear")
+            let _ = try await client.postJSON("/api/dns/cache/clear")
             showMessage("DNS cache cleared", isError: false)
             await refresh()
         } catch {
@@ -218,7 +163,8 @@ final class DNSSettingsViewModel {
 
     func refreshCache() async {
         do {
-            let list = try await client.getJSONArray("/api/doh/cache")
+            let data = try await client.getJSON("/api/dns/cache")
+            let list = data["entries"] as? [[String: Any]] ?? []
             cacheEntries = DoHParser.parseCacheEntries(list)
         } catch {
             // cache fetch is best-effort

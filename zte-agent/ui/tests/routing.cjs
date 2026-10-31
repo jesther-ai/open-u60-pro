@@ -105,6 +105,7 @@ const {chromium}=require('playwright');
       for(const route of ['network/lan','network/firewall','network/ports','network/qos','network/ttl']){
         await go(route);assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false,`${route} overflows ${theme} ${width}`);
         if(width===390 && route==='network/lan' && theme==='dark')await page.screenshot({path:'/tmp/zte-routing-lan-phone-dark.png',fullPage:true});
+        if(width===390 && route==='network/ttl' && theme==='light')await page.screenshot({path:'/tmp/zte-routing-ttl-phone-light.png',fullPage:true});
         if(width===1440 && route==='network/ports' && theme==='light')await page.screenshot({path:'/tmp/zte-routing-ports-desktop-light.png',fullPage:true});
       }
     }
@@ -112,7 +113,7 @@ const {chromium}=require('playwright');
     await go('network/lan');failLAN=true;push();await page.waitForFunction(()=>document.querySelector('#lan-overview .reading-caption').textContent.includes('unavailable'));assert.match(await page.locator('#lan-overview').textContent(),/192.168.5.1/);failLAN=false;
     await go('network/ports');for(const stream of streams)stream.destroy();streams.clear();await page.waitForFunction(()=>!OpenU60Console.connected && document.querySelector('#port-rules fieldset').disabled);await page.waitForFunction(()=>OpenU60Console.connected);assert.ok(await page.locator('#port-rules .rule-card').count()>0);
     failQoS=true;const unsupported=await context.newPage();await unsupported.goto(`http://127.0.0.1:${server.address().port}/#network/qos`);await unsupported.waitForFunction(()=>document.querySelector('#qos-config .action-status').textContent.includes('Settings unavailable'));assert.equal(await unsupported.locator('#qos-config fieldset').evaluate(node=>node.disabled),true);await unsupported.close();failQoS=false;push();
-    authExpired=true;await go('network/qos');await page.locator('#qos-config').getByRole('button',{name:'Read current settings',exact:true}).click();await page.waitForFunction(()=>document.querySelector('#login-dialog').open);assert.equal(await page.locator('#port-rule-name').inputValue(),'');assert.equal(await page.locator('.routing-reconnect a').getAttribute('href'),null);
+    authExpired=true;await page.evaluate(()=>OpenU60Navigation.go('network/qos'));await page.waitForFunction(()=>document.documentElement.dataset.route==='network/qos');await page.waitForFunction(()=>document.querySelector('#login-dialog').open);assert.equal(await page.locator('#port-rule-name').inputValue(),'');assert.equal(await page.locator('.routing-reconnect a').getAttribute('href'),null);
     assert.deepEqual(errors,[]);
     console.log('Passed: router controls including packet TTL, exact write contracts, validations, confirmation cancellation, LAN reconnect links, dirty/live conflicts, stale/guarded deletes, unconfirmed writes, no retry/polling, retained failures, auth clearing, digit motion and responsive/theme views.');
   }finally{await browser.close();clearInterval(heartbeat);for(const stream of streams)stream.destroy();server.closeAllConnections();server.close();}

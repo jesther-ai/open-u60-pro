@@ -101,7 +101,15 @@ pub fn modem_network_mode_set(state: &AppState, body: &[u8]) -> (u16, Value) {
     );
     settle_modem_data(state);
     match result {
-        Ok(data) => (200, json!({"ok": true, "data": data})),
+        Ok(data) => {
+            match crate::dns_control::network_preference_changed(state) {
+                Ok(()) => eprintln!("[dns] network preference changed: caches and sessions reset"),
+                Err(error) => {
+                    eprintln!("[dns] network preference changed: immediate reset failed: {error}")
+                }
+            }
+            (200, json!({"ok": true, "data": data}))
+        }
         Err(e) => (503, json!({"ok": false, "error": e})),
     }
 }

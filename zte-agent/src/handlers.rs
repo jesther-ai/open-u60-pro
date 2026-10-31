@@ -277,40 +277,6 @@ fn uci_unquote(raw: &str) -> String {
     }
 }
 
-/// GET /api/data-usage
-pub fn data_usage(_state: &AppState) -> (u16, Value) {
-    let section = "zwrt_data_commit.wwancid1dst";
-
-    let read_period = |prefix: &str| -> Value {
-        let get = |suffix: &str| -> Value {
-            let key = format!("{section}.{prefix}_{suffix}");
-            match ubus::uci_get(&key) {
-                Ok(v) => v.parse::<u64>().map(Value::from).unwrap_or(Value::from(v)),
-                Err(_) => Value::Null,
-            }
-        };
-        json!({
-            "tx_bytes": get("tx_bytes"),
-            "rx_bytes": get("rx_bytes"),
-            "time_secs": get("time"),
-            "tx_packets": get("tx_packets"),
-            "rx_packets": get("rx_packets"),
-        })
-    };
-
-    (
-        200,
-        json!({
-            "ok": true,
-            "data": {
-                "day": read_period("day"),
-                "month": read_period("month"),
-                "total": read_period("total"),
-            }
-        }),
-    )
-}
-
 /// POST /api/modem/online
 pub fn modem_online(state: &AppState) -> (u16, Value) {
     use crate::at_cmd;
