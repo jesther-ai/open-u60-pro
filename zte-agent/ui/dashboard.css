@@ -381,17 +381,42 @@ h1>span {
   color:var(--connection-muted)
 }
 .connection-panel h2 {
-  font-size:26px;
-  font-weight:500;
-  letter-spacing:-.7px;
-  margin:8px 0 14px
+  max-width:16ch;
+  font-size:clamp(30px,3.1vw,42px);
+  line-height:1.08;
+  font-weight:650;
+  letter-spacing:-1.4px;
+  margin:9px 0 16px;
+  overflow-wrap:anywhere
 }
 .connection-meta {
   display:flex;
   align-items:center;
-  gap:12px;
-  font-size:12px;
+  flex-wrap:wrap;
+  gap:10px 16px;
   color:var(--connection-detail)
+}
+.connection-meta #network-type {
+  color:var(--highlight);
+  font-size:20px;
+  line-height:1.15;
+  font-weight:650;
+  letter-spacing:-.4px
+}
+.connection-meta #connection-title {
+  display:inline-flex;
+  align-items:center;
+  gap:8px;
+  font-size:11px;
+  line-height:1.45
+}
+.connection-meta #connection-title::before {
+  content:"";
+  width:6px;
+  height:6px;
+  flex:0 0 6px;
+  border-radius:50%;
+  background:var(--highlight)
 }
 .pill {
   font:10px var(--mono);
@@ -1171,13 +1196,14 @@ dialog .button {
     padding: 24px;
   }
   .connection-panel h2 {
-    font-size: 25px;
+    max-width:none;
+    font-size:clamp(29px,9vw,36px)
   }
   .connection-symbol {
     display: none;
   }
-  .connection-meta {
-    flex-wrap: wrap;
+  .connection-meta #network-type {
+    font-size:19px
   }
   .connection-facts {
     display: grid;
