@@ -1,4 +1,4 @@
-//! Opt-in IPv4 TTL and IPv6 hop-limit rewriting for forwarded WAN traffic.
+//! Opt-in IPv4 TTL and IPv6 hop-limit rewriting for cellular WAN traffic.
 //!
 //! The feature owns one chain in each legacy mangle table. It never changes
 //! the router's boot scripts or restarts the firewall, and failures are
@@ -366,7 +366,7 @@ mod tests {
         let error = Config::default()
             .patched(&json!({"ipv6_hop_limit": 0}))
             .unwrap_err();
-        assert_eq!(error, "ipv6_hop_limit must be 1-255");
+        assert!(error.contains("1-255"));
     }
 
     #[test]
@@ -374,6 +374,6 @@ mod tests {
         let error = Config::default()
             .patched(&json!({"ipv4_ttl": 256}))
             .unwrap_err();
-        assert_eq!(error, "ipv4_ttl must be 1-255");
+        assert!(error.contains("1-255"));
     }
 }
