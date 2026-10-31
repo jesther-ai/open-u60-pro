@@ -297,7 +297,7 @@
   }
   const renderers = {
     device: renderDevice, wan: renderWan, wan6: renderWan, signal: renderSignal,
-    client_details: () => {}, battery_details: () => {}, https_status: () => {},
+    client_details: () => {}, battery_details: () => {}, https_status: () => {}, dns_cache: () => {},
     esim_status: () => {},
     lan_config: () => {}, firewall_config: () => {}, upnp_config: () => {}, port_rules: () => {}, qos_config: () => {},
     operators: () => {}, forwarding: () => {}, resources: () => {}, neighbors: () => {}, sweep: () => {}, speedtest: () => {}, at_port: () => {}, guest: () => {}, mobile: () => {}, charging: () => {}, speed: renderSpeed, battery: renderBattery, wifi: renderWifi, clients: renderClients, modem: renderModem, sms: renderSMS, sms_capacity: renderSMSCapacity
@@ -367,7 +367,7 @@
   }
   function streamOptions() {
     const {group,key} = OpenU60Navigation.current;
-    const topic = {'settings/https':'https','network/esim':'esim','network/clients':'clients','network/lan':'routing','network/firewall':'routing','network/ports':'routing','network/qos':'routing','network/operators':'operators','sms/forwarding':'forwarding','tools/battery':'power','tools/diagnostics':'health','tools/radio':'radio','tools/speedtest':'speedtest','tools/terminal':'terminal'}[key];
+    const topic = {'settings/https':'https','network/esim':'esim','network/clients':'clients','network/dns-cache':'dns','network/lan':'routing','network/firewall':'routing','network/ports':'routing','network/qos':'routing','network/operators':'operators','sms/forwarding':'forwarding','tools/battery':'power','tools/diagnostics':'health','tools/radio':'radio','tools/speedtest':'speedtest','tools/terminal':'terminal'}[key];
     const query = [...(group === 'sms' ? ['sms=1'] : []),...(topic ? [`topics=${topic}`] : [])].join('&');
     return {includeSms:group === 'sms',key:query ? `?${query}` : '',topic};
   }
@@ -459,7 +459,7 @@
   window.addEventListener('dashboard:navigate',event => {
     if (event.detail.key !== 'network/clients') text('device-count', lastGood.get('clients') ? clients.length : '—');
     const options = streamOptions(), includeSms = options.includeSms;
-    const topics = {https_status:'https',battery_details:'power',esim_status:'esim',client_details:'clients',operators:'operators',forwarding:'forwarding',resources:'health',neighbors:'radio',sweep:'radio',speedtest:'speedtest',at_port:'terminal'};
+    const topics = {https_status:'https',battery_details:'power',esim_status:'esim',client_details:'clients',dns_cache:'dns',operators:'operators',forwarding:'forwarding',resources:'health',neighbors:'radio',sweep:'radio',speedtest:'speedtest',at_port:'terminal'};
     for (const [name,topic] of Object.entries(topics)) if (topic !== options.topic) { readings.delete(name); lastGood.delete(name); }
     if (!includeSms) {
       readings.delete('sms'); readings.delete('sms_capacity');

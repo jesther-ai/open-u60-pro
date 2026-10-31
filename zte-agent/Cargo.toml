@@ -17,6 +17,7 @@ httpdate = "1"
 # SGP.22 card commands: LGPL-2.1-only Rust translation of lpac's libeuicc (see euicc/).
 euicc = { path = "../euicc" }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"
 # LAN HTTPS (`tls`, `httpd::tls`): the server side of the TLS stack reqwest
 # already links (same versions and features), and ring for the router's own
 # CA (P-256 keys, ECDSA signatures, digests).

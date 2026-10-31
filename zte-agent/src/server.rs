@@ -24,6 +24,7 @@ use crate::sms_forward;
 use crate::speedtest;
 use crate::tailscale;
 use crate::telephony;
+use crate::ttl;
 use crate::usb;
 use crate::wifi;
 
@@ -206,6 +207,7 @@ pub fn lane(method: Method, path: &str) -> Lane {
         (_, p) if p.starts_with("/api/esim/") || p.starts_with("/api/tailscale/") || p.starts_with("/api/https/") => true,
         (_, p) if p.starts_with("/api/ussd/") || p.starts_with("/api/stk/") => true,
         (Post, p) if p.starts_with("/api/sim/") || p.starts_with("/api/cell/") => true,
+        (_, p) if p.starts_with("/api/dns/") => true,
         (
             Post,
             "/api/at/send"
@@ -362,6 +364,11 @@ fn route_inner(method: &Method, path: &str, state: &AppState, body: &[u8]) -> (u
         // Router
         (&Method::Get, "/api/router/dns") => router::router_dns_get(state),
         (&Method::Put, "/api/router/dns") => router::router_dns_set(state, body),
+        (&Method::Get, "/api/dns/status") => crate::dns_control::status(state),
+        (&Method::Post, "/api/dns/test") => crate::dns_control::test(state, body),
+        (&Method::Put, "/api/dns/apply") => crate::dns_control::apply(state, body),
+        (&Method::Get, "/api/dns/cache") => crate::dns_control::cache(state),
+        (&Method::Post, "/api/dns/cache/clear") => crate::dns_control::clear_cache(state),
         (&Method::Get, "/api/router/lan") => router::router_lan_get(state),
         (&Method::Put, "/api/router/lan") => router::router_lan_set(state, body),
         (&Method::Get, "/api/router/firewall") => router::router_firewall_get(state),
@@ -379,6 +386,8 @@ fn route_inner(method: &Method, path: &str, state: &AppState, body: &[u8]) -> (u
         (&Method::Put, "/api/router/vpn") => router::router_vpn_set(state, body),
         (&Method::Get, "/api/router/qos") => router::router_qos_get(state),
         (&Method::Put, "/api/router/qos") => router::router_qos_set(state, body),
+        (&Method::Get, "/api/router/ttl") => ttl::config_get(&state.ttl),
+        (&Method::Put, "/api/router/ttl") => ttl::config_set(&state.ttl, body),
         (&Method::Get, "/api/router/domain-filter") => router::router_domain_filter_get(state),
         (&Method::Put, "/api/router/domain-filter") => router::router_domain_filter_set(state, body),
         (&Method::Get, "/api/router/apn/mode") => router::router_apn_mode_get(state),
@@ -472,32 +481,15 @@ fn doh_status(state: &AppState) -> (u16, Value) {
 }
 
 fn doh_config_set(state: &AppState, body: &[u8]) -> (u16, Value) {
-    match state.doh.update_config(body) {
-        Ok(()) => (200, json!({"ok": true})),
-        Err(e) => (400, json!({"ok": false, "error": e})),
-    }
+    crate::dns_control::legacy_doh_config(state, body)
 }
 
 fn doh_enable(state: &AppState) -> (u16, Value) {
-    if let Err(e) = state.doh.start() {
-        return (500, json!({"ok": false, "error": e}));
-    }
-    // Write DoH forwarding config to dnsmasq.d drop-in
-    // (UCI `set` creates a plain option, but dnsmasq init only reads `server` as a list — drop-in is reliable)
-    let _ = std::fs::write("/tmp/dnsmasq.d/doh.conf", "server=127.0.0.1#5353\nno-resolv\n");
-    let _ = std::process::Command::new("sh")
-        .args(["-c", "/etc/init.d/dnsmasq restart"])
-        .output();
-    // Save config
-    state.doh.set_enabled(true);
-    (200, json!({"ok": true, "data": {"status": "enabled"}}))
+    crate::dns_control::legacy_doh_enable(state)
 }
 
 fn doh_disable(state: &AppState) -> (u16, Value) {
-    state.doh.stop();
-    dnsmasq_restore_defaults();
-    state.doh.set_enabled(false);
-    (200, json!({"ok": true, "data": {"status": "disabled"}}))
+    crate::dns_control::legacy_doh_disable(state)
 }
 
 /// Restore dnsmasq to default DNS resolution (remove DoH forwarding).
@@ -513,8 +505,7 @@ fn doh_cache_list(state: &AppState) -> (u16, Value) {
 }
 
 fn doh_cache_clear(state: &AppState) -> (u16, Value) {
-    state.doh.clear_cache();
-    (200, json!({"ok": true}))
+    crate::dns_control::clear_cache(state)
 }
 
 

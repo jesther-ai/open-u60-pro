@@ -7,7 +7,7 @@ const {chromium}=require('playwright');
   const streams=new Set(),requests=[];
   const lan={lan_ipaddr:'192.168.0.1',lan_netmask:'255.255.255.0',dhcp_enable:'1',dhcp_start:'100',dhcp_end:'192.168.0.149',dhcp_lease_time:'12h'};
   const firewall={firewall_switch:'1',firewall_level:'medium',nat_switch:'1',dmz_enabled:'0',dmz_ip:'',port_forward_switch:'1'};
-  const upnp={upnp_switch:'0'},qos={qos_switch:'0'};
+  const upnp={upnp_switch:'0'},qos={qos_switch:'0'},ttl={enabled:false,ipv4_ttl:64,ipv6_hop_limit:64,active:false,hardware_acceleration:'may_bypass'};
   let rules=[{name:'Home server',protocol:'tcp',wan_port:'8443',lan_ip:'192.168.0.10',lan_port:'443',enabled:'1'},{name:'Console',protocol:'udp',wan_port:'3074',lan_ip:'192.168.0.11',lan_port:'3074',enabled:'1'}];
   let clients={hosts:{},dhcp_leases:[{hostname:'Home server',ipaddr:'192.168.0.10',macaddr:'aa:bb:cc:dd:ee:01'}]};
   let failRules=false,failLAN=false,failQoS=false,ignoreWrite=false,loseAddReply=false,authExpired=false,postGuardRace=false;
@@ -33,6 +33,7 @@ const {chromium}=require('playwright');
         if(req.url==='/api/router/firewall'){send(res,firewall);return;}
         if(req.url==='/api/router/firewall/upnp'){send(res,upnp);return;}
         if(req.url==='/api/router/qos'){send(res,failQoS?'QoS unsupported':qos,failQoS?503:200);return;}
+        if(req.url==='/api/router/ttl'){send(res,ttl);return;}
         if(req.url==='/api/router/firewall/port-forward'){send(res,failRules?'List unavailable':{rule_list:rules},failRules?503:200);return;}
       }
       if(req.url==='/api/router/firewall/port-forward'){
@@ -47,6 +48,7 @@ const {chromium}=require('playwright');
       }else if(!ignoreWrite){
         if(req.url==='/api/router/lan')Object.assign(lan,body);
         else if(req.url==='/api/router/qos')Object.assign(qos,body);
+        else if(req.url==='/api/router/ttl')Object.assign(ttl,body,{active:body.enabled});
         else if(req.url==='/api/router/firewall/upnp')Object.assign(upnp,body);
         else Object.assign(firewall,body);
       }
@@ -94,13 +96,16 @@ const {chromium}=require('playwright');
     failRules=true;push();await page.waitForFunction(()=>document.querySelector('#port-rules fieldset').disabled);assert.ok(await page.locator('#port-rules .rule-card').count()>0,'failed reads retain last rules');failRules=false;push();await page.waitForFunction(()=>!document.querySelector('#port-rules fieldset').disabled);
     await go('network/qos');await page.locator('#qos-config-qos_switch').selectOption('1');await submit('qos-config');await confirm('Save changes');await status('qos-config','Saved and confirmed');assert.deepEqual(last('/api/router/qos','PUT').body,{qos_switch:'1'});
     ignoreWrite=true;await page.locator('#qos-config-qos_switch').selectOption('0');await submit('qos-config');await confirm('Save changes');await status('qos-config','not confirmed');assert.equal(await page.locator('#qos-config-qos_switch').inputValue(),'0');ignoreWrite=false;await page.locator('#qos-config').getByRole('button',{name:'Discard edits',exact:true}).click();
+    await go('network/ttl');await status('ttl-config','Current settings loaded');await page.locator('#ttl-config-ipv4_ttl').fill('0');const ttlWrites=count('/api/router/ttl','PUT');await submit('ttl-config');assert.equal(await page.locator('#ttl-config-ipv4_ttl').evaluate(input=>input.validity.rangeUnderflow),true);assert.equal(count('/api/router/ttl','PUT'),ttlWrites);
+    await page.locator('#ttl-config-enabled').selectOption('true');await page.locator('#ttl-config-ipv4_ttl').fill('65');await page.locator('#ttl-config-ipv6_hop_limit').fill('66');await submit('ttl-config');await confirm('Save changes');await status('ttl-config','Saved and confirmed');assert.deepEqual(last('/api/router/ttl','PUT').body,{enabled:true,ipv4_ttl:65,ipv6_hop_limit:66});
     await go('network/lan');await page.locator('#lan-config-lan_ipaddr').fill('192.168.5.1');await page.locator('#lan-config-dhcp_start').fill('192.168.5.100');await page.locator('#lan-config-dhcp_end').fill('192.168.5.149');await submit('lan-config');await confirm('Save changes');await status('lan-config','Saved and confirmed');assert.equal(await page.locator('.routing-reconnect a').getAttribute('href'),`http://192.168.5.1:${server.address().port}/#network/lan`);
     const readsBeforeIdle=requests.length;await page.waitForTimeout(1200);assert.equal(requests.length,readsBeforeIdle,'SSE causes no browser polling');
     for(const theme of ['light','dark'])for(const width of [320,390,820,1440]){
       await page.setViewportSize({width,height:1100});await go('settings/appearance');await page.locator(`input[name=appearance][value=${theme}]`).check();
-      for(const route of ['network/lan','network/firewall','network/ports','network/qos']){
+      for(const route of ['network/lan','network/firewall','network/ports','network/qos','network/ttl']){
         await go(route);assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false,`${route} overflows ${theme} ${width}`);
         if(width===390 && route==='network/lan' && theme==='dark')await page.screenshot({path:'/tmp/zte-routing-lan-phone-dark.png',fullPage:true});
+        if(width===390 && route==='network/ttl' && theme==='light')await page.screenshot({path:'/tmp/zte-routing-ttl-phone-light.png',fullPage:true});
         if(width===1440 && route==='network/ports' && theme==='light')await page.screenshot({path:'/tmp/zte-routing-ports-desktop-light.png',fullPage:true});
       }
     }
@@ -108,8 +113,8 @@ const {chromium}=require('playwright');
     await go('network/lan');failLAN=true;push();await page.waitForFunction(()=>document.querySelector('#lan-overview .reading-caption').textContent.includes('unavailable'));assert.match(await page.locator('#lan-overview').textContent(),/192.168.5.1/);failLAN=false;
     await go('network/ports');for(const stream of streams)stream.destroy();streams.clear();await page.waitForFunction(()=>!OpenU60Console.connected && document.querySelector('#port-rules fieldset').disabled);await page.waitForFunction(()=>OpenU60Console.connected);assert.ok(await page.locator('#port-rules .rule-card').count()>0);
     failQoS=true;const unsupported=await context.newPage();await unsupported.goto(`http://127.0.0.1:${server.address().port}/#network/qos`);await unsupported.waitForFunction(()=>document.querySelector('#qos-config .action-status').textContent.includes('Settings unavailable'));assert.equal(await unsupported.locator('#qos-config fieldset').evaluate(node=>node.disabled),true);await unsupported.close();failQoS=false;push();
-    authExpired=true;await go('network/qos');await page.locator('#qos-config').getByRole('button',{name:'Read current settings',exact:true}).click();await page.waitForFunction(()=>document.querySelector('#login-dialog').open);assert.equal(await page.locator('#port-rule-name').inputValue(),'');assert.equal(await page.locator('.routing-reconnect a').getAttribute('href'),null);
+    authExpired=true;await page.evaluate(()=>OpenU60Navigation.go('network/qos'));await page.waitForFunction(()=>document.documentElement.dataset.route==='network/qos');await page.waitForFunction(()=>document.querySelector('#login-dialog').open);assert.equal(await page.locator('#port-rule-name').inputValue(),'');assert.equal(await page.locator('.routing-reconnect a').getAttribute('href'),null);
     assert.deepEqual(errors,[]);
-    console.log('Passed: all seven router controls, exact write contracts, validations, confirmation cancellation, LAN reconnect links, dirty/live conflicts, stale/guarded deletes, unconfirmed writes, no retry/polling, retained failures, auth clearing, digit motion and 32 responsive/theme views.');
+    console.log('Passed: router controls including packet TTL, exact write contracts, validations, confirmation cancellation, LAN reconnect links, dirty/live conflicts, stale/guarded deletes, unconfirmed writes, no retry/polling, retained failures, auth clearing, digit motion and responsive/theme views.');
   }finally{await browser.close();clearInterval(heartbeat);for(const stream of streams)stream.destroy();server.closeAllConnections();server.close();}
 })().catch(error=>{console.error(error);process.exitCode=1;});

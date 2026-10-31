@@ -7,6 +7,9 @@ use crate::handlers::AppState;
 use crate::system::try_spawn_named;
 use crate::ubus;
 
+const HOSTAPD_CLIENT_DIR: &str = "/data/vendor/wifi";
+const HOSTAPD_CONTROL_DIR: &str = "/data/vendor/wifi/hostapd";
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -118,6 +121,112 @@ fn station_count(iface: &str) -> u64 {
                 .count() as u64
         })
         .unwrap_or(0)
+}
+
+fn interface_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() < 16
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte))
+}
+
+fn mac_address(value: &str) -> bool {
+    let mut parts = value.split(':');
+    (0..6).all(|_| {
+        parts.next().is_some_and(|part| {
+            part.len() == 2 && part.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+    }) && parts.next().is_none()
+}
+
+fn access_point_interfaces(text: &str) -> Vec<String> {
+    let mut interfaces = Vec::new();
+    let mut current = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(value) = line.strip_prefix("Interface ") {
+            current = interface_name(value).then(|| value.to_string());
+        } else if line == "type AP" {
+            if let Some(interface) = current.take() {
+                interfaces.push(interface);
+            }
+        }
+    }
+    interfaces
+}
+
+fn station_addresses(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|line| {
+            line.trim()
+                .strip_prefix("Station ")
+                .and_then(|header| header.split_whitespace().next())
+                .filter(|address| mac_address(address))
+                .map(str::to_ascii_lowercase)
+        })
+        .collect()
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct ClientReconnect {
+    pub disconnected: usize,
+    pub failed: usize,
+}
+
+/// Ask each associated station to authenticate again without stopping an AP,
+/// changing its BSSID or hiding its SSID. Saved clients can immediately find
+/// the continuously advertised network and receive a fresh link event. That
+/// encourages network-scoped resolver state to refresh, but client-owned DNS
+/// and application caches still follow each operating system's policy.
+pub(crate) fn reconnect_clients_for_dns_refresh() -> Result<ClientReconnect, String> {
+    let devices = Command::new("iw")
+        .arg("dev")
+        .output()
+        .map_err(|error| format!("list Wi-Fi interfaces: {error}"))?;
+    if !devices.status.success() {
+        return Err("list Wi-Fi interfaces: iw failed".into());
+    }
+
+    let mut result = ClientReconnect::default();
+    for interface in access_point_interfaces(&String::from_utf8_lossy(&devices.stdout)) {
+        let stations = match Command::new("iw")
+            .args(["dev", &interface, "station", "dump"])
+            .output()
+        {
+            Ok(output) if output.status.success() => output,
+            _ => {
+                result.failed += 1;
+                continue;
+            }
+        };
+        for address in station_addresses(&String::from_utf8_lossy(&stations.stdout)) {
+            let deauthenticated = Command::new("hostapd_cli")
+                .args([
+                    "-i",
+                    &interface,
+                    "-s",
+                    HOSTAPD_CLIENT_DIR,
+                    "-p",
+                    HOSTAPD_CONTROL_DIR,
+                    "deauthenticate",
+                    &address,
+                ])
+                .output()
+                .is_ok_and(|output| {
+                    output.status.success()
+                        && String::from_utf8_lossy(&output.stdout)
+                            .lines()
+                            .any(|line| line.trim() == "OK")
+                });
+            if deauthenticated {
+                result.disconnected += 1;
+            } else {
+                result.failed += 1;
+            }
+        }
+    }
+    Ok(result)
 }
 
 fn sanitize_uci_value(v: &str) -> String {
@@ -450,7 +559,7 @@ pub fn guest_set(_state: &AppState, body: &[u8]) -> (u16, Value) {
 
 #[cfg(test)]
 mod wireless_tests {
-    use super::Wireless;
+    use super::{access_point_interfaces, station_addresses, Wireless};
 
     const SHOW: &str = "wireless.wifi0=wifi-device\nwireless.wifi0.disabled='0'\nwireless.main_2g.ssid='U60'\nwireless.zte_mbb=zte_mbb\nwireless.zte_mbb.wifi_onoff='1'\nwireless.zte_mbb.wifi6_switch='0'\n";
 
@@ -478,5 +587,17 @@ mod wireless_tests {
         assert!(w.0.is_empty());
         assert!(!w.0.contains_key("wireless.zte_mbb.wifi_onoff"));
         assert_eq!(w.get("main_2g.ssid"), "");
+    }
+
+    #[test]
+    fn station_refresh_discovers_only_access_points_and_valid_addresses() {
+        let devices = "phy#50\n\tInterface wlan2\n\t\ttype AP\n\tInterface wlan-client\n\t\ttype managed\n\tInterface bad/name\n\t\ttype AP\n\tInterface wlan0\n\t\ttype AP\n";
+        assert_eq!(access_point_interfaces(devices), ["wlan2", "wlan0"]);
+
+        let stations = "Station 8E:F9:76:66:C7:7D (on wlan2)\n\tsignal: -42 dBm\nStation not-a-mac (on wlan2)\nStation ba:4a:3a:9f:aa:ff (on wlan2)\n";
+        assert_eq!(
+            station_addresses(stations),
+            ["8e:f9:76:66:c7:7d", "ba:4a:3a:9f:aa:ff"]
+        );
     }
 }

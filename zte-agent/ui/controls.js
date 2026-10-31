@@ -347,9 +347,20 @@
   commandForm({route:'settings/device',id:'device-reboot',title:'Restart router',description:'Restart the device. Connected clients will temporarily lose access.',endpoint:'/api/device/reboot',label:'Restart router',warning:'Restart the router now? Internet, Wi-Fi and this console will disconnect while it starts up.',danger:true,accepted:'Restart request accepted. Wait for the device to return; the live stream will reconnect automatically.'});
   commandForm({route:'settings/device',id:'device-reset',title:'Factory reset',description:'Erase router settings and restore factory defaults. You will need to set up the router again.',endpoint:'/api/device/factory-reset',label:'Erase and reset',warning:'This permanently erases router configuration, including network settings and Wi-Fi credentials. The console will disconnect. Type RESET to confirm.',danger:true,typed:true,accepted:'Factory reset requested. Reconnect using the factory network settings after the device restarts.'});
 
-  function loadRoute() { if (consoleAPI.locked || !consoleAPI.connected) return; for (const view of views) if (view.route === route() && !view.loaded) view.load(); }
-  window.addEventListener('dashboard:navigate',()=>{ loadRoute(); });
-  window.addEventListener('dashboard:readings',event=>{ loadRoute(); for (const view of views) view.sync?.(event.detail.readings); updateSelection(); });
+  function loadRoute(refresh = false) {
+    if (consoleAPI.locked || !consoleAPI.connected) return;
+    for (const view of views) {
+      if (view.route !== route()) continue;
+      if (!view.loaded) view.load();
+      else if (refresh && view.refresh) view.refresh();
+      else if (refresh && !view.dirty) view.load();
+    }
+  }
+  // A route activation is an explicit request to see current router state.
+  // Dirty drafts stay untouched unless that view provides a safe refresh which
+  // updates read-only data while preserving its form fields.
+  window.addEventListener('dashboard:navigate',()=>{ loadRoute(true); });
+  window.addEventListener('dashboard:readings',event=>{ loadRoute(event.detail.snapshot===true); for (const view of views) view.sync?.(event.detail.readings); updateSelection(); });
   window.addEventListener('dashboard:locked',()=>{ session++; finishConfirmation(false); selected.clear(); for (const view of views) view.clear(); smsFeedback.textContent = ''; counter.textContent = '0 characters'; updateSelection(); });
   window.addEventListener('beforeunload',event=>{ if (views.some(view=>view.dirty)) { event.preventDefault(); event.returnValue = ''; } });
   globalThis.OpenU60UI = {el,button,panel,status,say,json,request,confirm,mutate,makeForm,field,choices,onoff,

@@ -69,7 +69,7 @@ const path = require('node:path');
     const summary = page.locator(`.nav-group[data-group="${group}"] > summary`);
     if (await page.evaluate(() => innerWidth < 768)) {
       await summary.click();
-      await page.locator(`#section-tabs a[href="#${group}/${child}"]`).click();
+      await page.locator('#section-page-picker').selectOption(`${group}/${child}`);
     } else {
       const open = await page.locator(`.nav-group[data-group="${group}"]`).getAttribute('open');
       if (open === null) await summary.click();

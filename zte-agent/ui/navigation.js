@@ -16,11 +16,14 @@
       {id:'signal',label:'Signal & Cells',title:'Signal & Cells',description:'Every reported LTE and NR carrier, with clear SA and NSA status.'},
       {id:'wifi',label:'Wi-Fi',title:'Wi-Fi networks',description:'Your local wireless networks and radio status.'},
       {id:'clients',label:'Connected Devices',title:'Connected devices',description:'Your devices, live traffic, observed peaks and reported speed limits.'},
+      {id:'dns',label:'DNS & Privacy',title:'DNS & privacy',description:'Choose how names are resolved, test encrypted DNS and recover safely from bad settings.'},
+      {id:'dns-cache',label:'Live DNS Cache',title:'Live DNS cache',description:'Watch answers enter the router cache, count down and disappear when they expire.'},
       {id:'lan',label:'LAN & DHCP',title:'LAN & DHCP',description:'The router’s local address and the addresses it assigns to your devices.'},
       {id:'firewall',label:'Firewall & DMZ',title:'Firewall & DMZ',description:'Control inbound protection, address translation and automatic port access.'},
       {id:'ports',label:'Port forwarding',title:'Port forwarding',description:'Direct specific incoming connections to a device on your local network.'},
       {id:'qos',label:'Quality of service',title:'Quality of service',description:'Manage the router’s built-in traffic prioritization.'},
       {id:'mobile',label:'Mobile Network',title:'Mobile network',description:'The cellular data connection and modem radio state.'},
+      {id:'ttl',label:'Packet TTL',title:'Packet TTL',description:'Adjust outbound IPv4 TTL and IPv6 hop limit on the cellular software path.'},
       {id:'esim',label:'eSIM management',title:'eSIM management',description:'Profiles, activation codes and connection status for the eSIM card in your router.'},
       {id:'operators',label:'Network operators',title:'Network operators',description:'Find available mobile networks and choose automatic or manual registration.'},
       {id:'apn',label:'APN profiles',title:'APN profiles',description:'Manage the access-point profiles used for mobile data.'},
@@ -53,17 +56,70 @@
   const aliases = {overview:'dashboard/overview',cellular:'network/signal',wireless:'network/wifi',devices:'network/clients',system:'tools/device'};
   const remembered = new Map(), positions = new Map();
   let current;
+  const root = document.documentElement;
   const primary = document.querySelector('#primary-navigation');
+  const sidebarToggle = document.querySelector('#sidebar-toggle');
   const mobileHost = document.querySelector('#mobile-navigation-host');
   const navigationSlot = document.createComment('Desktop navigation');
   primary.before(navigationSlot);
   const mobileLayout = matchMedia('(max-width:767px), (max-width:1023px) and (max-height:500px) and (hover:none) and (pointer:coarse)');
+  const desktopLayout = matchMedia('(min-width:768px)');
+  const reducedMotion = matchMedia('(prefers-reduced-motion:reduce)');
+  const navigationPreference = 'openu60.navigation.collapsed';
+  const groupAnimations = new WeakMap();
+  let navigationCollapsed = false, navigationMotionTimer;
   let viewportFrame;
+  try { navigationCollapsed = localStorage.getItem(navigationPreference) === 'true'; } catch { /* Private browsing can block storage. */ }
+  function setNavigationCollapsed(collapsed,{remember=true,animate=true}={}) {
+    navigationCollapsed = !!collapsed;
+    clearTimeout(navigationMotionTimer);
+    if (animate && desktopLayout.matches && !reducedMotion.matches) {
+      root.dataset.navigationMotion = 'true';
+      navigationMotionTimer = setTimeout(()=>delete root.dataset.navigationMotion,320);
+    } else delete root.dataset.navigationMotion;
+    root.dataset.navigation = navigationCollapsed ? 'collapsed' : 'expanded';
+    const action = navigationCollapsed ? 'Expand navigation' : 'Collapse navigation';
+    sidebarToggle.setAttribute('aria-expanded',String(!navigationCollapsed));
+    sidebarToggle.setAttribute('aria-label',action);
+    sidebarToggle.title = action;
+    if (remember) try { localStorage.setItem(navigationPreference,String(navigationCollapsed)); } catch { /* Keep the choice for this tab. */ }
+  }
+  function stopGroupAnimation(details) {
+    const running = groupAnimations.get(details);
+    if (!running) return;
+    running.animation.cancel(); groupAnimations.delete(details);
+    const children = details.querySelector('.nav-children');
+    children.style.removeProperty('height'); children.style.removeProperty('opacity'); children.style.removeProperty('overflow');
+  }
+  function animateGroup(details,targetOpen) {
+    const children = details.querySelector('.nav-children');
+    if (reducedMotion.matches) { stopGroupAnimation(details); details.open = targetOpen; return; }
+    const running = groupAnimations.get(details);
+    const startHeight = details.open ? children.getBoundingClientRect().height : 0;
+    running?.animation.cancel();
+    if (targetOpen) details.open = true;
+    const endHeight = targetOpen ? children.scrollHeight : 0;
+    children.style.overflow = 'hidden';
+    const animation = children.animate([
+      {height:`${startHeight}px`,opacity:targetOpen ? 0 : 1,transform:targetOpen ? 'translateY(-5px)' : 'translateY(0)'},
+      {height:`${endHeight}px`,opacity:targetOpen ? 1 : 0,transform:targetOpen ? 'translateY(0)' : 'translateY(-5px)'}
+    ],{duration:targetOpen ? 230 : 180,easing:'cubic-bezier(.22,.8,.24,1)'});
+    groupAnimations.set(details,{animation,targetOpen});
+    animation.addEventListener('finish',()=>{
+      if (groupAnimations.get(details)?.animation !== animation) return;
+      if (!targetOpen) details.open = false;
+      groupAnimations.delete(details);
+      children.style.removeProperty('height'); children.style.removeProperty('opacity'); children.style.removeProperty('overflow');
+    },{once:true});
+  }
+  setNavigationCollapsed(navigationCollapsed,{remember:false,animate:false});
+  sidebarToggle.addEventListener('click',()=>setNavigationCollapsed(!navigationCollapsed));
   for (const group of groups) {
     const details = document.createElement('details'); details.className = 'nav-group'; details.dataset.group = group.id;
     const summary = document.createElement('summary');
     // Icons are static application assets; page and modem values are never parsed as markup.
     summary.innerHTML = `<span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24">${icons[group.id]}</svg></span><span class="nav-text">${group.label}</span><span class="nav-chevron" aria-hidden="true">›</span>`;
+    summary.setAttribute('aria-label',group.label); summary.title = group.label;
     const children = document.createElement('div'); children.className = 'nav-children';
     for (const page of group.pages) {
       const link = document.createElement('a'); link.href = `#${group.id}/${page.id}`; link.textContent = page.label; link.dataset.route = `${group.id}/${page.id}`;
@@ -72,6 +128,12 @@
     summary.addEventListener('click', event => {
       if (mobileLayout.matches) {
         event.preventDefault(); go(remembered.get(group.id) || `${group.id}/${group.pages[0].id}`);
+      } else if (navigationCollapsed) {
+        event.preventDefault(); go(remembered.get(group.id) || `${group.id}/${group.pages[0].id}`);
+      } else {
+        event.preventDefault();
+        const running = groupAnimations.get(details);
+        animateGroup(details,running ? !running.targetOpen : !details.open);
       }
     });
     details.append(summary,children); primary.append(details);
@@ -101,7 +163,7 @@
       const active = details.dataset.group === current.group.id;
       details.classList.toggle('active',active);
       const summary = details.querySelector('summary');
-      if (active) { details.open = true; summary.setAttribute('aria-current','true'); }
+      if (active) { stopGroupAnimation(details); details.open = true; summary.setAttribute('aria-current','true'); }
       else summary.removeAttribute('aria-current');
       for (const link of details.querySelectorAll('a')) {
         const selected = link.dataset.route === current.key;
@@ -110,12 +172,24 @@
       }
     }
     const subtabs = document.querySelector('#section-tabs'); subtabs.replaceChildren();
+    const picker = document.createElement('label'); picker.className = 'section-tabs-picker';
+    const pickerLabel = document.createElement('span'); pickerLabel.className = 'section-tabs-picker-label';
+    pickerLabel.textContent = `${current.group.label} pages`;
+    const pickerControl = document.createElement('span'); pickerControl.className = 'section-tabs-picker-control';
+    const select = document.createElement('select'); select.id = 'section-page-picker';
+    select.setAttribute('aria-label',`${current.group.label} pages`);
+    const links = document.createElement('div'); links.className = 'section-tab-links';
     for (const page of current.group.pages) {
+      const route = `${current.group.id}/${page.id}`;
+      const option = document.createElement('option'); option.value = route; option.textContent = page.label;
+      option.selected = page.id === current.page.id; select.append(option);
       const link = document.createElement('a'); link.href = `#${current.group.id}/${page.id}`;
       link.textContent = page.label;
       if (page.id === current.page.id) link.setAttribute('aria-current','page');
-      subtabs.append(link);
+      links.append(link);
     }
+    select.addEventListener('change',() => go(select.value));
+    pickerControl.append(select); picker.append(pickerLabel,pickerControl); subtabs.append(picker,links);
     for (const panel of document.querySelectorAll('[data-views]')) {
       panel.dataset.viewHidden = String(!panel.dataset.views.split(' ').includes(current.key));
     }
@@ -127,7 +201,7 @@
     revealCurrentPage();
   }
   function revealCurrentPage() {
-    const tabs = document.querySelector('#section-tabs'), selected = tabs.querySelector('[aria-current]');
+    const tabs = document.querySelector('.section-tab-links'), selected = tabs?.querySelector('[aria-current]');
     if (!selected || !tabs.clientWidth) return;
     const left = selected.getBoundingClientRect().left - tabs.getBoundingClientRect().left + tabs.scrollLeft;
     if (left < tabs.scrollLeft) tabs.scrollLeft = Math.max(0,left - 12);
@@ -183,6 +257,7 @@
     OpenU60Motion.changePage(() => apply(),{animate:resolve(location.hash.slice(1)).key !== current.key});
   });
   mobileLayout.addEventListener('change',placeNavigation);
+  desktopLayout.addEventListener('change',()=>{ delete root.dataset.navigationMotion; placeNavigation(); });
   window.addEventListener('resize',() => { placeNavigation(); scheduleViewport(); },{passive:true});
   window.addEventListener('pageshow',placeNavigation);
   window.visualViewport?.addEventListener('resize',scheduleViewport,{passive:true});
