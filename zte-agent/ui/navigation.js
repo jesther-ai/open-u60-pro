@@ -20,6 +20,7 @@
       {id:'firewall',label:'Firewall & DMZ',title:'Firewall & DMZ',description:'Control inbound protection, address translation and automatic port access.'},
       {id:'ports',label:'Port forwarding',title:'Port forwarding',description:'Direct specific incoming connections to a device on your local network.'},
       {id:'qos',label:'Quality of service',title:'Quality of service',description:'Manage the router’s built-in traffic prioritization.'},
+      {id:'ttl',label:'Packet TTL',title:'Packet TTL',description:'Adjust outbound IPv4 TTL and IPv6 hop limit on the cellular software path.'},
       {id:'mobile',label:'Mobile Network',title:'Mobile network',description:'The cellular data connection and modem radio state.'},
       {id:'esim',label:'eSIM management',title:'eSIM management',description:'Profiles, activation codes and connection status for the eSIM card in your router.'},
       {id:'operators',label:'Network operators',title:'Network operators',description:'Find available mobile networks and choose automatic or manual registration.'},

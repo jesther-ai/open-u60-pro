@@ -43,6 +43,7 @@ mod system;
 mod tailscale;
 mod telephony;
 mod tls;
+mod ttl;
 mod ubus;
 mod usb;
 // Retired renderer fixtures; production serves only the responsive console.
@@ -114,6 +115,7 @@ fn main() {
         .collect();
     let oos_service_rx = event_bus.subscribe("zwrt_servicestatus");
     let connwd_wan_rx = event_bus.subscribe("router_event_wan_connect_status");
+    let ttl_wan_rx = event_bus.subscribe("router_event_wan_connect_status");
     let identity_events = sim_identity::FIRMWARE_EVENTS
         .iter()
         .map(|&name| (name, event_bus.subscribe(name)))
@@ -136,6 +138,7 @@ fn main() {
     state.sms_forward.start(sms_rx, service_rx, wan_status_rx);
     state.tailscale.auto_start();
     state.tailscale.start_wan_watch(ts_wan_rx);
+    state.ttl.start(ttl_wan_rx);
     state.oos_policy.start(
         Box::new(oos_policy::DeviceEffects::new(Arc::clone(&state))),
         busy_check(&state),

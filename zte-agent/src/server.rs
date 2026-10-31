@@ -23,6 +23,7 @@ use crate::sms_forward;
 use crate::speedtest;
 use crate::tailscale;
 use crate::telephony;
+use crate::ttl;
 use crate::usb;
 use crate::wifi;
 
@@ -376,6 +377,8 @@ fn route_inner(method: &Method, path: &str, state: &AppState, body: &[u8]) -> (u
         (&Method::Put, "/api/router/vpn") => router::router_vpn_set(state, body),
         (&Method::Get, "/api/router/qos") => router::router_qos_get(state),
         (&Method::Put, "/api/router/qos") => router::router_qos_set(state, body),
+        (&Method::Get, "/api/router/ttl") => ttl::config_get(&state.ttl),
+        (&Method::Put, "/api/router/ttl") => ttl::config_set(&state.ttl, body),
         (&Method::Get, "/api/router/domain-filter") => router::router_domain_filter_get(state),
         (&Method::Put, "/api/router/domain-filter") => router::router_domain_filter_set(state, body),
         (&Method::Get, "/api/router/apn/mode") => router::router_apn_mode_get(state),
