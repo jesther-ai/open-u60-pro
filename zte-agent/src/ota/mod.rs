@@ -110,7 +110,13 @@ impl OtaManager {
         }
         let mut settings = storage::read_json::<Settings>(&paths.settings).unwrap_or_default();
         settings.automatic_install = false;
-        let persistent = storage::read_json(&paths.state).unwrap_or_default();
+        let mut persistent = storage::read_json(&paths.state).unwrap_or_default();
+        if let Some(message) = reconcile_startup_state(&paths, &mut persistent) {
+            if let Err(error) = storage::write_json(&paths.state, &persistent) {
+                eprintln!("[ota] cannot save recovered update state: {error}");
+            }
+            paths.append_log(message);
+        }
         let key = include_str!(concat!(env!("OUT_DIR"), "/ota-public-key.pem"));
         Arc::new(Self {
             paths,
@@ -586,6 +592,59 @@ impl OtaManager {
     }
 }
 
+fn reconcile_startup_state(
+    paths: &Paths,
+    persistent: &mut PersistentState,
+) -> Option<&'static str> {
+    // A live helper owns state reconciliation while its pending marker exists.
+    // Without that marker, a transient phase survived a process or router
+    // restart and must not leave the console permanently stuck in progress.
+    if paths.pending.exists() {
+        return None;
+    }
+
+    match persistent.phase {
+        Phase::Installing => {
+            let candidate = persistent.staged_slot.as_deref().and_then(Slot::parse);
+            let completed = candidate.is_some() && candidate == paths.active_slot();
+            persistent.phase = Phase::Idle;
+            persistent.staged = None;
+            persistent.staged_slot = None;
+            if completed {
+                persistent.available = None;
+                persistent.last_error = None;
+                Some("reconciled a completed update after restart")
+            } else {
+                persistent.last_error = Some(
+                    "the previous update trial was interrupted; the previous agent was restored"
+                        .into(),
+                );
+                Some("recovered an interrupted update trial at startup")
+            }
+        }
+        Phase::RollingBack => {
+            persistent.phase = Phase::Idle;
+            persistent.staged = None;
+            persistent.staged_slot = None;
+            persistent.last_error = Some(
+                "the previous rollback trial was interrupted; an active agent was restored".into(),
+            );
+            Some("recovered an interrupted rollback trial at startup")
+        }
+        Phase::Checking | Phase::Downloading => {
+            persistent.phase = if persistent.staged.is_some() {
+                Phase::Staged
+            } else {
+                Phase::Idle
+            };
+            persistent.last_error =
+                Some("the previous update operation was interrupted; retry the operation".into());
+            Some("recovered an interrupted update operation at startup")
+        }
+        Phase::Idle | Phase::Staged | Phase::Failed => None,
+    }
+}
+
 fn select_candidate(
     channel: Channel,
     current: &Version,
@@ -1044,6 +1103,105 @@ mod tests {
             .unwrap_err();
 
         assert!(error.contains("503 Service Unavailable"), "{error}");
+    }
+
+    #[test]
+    fn interrupted_trial_clears_staging_after_the_supervisor_restores_previous() {
+        let manager = manager("interrupted-trial");
+        manager.paths.write_active(Slot::B).unwrap();
+        let candidate = release(Channel::Beta, "2.4.0-beta.5");
+        let mut persistent = PersistentState {
+            phase: Phase::Installing,
+            available: Some(candidate.clone()),
+            staged: Some(candidate),
+            staged_slot: Some("a".into()),
+            ..PersistentState::default()
+        };
+
+        let message = reconcile_startup_state(&manager.paths, &mut persistent);
+
+        assert_eq!(
+            message,
+            Some("recovered an interrupted update trial at startup")
+        );
+        assert_eq!(persistent.phase, Phase::Idle);
+        assert!(persistent.available.is_some());
+        assert!(persistent.staged.is_none());
+        assert!(persistent.staged_slot.is_none());
+        assert!(persistent
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("previous agent was restored")));
+    }
+
+    #[test]
+    fn completed_trial_clears_the_installed_candidate_without_an_error() {
+        let manager = manager("completed-trial");
+        manager.paths.write_active(Slot::A).unwrap();
+        let candidate = release(Channel::Beta, "2.4.0-beta.5");
+        let mut persistent = PersistentState {
+            phase: Phase::Installing,
+            available: Some(candidate.clone()),
+            staged: Some(candidate),
+            staged_slot: Some("a".into()),
+            last_error: Some("old error".into()),
+            ..PersistentState::default()
+        };
+
+        let message = reconcile_startup_state(&manager.paths, &mut persistent);
+
+        assert_eq!(message, Some("reconciled a completed update after restart"));
+        assert_eq!(persistent.phase, Phase::Idle);
+        assert!(persistent.available.is_none());
+        assert!(persistent.staged.is_none());
+        assert!(persistent.staged_slot.is_none());
+        assert!(persistent.last_error.is_none());
+    }
+
+    #[test]
+    fn live_trial_is_left_for_the_update_helper_to_reconcile() {
+        let manager = manager("live-trial");
+        manager.paths.write_active(Slot::B).unwrap();
+        manager
+            .paths
+            .write_pending(Slot::A, Slot::B, "2.4.0-beta.5")
+            .unwrap();
+        let candidate = release(Channel::Beta, "2.4.0-beta.5");
+        let mut persistent = PersistentState {
+            phase: Phase::Installing,
+            available: Some(candidate.clone()),
+            staged: Some(candidate),
+            staged_slot: Some("a".into()),
+            ..PersistentState::default()
+        };
+
+        assert!(reconcile_startup_state(&manager.paths, &mut persistent).is_none());
+        assert_eq!(persistent.phase, Phase::Installing);
+        assert!(persistent.staged.is_some());
+        assert_eq!(persistent.staged_slot.as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn interrupted_download_returns_to_an_actionable_idle_state() {
+        let manager = manager("interrupted-download");
+        let mut persistent = PersistentState {
+            phase: Phase::Downloading,
+            available: Some(release(Channel::Beta, "2.4.0-beta.5")),
+            ..PersistentState::default()
+        };
+
+        let message = reconcile_startup_state(&manager.paths, &mut persistent);
+
+        assert_eq!(
+            message,
+            Some("recovered an interrupted update operation at startup")
+        );
+        assert_eq!(persistent.phase, Phase::Idle);
+        assert!(persistent.available.is_some());
+        assert!(persistent
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("retry")));
     }
 
     #[test]
