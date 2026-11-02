@@ -23,6 +23,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Tag releases verify their commit against the permanent lane heads.
+          fetch-depth: 0
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -44,10 +47,20 @@ jobs:
           test "v$VERSION" = "$GITHUB_REF_NAME"
           if [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             CHANNEL=stable
+            RELEASE_BRANCH=main
           elif [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+-beta\.[0-9]+$ ]]; then
             CHANNEL=beta
+            RELEASE_BRANCH=beta
           else
             echo 'Tags must be vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-beta.N' >&2
+            exit 1
+          fi
+          git fetch --no-tags origin \
+            +refs/heads/main:refs/remotes/origin/main \
+            +refs/heads/beta:refs/remotes/origin/beta
+          RELEASE_HEAD="$(git rev-parse "refs/remotes/origin/$RELEASE_BRANCH")"
+          if [ "$GITHUB_SHA" != "$RELEASE_HEAD" ]; then
+            echo "$GITHUB_REF_NAME must point at the current $RELEASE_BRANCH branch head ($RELEASE_HEAD)" >&2
             exit 1
           fi
           printf '%s' "$OTA_SIGNING_KEY_PEM" > ota-private.pem
@@ -57,7 +70,8 @@ jobs:
           openssl ec -pubin -in ota-public.pem -text -noout > ota-key-info.txt
           grep -q 'ASN1 OID: prime256v1' ota-key-info.txt
           rm -f ota-key-info.txt
-          printf 'OTA_VERSION=%s\nOTA_CHANNEL=%s\n' "$VERSION" "$CHANNEL" >> "$GITHUB_ENV"
+          printf 'OTA_VERSION=%s\nOTA_CHANNEL=%s\nOTA_RELEASE_BRANCH=%s\n' \
+            "$VERSION" "$CHANNEL" "$RELEASE_BRANCH" >> "$GITHUB_ENV"
 
       - name: Build zte-agent
         env:
