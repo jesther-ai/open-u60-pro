@@ -196,7 +196,7 @@ pub fn encode((status, body): (u16, Value)) -> Encoded {
 /// STK worker's memory) and call control (one short AT command each, and a
 /// hang-up must not wait behind a Tailscale setup) stay General.
 pub fn lane(method: Method, path: &str) -> Lane {
-    use Method::{Delete, Get, Post};
+    use Method::{Delete, Get, Post, Put};
     let slow = match (method, path) {
         (Get, "/api/network/client-details") => true,
         (Get, "/api/esim/switch")
@@ -205,6 +205,7 @@ pub fn lane(method: Method, path: &str) -> Lane {
         | (Get, "/api/tailscale/status")
         | (Get, "/api/stk/menu" | "/api/stk/session") => false,
         (_, p) if p.starts_with("/api/esim/") || p.starts_with("/api/tailscale/") || p.starts_with("/api/https/") => true,
+        (Put | Post, p) if p.starts_with("/api/vpn/wireguard") => true,
         (_, p) if p.starts_with("/api/ussd/") || p.starts_with("/api/stk/") => true,
         (Post, p) if p.starts_with("/api/sim/") || p.starts_with("/api/cell/") => true,
         (_, p) if p.starts_with("/api/dns/") => true,
@@ -388,6 +389,10 @@ fn route_inner(method: &Method, path: &str, state: &AppState, body: &[u8]) -> (u
         (&Method::Put, "/api/router/qos") => router::router_qos_set(state, body),
         (&Method::Get, "/api/router/ttl") => ttl::config_get(&state.ttl),
         (&Method::Put, "/api/router/ttl") => ttl::config_set(&state.ttl, body),
+        (&Method::Get, "/api/vpn/wireguard") => crate::wireguard::status(&state.wireguard),
+        (&Method::Put, "/api/vpn/wireguard") => crate::wireguard::import(&state.wireguard, body),
+        (&Method::Post, "/api/vpn/wireguard/enable") => crate::wireguard::enable(&state.wireguard),
+        (&Method::Post, "/api/vpn/wireguard/disable") => crate::wireguard::disable(&state.wireguard),
         (&Method::Get, "/api/router/domain-filter") => router::router_domain_filter_get(state),
         (&Method::Put, "/api/router/domain-filter") => router::router_domain_filter_set(state, body),
         (&Method::Get, "/api/router/apn/mode") => router::router_apn_mode_get(state),

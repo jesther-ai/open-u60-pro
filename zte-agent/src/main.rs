@@ -57,6 +57,7 @@ mod calendar;
 mod qr_decode;
 mod wifi;
 mod wifi_watchdog;
+mod wireguard;
 
 use std::sync::Arc;
 
@@ -80,6 +81,11 @@ fn main() {
         std::process::exit(web::qr_decode::cli(&args[2..]));
         #[cfg(not(test))]
         std::process::exit(qr_decode::cli(&args[2..]));
+    }
+    // `zte-agent wireguard-smoke` verifies native netlink support without
+    // starting the HTTP service or installing routes.
+    if args.get(1).map(String::as_str) == Some("wireguard-smoke") {
+        std::process::exit(wireguard::cli_smoke());
     }
 
     let bind = std::env::var("ZTE_AGENT_BIND").unwrap_or_else(|_| DEFAULT_BIND.to_string());
@@ -118,6 +124,7 @@ fn main() {
     let oos_service_rx = event_bus.subscribe("zwrt_servicestatus");
     let connwd_wan_rx = event_bus.subscribe("router_event_wan_connect_status");
     let ttl_wan_rx = event_bus.subscribe("router_event_wan_connect_status");
+    let wireguard_wan_rx = event_bus.subscribe("router_event_wan_connect_status");
     let dns_network_rx = dns_control::subscribe_network_changes(&event_bus);
     let identity_events = sim_identity::FIRMWARE_EVENTS
         .iter()
@@ -146,6 +153,7 @@ fn main() {
     state.tailscale.auto_start();
     state.tailscale.start_wan_watch(ts_wan_rx);
     state.ttl.start(ttl_wan_rx);
+    state.wireguard.start(wireguard_wan_rx);
     state.oos_policy.start(
         Box::new(oos_policy::DeviceEffects::new(Arc::clone(&state))),
         busy_check(&state),
