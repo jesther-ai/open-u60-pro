@@ -60,6 +60,7 @@ const TOPICS: &[&str] = &[
     "https",
     "dns",
 ];
+const ESIM_TOPIC: usize = 8;
 const DNS_TOPIC: usize = TOPICS.len() - 1;
 const EXTRA_READINGS: &[(&str, u64, usize)] = &[
     ("operators", 2, 0),
@@ -75,7 +76,7 @@ const EXTRA_READINGS: &[(&str, u64, usize)] = &[
     ("port_rules", 10, 6),
     ("qos_config", 10, 6),
     ("client_details", 2, 7),
-    ("esim_status", 2, 8),
+    ("esim_status", 0, ESIM_TOPIC),
     ("battery_details", 5, 9),
     ("https_status", 5, 10),
 ];
@@ -258,7 +259,7 @@ impl Dashboard {
 
     fn start_extra_collectors(self: &Arc<Self>, app: Arc<AppState>) {
         for (index, topic_name) in TOPICS.iter().enumerate() {
-            if index == DNS_TOPIC {
+            if index == ESIM_TOPIC || index == DNS_TOPIC {
                 continue;
             }
             let feed = Arc::clone(self);
@@ -310,6 +311,43 @@ impl Dashboard {
                 }
             });
         }
+    }
+
+    /// eSIM progress is a composite of watched switch/download state and the
+    /// saved inventory. Publish it only after an eSIM touch, an API mutation,
+    /// or a fresh subscription; never poll the card or its API from the UI.
+    fn start_esim_collector(self: &Arc<Self>, app: Arc<AppState>) {
+        let changes = crate::events::subscribe_touches(&[
+            crate::events::Topic::EsimSwitch,
+            crate::events::Topic::EsimDownload,
+        ]);
+        let feed = Arc::clone(self);
+        crate::system::spawn_named("dashboard-esim", move || {
+            let mut pending = true;
+            let mut version = 0;
+            loop {
+                let (active, refresh, missing) = {
+                    let guard = feed.state.lock().unwrap_or_else(|p| p.into_inner());
+                    (
+                        guard.extra_clients[ESIM_TOPIC] > 0,
+                        guard.refresh_version,
+                        !guard.readings.contains_key("esim_status"),
+                    )
+                };
+                if active && (pending || missing || refresh != version) {
+                    let mut updates = Readings::new();
+                    updates.insert("esim_status".into(), crate::esim::dashboard_status(&app));
+                    feed.publish(updates);
+                    pending = false;
+                }
+                version = refresh;
+                match changes.recv_timeout(Duration::from_secs(1)) {
+                    Ok(()) => pending = true,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                }
+            }
+        });
     }
 
     /// The cache is already in memory, so this collector never makes an HTTP
@@ -365,6 +403,7 @@ impl Dashboard {
                 }
             }),
         );
+        self.start_esim_collector(Arc::clone(&state));
         self.start_extra_collectors(Arc::clone(&state));
         self.start_dns_collector(Arc::clone(&state));
         let feed = Arc::clone(self);

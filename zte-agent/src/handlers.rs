@@ -29,6 +29,7 @@ pub struct AppState {
     pub sms_forward: Arc<SmsForwarder>,
     pub tailscale: Arc<crate::tailscale::TailscaleManager>,
     pub ttl: Arc<crate::ttl::TtlManager>,
+    pub wireguard: Arc<crate::wireguard::WireGuardManager>,
     /// Single-flight TTL cache in front of the `ubus` CLI (see cache.rs).
     pub cache: Arc<UbusCache>,
     pub oos_policy: Arc<crate::oos_policy::OosPolicy>,
@@ -68,6 +69,7 @@ impl AppState {
             sms_forward: Arc::new(SmsForwarder::new()),
             tailscale: Arc::new(crate::tailscale::TailscaleManager::new()),
             ttl: Arc::new(crate::ttl::TtlManager::new()),
+            wireguard: Arc::new(crate::wireguard::WireGuardManager::new()),
             cache: Arc::new(UbusCache::new()),
             oos_policy: Arc::new(crate::oos_policy::OosPolicy::new()),
             conn_watchdog: Arc::new(crate::conn_watchdog::ConnWatchdog::new()),

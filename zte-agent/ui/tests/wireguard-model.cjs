@@ -1,0 +1,10 @@
+'use strict';
+const assert=require('node:assert/strict'),W=require('../wireguard-model.js');
+const source='[Interface]\nPrivateKey = secret\nAddress = 10.7.0.2/32\nDNS = 10.7.0.1\nMTU = 1380\n\n[Peer]\nPublicKey = public\nEndpoint = vpn.example.com:51820\nAllowedIPs = 10.7.0.0/24, 10.8.0.0/24\n';
+const info=W.inspect(source);
+assert.equal(info.hasPrivateKey,true);
+assert.deepEqual(info.addresses,['10.7.0.2/32']);
+assert.deepEqual(info.peers[0],{endpoint:'vpn.example.com:51820',allowed:['10.7.0.0/24','10.8.0.0/24']});
+assert.equal(info.mtu,1380);
+assert.equal(W.bytes(1536),'1.50 KB');
+assert.equal(W.handshake(970,1000),'30s ago');

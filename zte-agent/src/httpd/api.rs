@@ -762,6 +762,9 @@ mod tests {
             (Post, "/api/speedtest/start"),
             (Post, "/api/doh/enable"),
             (Post, "/api/doh/disable"),
+            (Put, "/api/vpn/wireguard"),
+            (Post, "/api/vpn/wireguard/enable"),
+            (Post, "/api/vpn/wireguard/disable"),
         ];
         for (m, p) in slow {
             assert_eq!(server::lane(m, p), Lane::Slow, "{m:?} {p}");
@@ -790,6 +793,7 @@ mod tests {
             (Get, "/api/speedtest/progress"),
             (Post, "/api/speedtest/stop"),
             (Get, "/api/doh/status"),
+            (Get, "/api/vpn/wireguard"),
             (Get, "/api/device"),
             (Post, "/api/auth/login"),
         ];

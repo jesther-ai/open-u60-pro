@@ -7,6 +7,8 @@ const path = require('node:path');
 (async () => {
   let mode = 'live', requiresAuth = false, delayedResponse;
   const streams = new Set(), requests = [];
+  const esimIds = ['08963000000000000001','08963000000000000002'];
+  const esimInventory = {profiles:[{iccid:esimIds[0],state:'enabled',nickname:'Everyday',provider:'SMART',name:'Primary',class:'operational',switch_warnings:[]},{iccid:esimIds[1],state:'disabled',nickname:null,provider:'GOMO',name:'Travel data',class:'operational',switch_warnings:[]}],generation:1,observed_at:100,observed_seq:1,agent_instance:1000,updating:false,stale:false};
   const fixtures = {
     device: {hostname:'OpenU60',uptime_secs:183960,kernel:'5.4.260',load_avg:[0.12,0.18,0.15]},
     wan: {up:true,'ipv4-address':[{address:'10.154.28.6'}]},
@@ -21,14 +23,16 @@ const path = require('node:path');
     speed: {rx_speed:15400000,tx_speed:1640000,rx_bytes:8400000000,tx_bytes:1200000000},
     battery: {capacity:86,status:'Charging',temperature:327},
     wifi: {wifi_onoff:'1',radio2_disabled:'0',radio5_disabled:'0',ssid_2g:'OpenU60',ssid_5g:'OpenU60 · 5G',channel_2g:'6',channel_5g:'149'},
-    clients: {hosts:{'aa:bb:cc:dd:ee:01':{name:'MacBook Pro',ipaddrs:['192.168.0.102']},'aa:bb:cc:dd:ee:02':{name:'<img src=x onerror=alert(1)>',ipaddrs:['192.168.0.104']}},dhcp_leases:[{hostname:'Living room TV',ipaddr:'192.168.0.108',macaddr:'aa:bb:cc:dd:ee:03'}]}
+    clients: {hosts:{'aa:bb:cc:dd:ee:01':{name:'MacBook Pro',ipaddrs:['192.168.0.102']},'aa:bb:cc:dd:ee:02':{name:'<img src=x onerror=alert(1)>',ipaddrs:['192.168.0.104']}},dhcp_leases:[{hostname:'Living room TV',ipaddr:'192.168.0.108',macaddr:'aa:bb:cc:dd:ee:03'}]},
+    esim_status: {agent_instance:1000,inventory_loaded:true,inventory:esimInventory,switch:{state:'idle',generation:0},download:{state:'idle'},receipts:{count:0,pending:[],retrying:false},password_required:false}
   };
   const envelope = names => Object.fromEntries(names.map(name => [name,{ok:true,data:fixtures[name]}]));
   const send = (response,event,readings) => response.write(`event: ${event}\r\ndata: ${JSON.stringify({readings})}\r\n\r\n`);
-  const push = names => { for (const response of streams) send(response,'patch',envelope(names.filter(name => !name.startsWith('sms') || response.includeSms))); };
+  const visible = (response,name) => (!name.startsWith('sms') || response.includeSms) && (name!=='esim_status' || response.includeEsim);
+  const push = names => { for (const response of streams) send(response,'patch',envelope(names.filter(name => visible(response,name)))); };
   const disconnect = () => { for (const response of streams) response.destroy(); };
   const server = http.createServer((request, response) => {
-    if (request.url.startsWith('/api/')) requests.push({url:request.url,authorization:request.headers.authorization});
+    if (request.url.startsWith('/api/')) requests.push({url:request.url,method:request.method,authorization:request.headers.authorization});
     if (request.url.split('?')[0] === '/api/dashboard/events') {
       if (requiresAuth && request.headers.authorization !== 'Bearer test-token') {
         response.writeHead(401,{'Content-Type':'application/json'}); response.end('{"ok":false}'); return;
@@ -37,11 +41,14 @@ const path = require('node:path');
       response.writeHead(200,{'Content-Type':'text/event-stream','Cache-Control':'no-store'});
       response.flushHeaders();
       response.includeSms = request.url.includes('sms=1');
+      response.includeEsim = request.url.includes('topics=esim');
       streams.add(response); response.on('close', () => streams.delete(response));
       if (mode === 'delayed') { delayedResponse = response; return; }
-      send(response,'snapshot',envelope(Object.keys(fixtures).filter(name => !name.startsWith('sms') || response.includeSms)));
+      send(response,'snapshot',envelope(Object.keys(fixtures).filter(name => visible(response,name))));
       return;
     }
+    if (request.url === '/api/esim/profiles' && request.method === 'GET') { response.setHeader('Content-Type','application/json');response.end(JSON.stringify({ok:true,data:esimInventory}));return; }
+    if (request.url === '/api/esim/enable' && request.method === 'POST') { let body='';request.on('data',chunk=>body+=chunk);request.on('end',()=>{const target=JSON.parse(body).iccid;response.writeHead(202,{'Content-Type':'application/json'});response.end(JSON.stringify({ok:true,data:{generation:2,enabled_iccid:target}}));});return; }
     if (request.url === '/api/auth/login') {
       let body = ''; request.on('data',chunk => body += chunk);
       request.on('end', () => {
@@ -85,6 +92,13 @@ const path = require('node:path');
   const connectionStatus = await page.locator('#connection-title').evaluate(node=>parseFloat(getComputedStyle(node).fontSize));
   const operatorSize = await page.locator('#operator').evaluate(node=>parseFloat(getComputedStyle(node).fontSize));
   assert.ok(operatorSize > connectionType && connectionType > connectionStatus,'operator, generation and status must have a clear descending type hierarchy');
+  await page.waitForFunction(()=>document.querySelectorAll('#dashboard-esim-profiles .dashboard-esim-profile').length===2);
+  assert.equal(await page.locator('#dashboard-esim-profiles .dashboard-esim-profile[aria-current="true"] strong').textContent(),'SMART');
+  const enableCount=()=>requests.filter(request=>request.url==='/api/esim/enable').length,profileReadCount=()=>requests.filter(request=>request.url==='/api/esim/profiles').length;
+  await page.getByRole('button',{name:/Activate GOMO/}).click();await page.waitForFunction(()=>document.querySelector('.confirm-dialog').open);assert.match(await page.locator('.confirm-copy').textContent(),/Mobile data will disconnect/);await page.locator('.confirm-dialog').getByRole('button',{name:'Cancel',exact:true}).click();assert.equal(enableCount(),0,'dashboard ISP tap is confirmation guarded');
+  await page.getByRole('button',{name:/Activate GOMO/}).click();await page.locator('.confirm-dialog').getByRole('button',{name:'Activate profile',exact:true}).click();await page.waitForFunction(()=>document.querySelector('#dashboard-esim-feedback').textContent.includes('Switch request accepted'));assert.equal(enableCount(),1);
+  fixtures.esim_status.switch={state:'reloading',generation:2,target_iccid:esimIds[1]};esimInventory.updating=true;push(['esim_status']);await page.waitForFunction(()=>document.querySelector('#dashboard-esim-status').textContent.includes('SIM to reload'));
+  const switchReads=profileReadCount();esimInventory.profiles[0].state='disabled';esimInventory.profiles[1].state='enabled';esimInventory.updating=false;esimInventory.generation=2;fixtures.esim_status.switch={state:'connected',generation:2,target_iccid:esimIds[1]};push(['esim_status']);await page.waitForFunction(()=>document.querySelector('#dashboard-esim-profiles .dashboard-esim-profile[aria-current="true"] strong').textContent==='GOMO');await page.waitForTimeout(100);assert.equal(profileReadCount(),switchReads,'dashboard switch completion is pushed over SSE without polling');
   assert.equal(await page.locator('#download').textContent(),'123.20');
   assert.equal(await page.locator('#device-count').textContent(),'3');
   assert.equal(await page.locator('#wan-ip').textContent(),'10.154.28.6');
@@ -231,6 +245,12 @@ const path = require('node:path');
     });
     assert.equal(geometry.overflow, false, `page overflow at ${width}px`);
     assert.ok(geometry.linkSizes.every(size => size.width >= 44 && size.height >= 44), `navigation touch targets at ${width}px`);
+    assert.ok(await contrast('#dashboard-esim-profiles .dashboard-esim-profile[aria-current="true"] strong') >= 4.5,`selected ISP name contrast at ${width}px`);
+    assert.ok(await contrast('#dashboard-esim-profiles .dashboard-esim-profile[aria-current="true"] small') >= 4.5,`selected ISP status contrast at ${width}px`);
+    const profileGeometry=await page.locator('#dashboard-esim-profiles').evaluate(container=>{const parent=container.getBoundingClientRect(),tiles=[...container.children].map(tile=>tile.getBoundingClientRect());return {columns:getComputedStyle(container).gridTemplateColumns.split(' ').length,inside:tiles.every(tile=>tile.left>=parent.left-.5 && tile.right<=parent.right+.5),touch:tiles.every(tile=>tile.height>=44)};});
+    assert.equal(profileGeometry.inside,true,`eSIM profile tiles stay inside their card at ${width}px`);
+    assert.equal(profileGeometry.touch,true,`eSIM profile touch targets at ${width}px`);
+    if(layout==='mobile')assert.equal(profileGeometry.columns,2,`mobile eSIM profile grid at ${width}px`);
     if (layout === 'mobile') {
       assert.equal(geometry.rowLayout, 'grid', 'mobile devices use cards');
       assert.ok(Math.abs(geometry.navBottom - height) <= 1, 'mobile navigation remains at the bottom');
@@ -372,7 +392,7 @@ const path = require('node:path');
   await page.waitForFunction(() => document.querySelector('#login-error').textContent.includes('Incorrect'));
   await page.locator('#password').fill('test-password'); await page.locator('#login-form button[type=submit]').click();
   await live(); assert.equal(await page.locator('#password').inputValue(),'');
-  assert.ok(requests.some(request => request.url === '/api/dashboard/events' && request.authorization === 'Bearer test-token'));
+  assert.ok(requests.some(request => request.url.startsWith('/api/dashboard/events') && request.authorization === 'Bearer test-token'));
   for (const width of [390,820,1440]) {
     await page.setViewportSize({width,height:900});
     const rect = await page.locator('#signout').boundingBox();
@@ -410,8 +430,8 @@ const path = require('node:path');
   await page.waitForFunction(() => document.querySelector('#login-dialog').open);
   assert.equal(await page.locator('#hostname').textContent(),'ZTE U60 Pro');
   assert.equal(await page.locator('#client-list').textContent(),'Device data unavailable.');
-  assert.ok(requests.every(request => ['/api/dashboard/events','/api/auth/login','/api/wifi/status','/api/wifi/guest'].includes(request.url.split('?')[0])),'no polling of individual API readings');
+  assert.ok(requests.every(request => ['/api/dashboard/events','/api/auth/login','/api/wifi/status','/api/wifi/guest','/api/esim/profiles','/api/esim/enable'].includes(request.url.split('?')[0])),'no polling of individual API readings');
   assert.deepEqual(errors,[]);
   await browser.close(); clearInterval(heartbeat); disconnect(); server.close();
-  console.log('Passed: saved Light/Dark/System themes, system appearance changes, themed phone/tablet/desktop and contrast, five primary tabs, expandable sidebars, routed pages and browser back, state preservation, optional live SMS, LTE and NR carrier aggregation, SA/NSA, no-service and LPM states, retained offline statistics, SSE snapshots and dependency patches, split frames, auth headers and expiry, automatic reconnection, tab visibility, no endpoint polling, 11 responsive viewports, search and session lock.');
+  console.log('Passed: dashboard eSIM ISP switching with confirmation and SSE progress, saved Light/Dark/System themes, system appearance changes, themed phone/tablet/desktop and contrast, five primary tabs, expandable sidebars, routed pages and browser back, state preservation, optional live SMS, LTE and NR carrier aggregation, SA/NSA, no-service and LPM states, retained offline statistics, SSE snapshots and dependency patches, split frames, auth headers and expiry, automatic reconnection, tab visibility, no endpoint polling, 11 responsive viewports, search and session lock.');
 })().catch(error => {console.error(error);process.exit(1);});

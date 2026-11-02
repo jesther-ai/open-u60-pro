@@ -18,6 +18,7 @@
       {id:'clients',label:'Connected Devices',title:'Connected devices',description:'Your devices, live traffic, observed peaks and reported speed limits.'},
       {id:'dns',label:'DNS & Privacy',title:'DNS & privacy',description:'Choose how names are resolved, test encrypted DNS and recover safely from bad settings.'},
       {id:'dns-cache',label:'Live DNS Cache',title:'Live DNS cache',description:'Watch answers enter the router cache, count down and disappear when they expire.'},
+      {id:'vpn',label:'WireGuard VPN',title:'WireGuard VPN',description:'Import a split-tunnel profile and inspect native kernel handshakes and traffic.'},
       {id:'lan',label:'LAN & DHCP',title:'LAN & DHCP',description:'The router’s local address and the addresses it assigns to your devices.'},
       {id:'firewall',label:'Firewall & DMZ',title:'Firewall & DMZ',description:'Control inbound protection, address translation and automatic port access.'},
       {id:'ports',label:'Port forwarding',title:'Port forwarding',description:'Direct specific incoming connections to a device on your local network.'},
