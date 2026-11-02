@@ -25,15 +25,23 @@ else
     exit 1
 fi
 
+if [[ "$AGENT_PASSWORD" == *$'\n'* || "$AGENT_PASSWORD" == *$'\r'* ]]; then
+    fail "Agent password cannot contain a line break."
+fi
+
 GATEWAY=192.168.0.1
 AGENT_PORT=9090
 SSH_PORT=2222
 TARGET=aarch64-unknown-linux-musl
 BINARY=target/$TARGET/release/zte-agent
+OTA_ROOT=/data/open-u60/update
+REMOTE_SLOT=$OTA_ROOT/slot-a/zte-agent
 REMOTE_BIN=/data/zte-agent
+SUPERVISOR=/data/local/tmp/zte-agent-supervisor.sh
+SUPERVISOR_LOCAL=scripts/router/zte-agent-supervisor.sh
 STARTUP_SCRIPT=/data/local/tmp/start_zte_agent.sh
 BINARY_CHANGED=false
-DOWNLOAD_URL="https://github.com/jesther-ai/open-u60-pro/releases/latest/download/zte-agent"
+DOWNLOAD_URL="${ZTE_AGENT_DOWNLOAD_URL:-https://github.com/jesther-ai/open-u60-pro/releases/latest/download/zte-agent}"
 
 # ── Binary source menu ──────────────────────────────────────────────
 echo ""
@@ -362,30 +370,40 @@ fi
 # ── Step 4: Push binary ─────────────────────────────────────────────
 info "Checking zte-agent binary..."
 LOCAL_SHA=$(sha256_file "$BINARY")
-REMOTE_SHA=$(rcmd "sha256sum $REMOTE_BIN 2>/dev/null" | awk '{print $1}')
+rcmd "mkdir -p $OTA_ROOT/slot-a $OTA_ROOT/slot-b $OTA_ROOT/last-stable && chmod 700 $OTA_ROOT $OTA_ROOT/slot-a $OTA_ROOT/slot-b $OTA_ROOT/last-stable"
+REMOTE_SHA=$(rcmd "sha256sum $REMOTE_SLOT 2>/dev/null" | awk '{print $1}')
 if [ "$LOCAL_SHA" = "$REMOTE_SHA" ]; then
     ok "Binary unchanged, skipping push."
 else
     info "Stopping running agent before push..."
     rcmd "killall zte-agent 2>/dev/null; sleep 1"
     info "Pushing zte-agent to device..."
-    rpush "$BINARY" "$REMOTE_BIN"
+    rpush "$BINARY" "$REMOTE_SLOT"
     BINARY_CHANGED=true
-    ok "Binary deployed to $REMOTE_BIN."
+    ok "Binary deployed to OTA slot A."
 fi
+
+info "Installing the A/B update supervisor..."
+rpush "$SUPERVISOR_LOCAL" "$SUPERVISOR"
+rcmd "chmod 755 $SUPERVISOR; printf 'a\n' > $OTA_ROOT/active; chmod 600 $OTA_ROOT/active; rm -f $OTA_ROOT/pending $OTA_ROOT/state.json; ln -sfn $REMOTE_SLOT $REMOTE_BIN.next; mv -f $REMOTE_BIN.next $REMOTE_BIN"
+BINARY_CHANGED=true
+ok "OTA bootstrap and rollback supervisor installed."
 
 # ── Step 5: Create startup script ───────────────────────────────────
 # Escape single quotes for safe embedding in sh single-quoted string
 SAFE_PASSWORD=$(printf '%s' "$AGENT_PASSWORD" | sed "s/'/'\\\\''/g")
 
-if rcmd "grep -qF '${SAFE_PASSWORD}' $STARTUP_SCRIPT 2>/dev/null"; then
+if rcmd "grep -qF '${SAFE_PASSWORD}' $STARTUP_SCRIPT 2>/dev/null && grep -qF '$SUPERVISOR' $STARTUP_SCRIPT 2>/dev/null"; then
     ok "Startup script already up to date."
 else
     info "Creating startup script..."
     cat > /tmp/start_zte_agent.sh <<BOOT
 #!/bin/sh
 export ZTE_AGENT_PASSWORD='${SAFE_PASSWORD}'
-nohup /data/zte-agent >/tmp/zte-agent.log 2>&1 &
+export ZTE_OTA_ROOT='$OTA_ROOT'
+export ZTE_OTA_SUPERVISOR='$SUPERVISOR'
+export ZTE_OTA_LEGACY_LINK='$REMOTE_BIN'
+nohup $SUPERVISOR >/tmp/zte-agent.log 2>&1 &
 BOOT
     rpush /tmp/start_zte_agent.sh "$STARTUP_SCRIPT"
     rm /tmp/start_zte_agent.sh

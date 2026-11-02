@@ -69,7 +69,7 @@ A lightweight Rust HTTP server that runs directly on the router (port 9090, on t
 cargo build --release --target aarch64-unknown-linux-musl -p zte-agent
 ```
 
-**183 endpoints across 22 categories:**
+**189 endpoints across 23 categories:**
 
 | Category | # | Capabilities |
 |---|---|---|
@@ -93,6 +93,7 @@ cargo build --release --target aarch64-unknown-linux-musl -p zte-agent
 | Scheduler | 5 | Scheduled/recurring jobs for any API action |
 | Live updates | 1 | `GET /api/events`: Server-Sent Events of signal, traffic, battery, SIM, eSIM progress and more |
 | Live Activity | 3 | Register/unregister the iOS Live Activity, status |
+| Agent Update | 6 | Signed Stable/Beta checks, inactive-slot download, guarded install and rollback |
 | Tailscale | 8 | Remote management: setup, login URL, enable/disable, config, logout, update |
 | AT Terminal | 2 | Send AT commands, port info |
 
@@ -303,6 +304,12 @@ Enables ADB, builds and pushes the agent, creates boot scripts, and optionally s
 ```
 
 This builds, deploys the binary to the device via SSH (port 2222), updates the boot password, and restarts the agent.
+
+After this one-time bootstrap, **Settings → Agent Update** can check signed
+Stable or Beta releases, stage them in the inactive A/B slot, and restart only
+the agent. A failed 60-second health trial automatically returns to the previous
+slot. Automatic installation remains disabled until the recovery path has been
+validated on physical U60 Pro hardware. See [OTA updates](docs/ota-updates.md).
 
 ### eSIM profiles (optional)
 

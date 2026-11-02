@@ -2366,6 +2366,48 @@ dialog .button {
 @media (prefers-reduced-motion:reduce) {
   .nav-chevron { transition: none; }
 }
+
+/* Agent update is intentionally an operational surface: compact state,
+   explicit actions and no decorative motion beyond the shared number tween. */
+.update-panel { overflow:hidden; }
+.update-hero { display:grid; grid-template-columns:minmax(0,1.7fr) minmax(210px,.65fr); gap:28px; align-items:end; padding:8px 0 28px; border-bottom:1px solid var(--line); }
+.update-hero h2 { max-width:680px; margin:7px 0 10px; font-size:clamp(21px,3vw,34px); line-height:1.08; letter-spacing:-.035em; }
+.update-hero p { max-width:720px; margin:0; color:var(--muted); line-height:1.7; }
+.update-current { min-width:0; padding:18px; border:1px solid var(--line); background:var(--surface-soft); }
+.update-current>span,.update-progress span { display:block; color:var(--muted); font:8px var(--mono); letter-spacing:.11em; }
+.update-current strong { display:block; margin:8px 0 5px; color:var(--selected-ink); font-size:24px; overflow-wrap:anywhere; }
+.update-current small { display:block; color:var(--muted); font-size:8px; line-height:1.5; overflow-wrap:anywhere; }
+.update-state-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); margin:24px 0; border:1px solid var(--line); }
+.update-state-grid article { min-width:0; padding:18px; }
+.update-state-grid article+article { border-left:1px solid var(--line); }
+.update-state-grid strong { display:block; margin:8px 0 5px; font-size:13px; overflow-wrap:anywhere; }
+.update-state-grid small { display:block; min-height:2.8em; color:var(--muted); font-size:9px; line-height:1.45; overflow-wrap:anywhere; }
+.update-progress { margin:0 0 24px; padding:16px 18px; border-left:3px solid var(--accent); background:var(--live-surface); }
+.update-progress>div:first-child { display:flex; justify-content:space-between; gap:20px; align-items:center; }
+.update-progress strong { color:var(--selected-ink); font-size:13px; }
+.update-progress-track { height:5px; margin:12px 0 9px; overflow:hidden; background:var(--line); }
+.update-progress-track i { display:block; width:0; height:100%; background:var(--accent); transition:width .25s ease; }
+.update-progress small { color:var(--muted); font-size:9px; }
+.update-settings { margin-top:0; }
+.update-toggle { display:flex; gap:12px; align-items:flex-start; padding:15px 16px; border:1px solid var(--line); background:var(--surface-soft); }
+.update-toggle input { flex:0 0 auto; width:18px!important; min-height:18px!important; height:18px; margin:0; accent-color:var(--accent); }
+.update-toggle span { min-width:0; }
+.update-toggle strong,.update-toggle small { display:block; }
+.update-toggle strong { margin-bottom:4px; font-size:10px; }
+.update-toggle small { color:var(--muted); font-size:9px; line-height:1.45; }
+.update-release { display:flex; justify-content:space-between; gap:24px; align-items:center; margin:24px 0 0; padding:18px; border:1px solid var(--line); border-left:3px solid var(--accent); background:var(--surface-soft); }
+.update-release h3 { margin:7px 0 4px; font-size:20px; }
+.update-release p { margin:0; color:var(--muted); font-size:10px; }
+.update-actions { margin-top:18px; }
+@media(max-width:780px) {
+  .update-hero { grid-template-columns:minmax(0,1fr); }
+  .update-state-grid { grid-template-columns:minmax(0,1fr); }
+  .update-state-grid article+article { border-left:0; border-top:1px solid var(--line); }
+  .update-release { align-items:flex-start; flex-direction:column; }
+  .update-actions { display:grid; grid-template-columns:minmax(0,1fr); }
+  .update-actions .button { width:100%; }
+}
+@media(prefers-reduced-motion:reduce) { .update-progress-track i { transition:none; } }
 @media (min-width:768px) and (max-width:1023px) and (max-height:500px) and (hover:none) and (pointer:coarse) {
   main {
     padding-top: 16px;

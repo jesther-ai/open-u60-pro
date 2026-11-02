@@ -4,6 +4,7 @@ mod auth;
 mod bearer;
 mod battery_details;
 mod boottime;
+mod build_info;
 mod cache;
 mod cell;
 mod charge_policy;
@@ -30,6 +31,7 @@ mod live_activity;
 mod modem_ext;
 mod network_ext;
 mod oos_policy;
+mod ota;
 mod qrtr_uim;
 mod router;
 mod scheduler;
@@ -72,6 +74,16 @@ const DEFAULT_THREADS: usize = 4;
 fn main() {
     // Diagnostics: `zte-agent esim-native chip info` runs one native eSIM command and exits.
     let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("--version") {
+        println!("zte-agent {}", build_info::display());
+        return;
+    }
+    if args.get(1).map(String::as_str) == Some("ota-probe") {
+        std::process::exit(ota::probe_cli(args.get(2).map(String::as_str)));
+    }
+    if args.get(1).map(String::as_str) == Some("ota-helper") {
+        std::process::exit(ota::helper_cli(&args[2..]));
+    }
     if args.get(1).map(String::as_str) == Some("esim-native") {
         std::process::exit(esim_native::cli(&args[2..]));
     }
@@ -154,6 +166,7 @@ fn main() {
     state.tailscale.start_wan_watch(ts_wan_rx);
     state.ttl.start(ttl_wan_rx);
     state.wireguard.start(wireguard_wan_rx);
+    state.ota.start();
     state.oos_policy.start(
         Box::new(oos_policy::DeviceEffects::new(Arc::clone(&state))),
         busy_check(&state),

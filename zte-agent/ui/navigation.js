@@ -51,6 +51,7 @@
       {id:'https',label:'HTTPS & Install',title:'HTTPS & install',description:'Secure local access and install this console on your devices.'},
       {id:'appearance',label:'Appearance',title:'Appearance',description:'A comfortable view, in any light.'},
       {id:'connection',label:'Console connection',title:'Console connection',description:'Connection status and access to this local console.'},
+      {id:'update',label:'Agent Update',title:'Agent update',description:'Signed Stable and Beta releases with automatic rollback protection.'},
       {id:'about',label:'About',title:'About OpenU60',description:'A local console for your ZTE U60 Pro.'}
     ]}
   ];
