@@ -749,4 +749,10 @@ mod tests {
         assert_eq!(Method::from(&M::PATCH), Method::Other);
         assert_eq!(Method::from(&M::from_bytes(b"get").unwrap()), Method::Other);
     }
+
+    #[test]
+    fn ota_download_uses_the_slow_lane_without_blocking_status() {
+        assert_eq!(lane(Method::Post, "/api/update/download"), Lane::Slow);
+        assert_eq!(lane(Method::Get, "/api/update/status"), Lane::General);
+    }
 }
