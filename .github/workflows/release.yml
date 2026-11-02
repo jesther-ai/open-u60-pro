@@ -3,17 +3,9 @@ name: Release
 on:
   push:
     tags: ['v*']
-  # Pull requests that touch the agent build it too (no release), so a broken
-  # cross build shows up before a tag is pushed.
-  pull_request:
-    paths:
-      - '.github/workflows/release.yml'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'zte-agent/**'
-      - 'euicc/**'
-      - 'scripts/release/**'
-      - 'scripts/router/**'
+  # Branch protection requires this build for every pull request. PR builds
+  # never receive the signing key and never publish release artifacts.
+  pull_request: {}
 
 permissions:
   contents: write
