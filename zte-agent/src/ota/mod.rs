@@ -293,50 +293,28 @@ impl OtaManager {
         }
         let channel = self.settings().channel;
         let stable = self.fetch_manifest(stable_url())?;
-        let mut releases = vec![stable.clone()];
-        if channel == Channel::Beta {
-            releases.push(self.fetch_manifest(beta_url())?);
-        }
+        let beta = if channel == Channel::Beta {
+            self.fetch_manifest(beta_url())?
+        } else {
+            None
+        };
         let current = Version::parse(crate::build_info::VERSION)
             .map_err(|_| "current build has an invalid version".to_string())?;
         let blocked: Vec<String> = storage::read_json(&self.paths.blocked).unwrap_or_default();
-        releases.sort_by_key(|release| release.semver().ok());
-        let candidate = if channel == Channel::Stable {
-            // Leaving Beta explicitly returns to the newest Stable release,
-            // even when it sorts below a later prerelease already installed.
-            let version = stable.semver().map_err(|e| e.to_string())?;
-            (stable.version != crate::build_info::VERSION
-                && !blocked.contains(&stable.version)
-                && (version > current || !current.pre.is_empty()))
-            .then_some(stable)
-        } else {
-            releases
-                .into_iter()
-                .filter(|release| !blocked.contains(&release.version))
-                .filter(|release| release.semver().is_ok_and(|version| version > current))
-                .next_back()
-        };
-        if let Some(release) = &candidate {
-            if release
-                .minimum_updater_semver()
-                .map_err(|e| e.to_string())?
-                > current
-            {
-                return Err(format!(
-                    "{} requires updater {} or newer",
-                    release.version, release.minimum_updater_version
-                ));
-            }
-        }
-        Ok(candidate)
+        select_candidate(channel, &current, stable, beta, &blocked)
     }
 
-    fn fetch_manifest(&self, url: &str) -> Result<ReleaseManifest, String> {
+    fn fetch_manifest(&self, url: &str) -> Result<Option<ReleaseManifest>, String> {
         validate_channel_url(url)?;
         let response = client(HTTP_TIMEOUT)?
             .get(url)
             .send()
-            .and_then(reqwest::blocking::Response::error_for_status)
+            .map_err(|e| format!("release channel request failed: {e}"))?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let response = response
+            .error_for_status()
             .map_err(|e| format!("release channel request failed: {e}"))?;
         if response
             .content_length()
@@ -357,7 +335,10 @@ impl OtaManager {
         if bytes.len() > MAX_ENVELOPE_BYTES {
             return Err("signed release envelope is too large".into());
         }
-        self.verifier.verify(&bytes).map_err(|e| e.to_string())
+        self.verifier
+            .verify(&bytes)
+            .map(Some)
+            .map_err(|e| e.to_string())
     }
 
     pub fn download(&self) -> Result<(), String> {
@@ -603,6 +584,53 @@ impl OtaManager {
             dashboard.request_refresh();
         }
     }
+}
+
+fn select_candidate(
+    channel: Channel,
+    current: &Version,
+    stable: Option<ReleaseManifest>,
+    beta: Option<ReleaseManifest>,
+    blocked: &[String],
+) -> Result<Option<ReleaseManifest>, String> {
+    let candidate = if channel == Channel::Stable {
+        let Some(stable) = stable else {
+            return Ok(None);
+        };
+        // Leaving Beta explicitly returns to the newest Stable release, even
+        // when it sorts below a later prerelease already installed.
+        let version = stable.semver().map_err(|e| e.to_string())?;
+        (stable.version != crate::build_info::VERSION
+            && !blocked.contains(&stable.version)
+            && (version.cmp(current).is_gt() || !current.pre.is_empty()))
+        .then_some(stable)
+    } else {
+        let mut releases: Vec<_> = stable.into_iter().chain(beta).collect();
+        releases.sort_by_key(|release| release.semver().ok());
+        releases
+            .into_iter()
+            .filter(|release| !blocked.contains(&release.version))
+            .filter(|release| {
+                release
+                    .semver()
+                    .is_ok_and(|version| version.cmp(current).is_gt())
+            })
+            .next_back()
+    };
+    if let Some(release) = &candidate {
+        if release
+            .minimum_updater_semver()
+            .map_err(|e| e.to_string())?
+            .cmp(current)
+            .is_gt()
+        {
+            return Err(format!(
+                "{} requires updater {} or newer",
+                release.version, release.minimum_updater_version
+            ));
+        }
+    }
+    Ok(candidate)
 }
 
 #[derive(Debug)]
@@ -954,6 +982,68 @@ mod tests {
             published_at: "2026-11-02T00:00:00Z".into(),
             minimum_updater_version: "2.4.0-beta.1".into(),
         }
+    }
+
+    fn channel_response(status: &str) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let status = status.to_owned();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request);
+            stream
+                .write_all(
+                    format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                        .as_bytes(),
+                )
+                .unwrap();
+        });
+        format!("http://{address}/channel.json")
+    }
+
+    #[test]
+    fn beta_channel_selects_beta_before_the_first_stable_pointer() {
+        let current = Version::parse("2.4.0-beta.1").unwrap();
+        let candidate = select_candidate(
+            Channel::Beta,
+            &current,
+            None,
+            Some(release(Channel::Beta, "2.4.0-beta.2")),
+            &[],
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(candidate.version, "2.4.0-beta.2");
+    }
+
+    #[test]
+    fn stable_channel_has_no_candidate_before_its_first_pointer() {
+        let current = Version::parse("2.4.0-beta.1").unwrap();
+        let candidate = select_candidate(Channel::Stable, &current, None, None, &[]).unwrap();
+
+        assert!(candidate.is_none());
+    }
+
+    #[test]
+    fn missing_channel_pointer_is_not_an_update_failure() {
+        let manager = manager("missing-channel");
+        let result = manager
+            .fetch_manifest(&channel_response("404 Not Found"))
+            .unwrap();
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn channel_server_failure_is_not_treated_as_unpublished() {
+        let manager = manager("failed-channel");
+        let error = manager
+            .fetch_manifest(&channel_response("503 Service Unavailable"))
+            .unwrap_err();
+
+        assert!(error.contains("503 Service Unavailable"), "{error}");
     }
 
     #[test]
