@@ -11,7 +11,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -31,8 +31,10 @@ const BETA_CHANNEL_URL: &str =
 const CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(45);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const DOWNLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const REQUIRED_HEADROOM: u64 = 8 * 1024 * 1024;
 const TRIAL_SECONDS: u64 = 60;
+const SUPERVISOR_SCRIPT: &[u8] = include_bytes!("../../../scripts/router/zte-agent-supervisor.sh");
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -108,6 +110,11 @@ impl OtaManager {
         if let Err(error) = paths.prepare() {
             eprintln!("[ota] cannot prepare update storage: {error}");
         }
+        if std::env::var("ZTE_OTA_TRIAL").as_deref() != Ok("1") {
+            if let Err(error) = ensure_supervisor(&paths) {
+                eprintln!("[ota] cannot repair update supervisor: {error}");
+            }
+        }
         let mut settings = storage::read_json::<Settings>(&paths.settings).unwrap_or_default();
         settings.automatic_install = false;
         let mut persistent = storage::read_json(&paths.state).unwrap_or_default();
@@ -151,6 +158,11 @@ impl OtaManager {
                 std::thread::sleep(Duration::from_secs(TRIAL_SECONDS));
                 for _ in 0..12 {
                     if !manager.paths.pending.exists() {
+                        if let Err(error) = ensure_supervisor(&manager.paths) {
+                            manager.paths.append_log(&format!(
+                                "could not repair update supervisor: {error}"
+                            ));
+                        }
                         manager.change(|state| {
                             state.persistent.phase = Phase::Idle;
                             state.persistent.available = None;
@@ -372,6 +384,8 @@ impl OtaManager {
             return Err("not enough free storage for a safe update".into());
         }
         let destination = self.paths.slot_download(slot);
+        let metadata_destination = self.paths.slot_meta_download(slot);
+        let _cleanup = RemoveFilesOnDrop([destination.clone(), metadata_destination.clone()]);
         let mut file = OpenOptions::new()
             .create(true)
             .truncate(true)
@@ -379,7 +393,7 @@ impl OtaManager {
             .mode(0o700)
             .open(&destination)
             .map_err(|e| e.to_string())?;
-        let mut response = client(DOWNLOAD_TIMEOUT)?
+        let mut response = client(DOWNLOAD_IDLE_TIMEOUT)?
             .get(&manifest.binary_url)
             .send()
             .and_then(reqwest::blocking::Response::error_for_status)
@@ -394,34 +408,27 @@ impl OtaManager {
             state.bytes_received = 0;
             state.bytes_total = manifest.size;
         });
-        let mut digest = Sha256::new();
-        let mut received = 0u64;
-        let mut buffer = [0u8; 64 * 1024];
-        loop {
-            let count = response.read(&mut buffer).map_err(|e| e.to_string())?;
-            if count == 0 {
-                break;
-            }
-            received = received.saturating_add(count as u64);
-            if received > manifest.size || received > MAX_BINARY_BYTES {
-                return Err("download exceeded the signed size".into());
-            }
-            file.write_all(&buffer[..count])
-                .map_err(|e| e.to_string())?;
-            digest.update(&buffer[..count]);
-            self.change(|state| state.bytes_received = received);
-        }
-        if received != manifest.size || manifest.sha256 != manifest::hex(&digest.finalize()) {
-            return Err("download failed signed size or SHA-256 verification".into());
-        }
+        stream_verified_binary(
+            &mut response,
+            &mut file,
+            manifest.size,
+            &manifest.sha256,
+            DOWNLOAD_TIMEOUT,
+            |received| self.change(|state| state.bytes_received = received),
+        )?;
         file.sync_all().map_err(|e| e.to_string())?;
         drop(file);
         fs::set_permissions(&destination, fs::Permissions::from_mode(0o755))
             .map_err(|e| e.to_string())?;
         probe(&destination, &manifest.version)?;
+        storage::write_json(&metadata_destination, &manifest).map_err(|e| e.to_string())?;
         fs::rename(&destination, self.paths.slot_binary(slot)).map_err(|e| e.to_string())?;
         storage::sync_parent(&self.paths.slot_binary(slot)).map_err(|e| e.to_string())?;
-        storage::write_json(&self.paths.slot_meta(slot), &manifest).map_err(|e| e.to_string())?;
+        fs::rename(&metadata_destination, self.paths.slot_meta(slot)).map_err(|e| e.to_string())?;
+        storage::sync_parent(&self.paths.slot_meta(slot)).map_err(|e| e.to_string())?;
+        self.paths
+            .clear_slot_bootstrap_digest(slot)
+            .map_err(|e| format!("cannot retire bootstrap digest: {e}"))?;
         self.change(|state| {
             state.persistent.staged = Some(manifest);
             state.persistent.staged_slot = Some(slot.as_str().into());
@@ -444,6 +451,8 @@ impl OtaManager {
         if self.paths.pending.exists() {
             return Err("an agent health trial is already in progress".into());
         }
+        ensure_supervisor(&self.paths)
+            .map_err(|error| format!("update supervisor is not repairable: {error}"))?;
         if !self.paths.bootstrap_ready() {
             return Err("OTA bootstrap supervisor is not installed yet".into());
         }
@@ -466,23 +475,20 @@ impl OtaManager {
             .paths
             .active_slot()
             .ok_or_else(|| "active OTA slot is missing".to_string())?;
-        self.paths
-            .write_pending(slot, previous, &manifest.version)
-            .map_err(|e| e.to_string())?;
+        if slot == previous {
+            return Err("staged update must be in the inactive slot".into());
+        }
+        verify_staged_slot(&self.paths, slot, &manifest)?;
+        verify_active_slot(&self.paths, previous)?;
         let current = std::env::current_exe().map_err(|e| e.to_string())?;
-        Command::new(current)
-            .args([
-                "ota-helper",
-                slot.as_str(),
-                previous.as_str(),
-                &manifest.version,
-                &std::process::id().to_string(),
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| format!("cannot start update helper: {e}"))?;
+        launch_helper(
+            &self.paths,
+            &current,
+            slot,
+            previous,
+            &manifest.version,
+            std::process::id(),
+        )?;
         self.paths.append_log(&format!(
             "installing {} in slot {}",
             manifest.version,
@@ -508,10 +514,13 @@ impl OtaManager {
         if self.paths.pending.exists() {
             return Err("an agent health trial is already in progress".into());
         }
+        ensure_supervisor(&self.paths)
+            .map_err(|error| format!("update supervisor is not repairable: {error}"))?;
         let active = self
             .paths
             .active_slot()
             .ok_or_else(|| "active OTA slot is missing".to_string())?;
+        verify_active_slot(&self.paths, active)?;
         let previous = active.other();
         if self
             .state
@@ -525,29 +534,16 @@ impl OtaManager {
         {
             return Err("the inactive slot contains a staged update, not a rollback build".into());
         }
-        if !storage::executable(&self.paths.slot_binary(previous)) {
-            return Err("no previous agent slot is available".into());
-        }
-        let version = storage::read_json::<ReleaseManifest>(&self.paths.slot_meta(previous))
-            .map(|meta| meta.version)
-            .unwrap_or_else(|| "bootstrap-slot".into());
-        self.paths
-            .write_pending(previous, active, &version)
-            .map_err(|e| e.to_string())?;
+        let version = verify_rollback_slot(&self.paths, previous)?;
         let current = std::env::current_exe().map_err(|e| e.to_string())?;
-        Command::new(current)
-            .args([
-                "ota-helper",
-                previous.as_str(),
-                active.as_str(),
-                &version,
-                &std::process::id().to_string(),
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| format!("cannot start rollback helper: {e}"))?;
+        launch_helper(
+            &self.paths,
+            &current,
+            previous,
+            active,
+            &version,
+            std::process::id(),
+        )?;
         crate::system::spawn_named("ota-exit", || {
             std::thread::sleep(Duration::from_millis(1200));
             std::process::exit(0);
@@ -589,6 +585,265 @@ impl OtaManager {
         if let Some(dashboard) = self.dashboard.upgrade() {
             dashboard.request_refresh();
         }
+    }
+}
+
+struct RemoveFilesOnDrop([PathBuf; 2]);
+
+impl Drop for RemoveFilesOnDrop {
+    fn drop(&mut self) {
+        for path in &self.0 {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+fn ensure_supervisor(paths: &Paths) -> std::io::Result<()> {
+    let current = fs::read(&paths.supervisor).ok();
+    let executable = fs::metadata(&paths.supervisor)
+        .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false);
+    if current.as_deref() == Some(SUPERVISOR_SCRIPT) && executable {
+        return Ok(());
+    }
+    storage::atomic_write_preserving_parent(&paths.supervisor, SUPERVISOR_SCRIPT, 0o755)
+}
+
+fn stream_verified_binary(
+    reader: &mut impl Read,
+    writer: &mut impl Write,
+    expected_size: u64,
+    expected_sha256: &str,
+    total_timeout: Duration,
+    mut progress: impl FnMut(u64),
+) -> Result<(), String> {
+    let started = Instant::now();
+    let mut digest = Sha256::new();
+    let mut received = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        if started.elapsed() >= total_timeout {
+            return Err("binary download exceeded the total time limit".into());
+        }
+        let count = reader.read(&mut buffer).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::TimedOut {
+                "binary download stalled".to_string()
+            } else {
+                format!("binary download read failed: {error}")
+            }
+        })?;
+        if started.elapsed() >= total_timeout {
+            return Err("binary download exceeded the total time limit".into());
+        }
+        if count == 0 {
+            break;
+        }
+        received = received.saturating_add(count as u64);
+        if received > expected_size || received > MAX_BINARY_BYTES {
+            return Err("download exceeded the signed size".into());
+        }
+        writer
+            .write_all(&buffer[..count])
+            .map_err(|error| format!("cannot write update download: {error}"))?;
+        digest.update(&buffer[..count]);
+        progress(received);
+    }
+    if received != expected_size || expected_sha256 != manifest::hex(&digest.finalize()) {
+        return Err("download failed signed size or SHA-256 verification".into());
+    }
+    Ok(())
+}
+
+fn verify_file_integrity(
+    path: &Path,
+    expected_size: u64,
+    expected_sha256: &str,
+) -> Result<(), String> {
+    let metadata =
+        fs::metadata(path).map_err(|error| format!("update binary is missing: {error}"))?;
+    if !metadata.is_file() || metadata.len() != expected_size {
+        return Err("update binary size no longer matches the signed manifest".into());
+    }
+    let mut file =
+        fs::File::open(path).map_err(|error| format!("cannot read update binary: {error}"))?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .map_err(|error| format!("cannot read update binary: {error}"))?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    if expected_sha256 != manifest::hex(&digest.finalize()) {
+        return Err("update binary SHA-256 no longer matches the signed manifest".into());
+    }
+    Ok(())
+}
+
+fn verify_release_binary(path: &Path, manifest: &ReleaseManifest) -> Result<(), String> {
+    manifest.validate().map_err(|error| error.to_string())?;
+    if !storage::executable(path) {
+        return Err("update binary is not executable".into());
+    }
+    verify_file_integrity(path, manifest.size, &manifest.sha256)?;
+    probe(path, &manifest.version)
+}
+
+fn verify_staged_slot(paths: &Paths, slot: Slot, manifest: &ReleaseManifest) -> Result<(), String> {
+    let stored = storage::read_json::<ReleaseManifest>(&paths.slot_meta(slot))
+        .ok_or_else(|| "staged update metadata is missing or corrupted".to_string())?;
+    if stored != *manifest {
+        return Err("staged update metadata changed after download".into());
+    }
+    verify_release_binary(&paths.slot_binary(slot), manifest)
+        .map_err(|error| format!("staged update failed preflight verification: {error}"))
+}
+
+fn verify_active_slot(paths: &Paths, slot: Slot) -> Result<(), String> {
+    let binary = paths.slot_binary(slot);
+    if let Some(manifest) = storage::read_json::<ReleaseManifest>(&paths.slot_meta(slot)) {
+        if manifest.version != crate::build_info::VERSION {
+            return Err("active rollback slot metadata does not match the running agent".into());
+        }
+        return verify_release_binary(&binary, &manifest).map_err(|error| {
+            format!("active rollback slot failed preflight verification: {error}")
+        });
+    }
+    if paths.slot_bootstrap_digest(slot).exists() {
+        verify_bootstrap_slot(paths, slot, Some(crate::build_info::VERSION)).map_err(|error| {
+            format!("active bootstrap slot failed preflight verification: {error}")
+        })?;
+        return Ok(());
+    }
+    if !storage::executable(&binary) {
+        return Err("active rollback slot is missing".into());
+    }
+    probe(&binary, crate::build_info::VERSION)
+        .map_err(|error| format!("active rollback slot failed preflight verification: {error}"))
+}
+
+fn verify_rollback_slot(paths: &Paths, slot: Slot) -> Result<String, String> {
+    let binary = paths.slot_binary(slot);
+    if let Some(manifest) = storage::read_json::<ReleaseManifest>(&paths.slot_meta(slot)) {
+        verify_release_binary(&binary, &manifest)
+            .map_err(|error| format!("rollback slot failed preflight verification: {error}"))?;
+        return Ok(manifest.version);
+    }
+    if paths.slot_bootstrap_digest(slot).exists() {
+        return verify_bootstrap_slot(paths, slot, None)
+            .map_err(|error| format!("rollback bootstrap slot failed preflight: {error}"));
+    }
+    if storage::executable(&binary) {
+        Ok("bootstrap-slot".into())
+    } else {
+        Err("no previous agent slot is available".into())
+    }
+}
+
+fn verify_bootstrap_slot(
+    paths: &Paths,
+    slot: Slot,
+    expected_version: Option<&str>,
+) -> Result<String, String> {
+    let identity = fs::read_to_string(paths.slot_bootstrap_digest(slot))
+        .map_err(|error| format!("bootstrap digest is unreadable: {error}"))?;
+    let mut lines = identity.lines();
+    let sha256 = lines.next().unwrap_or_default();
+    let version = lines.next().unwrap_or_default();
+    if sha256.len() != 64
+        || !sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        || Version::parse(version).is_err()
+    {
+        return Err("bootstrap identity is malformed".into());
+    }
+    if expected_version.is_some_and(|expected| expected != version) {
+        return Err("bootstrap identity does not match the running agent".into());
+    }
+    let binary = paths.slot_binary(slot);
+    if !storage::executable(&binary) {
+        return Err("bootstrap binary is not executable".into());
+    }
+    let size = fs::metadata(&binary)
+        .map_err(|error| format!("bootstrap binary is missing: {error}"))?
+        .len();
+    verify_file_integrity(&binary, size, sha256)?;
+    probe(&binary, version)?;
+    Ok(version.into())
+}
+
+fn launch_helper(
+    paths: &Paths,
+    helper: &Path,
+    candidate: Slot,
+    previous: Slot,
+    version: &str,
+    parent: u32,
+) -> Result<(), String> {
+    paths
+        .clear_helper_ready()
+        .map_err(|error| format!("cannot clear stale helper handshake: {error}"))?;
+    paths
+        .write_pending(candidate, previous, version)
+        .map_err(|error| error.to_string())?;
+    let parent = parent.to_string();
+    let result = Command::new(helper)
+        .args([
+            "ota-helper",
+            candidate.as_str(),
+            previous.as_str(),
+            version,
+            &parent,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    let mut child = match result {
+        Ok(child) => child,
+        Err(error) => {
+            return clear_failed_launch(paths, format!("cannot start update helper: {error}"))
+        }
+    };
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        if paths.helper_ready.exists() {
+            if let Err(error) = paths.clear_helper_ready() {
+                let _ = child.kill();
+                let _ = child.wait();
+                return clear_failed_launch(
+                    paths,
+                    format!("cannot clear helper handshake: {error}"),
+                );
+            }
+            return Ok(());
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            return clear_failed_launch(
+                paths,
+                format!("update helper exited before handoff with {status}"),
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    clear_failed_launch(paths, "update helper did not confirm startup".into())
+}
+
+fn clear_failed_launch(paths: &Paths, error: String) -> Result<(), String> {
+    let ready_error = paths.clear_helper_ready().err();
+    match paths.clear_pending() {
+        Ok(()) if ready_error.is_none() => Err(error),
+        Ok(()) => Err(format!(
+            "{error}; cannot clear helper handshake: {}",
+            ready_error.expect("checked")
+        )),
+        Err(cleanup) => Err(format!("{error}; cannot clear pending marker: {cleanup}")),
     }
 }
 
@@ -776,8 +1031,16 @@ pub fn helper_cli(args: &[String]) -> i32 {
         return 2;
     };
     let paths = Paths::system();
+    if let Err(error) = paths.write_helper_ready() {
+        paths.append_log(&format!("update helper could not confirm startup: {error}"));
+        return 7;
+    }
     if !wait_for_exit(parent, Duration::from_secs(15)) {
         paths.append_log("update helper timed out waiting for the previous agent");
+        if let Err(error) = paths.clear_pending() {
+            paths.append_log(&format!("could not clear pending update marker: {error}"));
+        }
+        let _ = paths.clear_helper_ready();
         return 3;
     }
     let binary = paths.slot_binary(candidate);
@@ -846,18 +1109,56 @@ fn recover(paths: &Paths, previous: Slot, child: Option<&mut Child>) -> i32 {
         let _ = child.kill();
         let _ = child.wait();
     }
-    let _ = paths.write_active(previous);
-    let _ = paths.point_legacy_link(previous);
-    let _ = paths.clear_pending();
-    match Command::new(paths.slot_binary(previous))
+    if let Err(error) = paths.write_active(previous) {
+        paths.append_log(&format!("could not restore active slot marker: {error}"));
+    }
+    if let Err(error) = paths.point_legacy_link(previous) {
+        paths.append_log(&format!("could not restore legacy agent link: {error}"));
+    }
+    if let Err(error) = paths.clear_pending() {
+        paths.append_log(&format!("could not clear pending update marker: {error}"));
+    }
+    let previous_error = match verify_active_slot(paths, previous) {
+        Ok(()) => match Command::new(paths.slot_binary(previous))
+            .stdin(Stdio::null())
+            .stdout(log_file(&paths.update_log))
+            .stderr(log_file(&paths.update_log))
+            .spawn()
+        {
+            Ok(_) => return 4,
+            Err(error) => format!("rollback agent could not start: {error}"),
+        },
+        Err(error) => format!("rollback agent is no longer safe: {error}"),
+    };
+    paths.append_log(&previous_error);
+
+    let stable = paths.stable_binary();
+    let Some(manifest) = storage::read_json::<ReleaseManifest>(&paths.stable_meta()) else {
+        paths.append_log("Stable rescue metadata is missing or corrupted");
+        return 5;
+    };
+    if let Err(error) = verify_release_binary(&stable, &manifest) {
+        paths.append_log(&format!("Stable rescue agent is not safe: {error}"));
+        return 5;
+    }
+    match Command::new(&stable)
         .stdin(Stdio::null())
         .stdout(log_file(&paths.update_log))
         .stderr(log_file(&paths.update_log))
         .spawn()
     {
-        Ok(_) => 4,
+        Ok(_) => {
+            if let Err(error) = paths.write_rescue() {
+                paths.append_log(&format!("could not mark Stable rescue mode: {error}"));
+            }
+            if let Err(error) = paths.point_legacy_path(&stable) {
+                paths.append_log(&format!("could not link the Stable rescue agent: {error}"));
+            }
+            paths.append_log("started the last Stable rescue agent");
+            6
+        }
         Err(error) => {
-            paths.append_log(&format!("rollback agent could not start: {error}"));
+            paths.append_log(&format!("Stable rescue agent could not start: {error}"));
             5
         }
     }
@@ -1012,6 +1313,44 @@ mod tests {
     use super::*;
     use p256::ecdsa::SigningKey;
 
+    struct TimedOutReader;
+
+    impl Read for TimedOutReader {
+        fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "fixture stalled",
+            ))
+        }
+    }
+
+    struct SlowReader {
+        inner: std::io::Cursor<Vec<u8>>,
+        delay: Duration,
+    }
+
+    impl Read for SlowReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            std::thread::sleep(self.delay);
+            self.inner.read(buffer)
+        }
+    }
+
+    struct FailedWriter;
+
+    impl Write for FailedWriter {
+        fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "fixture storage failure",
+            ))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     fn manager(name: &str) -> OtaManager {
         let root =
             std::env::temp_dir().join(format!("u60-ota-manager-{name}-{}", std::process::id()));
@@ -1041,6 +1380,32 @@ mod tests {
             published_at: "2026-11-02T00:00:00Z".into(),
             minimum_updater_version: "2.4.0-beta.1".into(),
         }
+    }
+
+    fn sha256(bytes: &[u8]) -> String {
+        manifest::hex(&Sha256::digest(bytes))
+    }
+
+    fn release_for_binary(channel: Channel, version: &str, bytes: &[u8]) -> ReleaseManifest {
+        let mut manifest = release(channel, version);
+        manifest.size = bytes.len() as u64;
+        manifest.sha256 = sha256(bytes);
+        manifest
+    }
+
+    fn test_agent(version: &str, probe_ok: bool, marker: &str) -> Vec<u8> {
+        let mut script = format!(
+            "#!/bin/sh\nif [ \"${{1:-}}\" = ota-probe ]; then\n  [ {probe_ok} = true ] && {{ [ -z \"${{2:-}}\" ] || [ \"$2\" = \"{version}\" ]; }} && exit 0\n  exit 2\nfi\n[ -z \"${{ZTE_TEST_MARKER:-}}\" ] || printf '%s' '{marker}' > \"$ZTE_TEST_MARKER\"\n#"
+        )
+        .into_bytes();
+        script.resize(1024, b'x');
+        script
+    }
+
+    fn write_release_agent(paths: &Paths, slot: Slot, manifest: &ReleaseManifest, bytes: &[u8]) {
+        fs::write(paths.slot_binary(slot), bytes).unwrap();
+        fs::set_permissions(paths.slot_binary(slot), fs::Permissions::from_mode(0o755)).unwrap();
+        storage::write_json(&paths.slot_meta(slot), manifest).unwrap();
     }
 
     fn channel_response(status: &str) -> String {
@@ -1318,5 +1683,401 @@ mod tests {
             200
         );
         assert_eq!(install_api(&state, br#"{"confirm":false}"#).0, 400);
+    }
+
+    #[test]
+    fn verified_stream_accepts_only_the_exact_signed_payload() {
+        let bytes = vec![0x5a; 1024];
+        let digest = sha256(&bytes);
+        let mut output = Vec::new();
+        let mut progress = Vec::new();
+
+        stream_verified_binary(
+            &mut bytes.as_slice(),
+            &mut output,
+            bytes.len() as u64,
+            &digest,
+            Duration::from_secs(1),
+            |received| progress.push(received),
+        )
+        .unwrap();
+
+        assert_eq!(output, bytes);
+        assert_eq!(progress.last(), Some(&(bytes.len() as u64)));
+    }
+
+    #[test]
+    fn verified_stream_rejects_truncated_oversized_and_corrupted_payloads() {
+        let signed = vec![0x41; 1024];
+        let digest = sha256(&signed);
+        for (name, payload) in [
+            ("truncated", signed[..1023].to_vec()),
+            ("oversized", [signed.clone(), vec![0x41]].concat()),
+            ("corrupted", vec![0x42; 1024]),
+        ] {
+            let error = stream_verified_binary(
+                &mut payload.as_slice(),
+                &mut Vec::new(),
+                signed.len() as u64,
+                &digest,
+                Duration::from_secs(1),
+                |_| {},
+            )
+            .unwrap_err();
+            assert!(
+                error.contains("signed size") || error.contains("SHA-256"),
+                "{name}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn verified_stream_stops_on_idle_total_and_storage_failures() {
+        let bytes = vec![0x51; 1024];
+        let digest = sha256(&bytes);
+        let idle_error = stream_verified_binary(
+            &mut TimedOutReader,
+            &mut Vec::new(),
+            bytes.len() as u64,
+            &digest,
+            Duration::from_secs(1),
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(idle_error.contains("stalled"), "{idle_error}");
+
+        let total_error = stream_verified_binary(
+            &mut SlowReader {
+                inner: std::io::Cursor::new(bytes.clone()),
+                delay: Duration::from_millis(10),
+            },
+            &mut Vec::new(),
+            bytes.len() as u64,
+            &digest,
+            Duration::from_millis(1),
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(total_error.contains("total time limit"), "{total_error}");
+
+        let write_error = stream_verified_binary(
+            &mut bytes.as_slice(),
+            &mut FailedWriter,
+            bytes.len() as u64,
+            &digest,
+            Duration::from_secs(1),
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(write_error.contains("cannot write"), "{write_error}");
+    }
+
+    #[test]
+    fn install_preflight_rejects_a_staged_binary_changed_after_download() {
+        let manager = manager("staged-corruption");
+        let bytes = test_agent("2.4.0-beta.8", true, "candidate");
+        let manifest = release_for_binary(Channel::Beta, "2.4.0-beta.8", &bytes);
+        write_release_agent(&manager.paths, Slot::B, &manifest, &bytes);
+        verify_staged_slot(&manager.paths, Slot::B, &manifest).unwrap();
+
+        let mut corrupted = bytes;
+        *corrupted.last_mut().unwrap() = b'y';
+        fs::write(manager.paths.slot_binary(Slot::B), corrupted).unwrap();
+        fs::set_permissions(
+            manager.paths.slot_binary(Slot::B),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+
+        let error = verify_staged_slot(&manager.paths, Slot::B, &manifest).unwrap_err();
+        assert!(error.contains("SHA-256"), "{error}");
+        assert!(!manager.paths.pending.exists());
+    }
+
+    #[test]
+    fn install_preflight_rejects_changed_staged_metadata() {
+        let manager = manager("staged-metadata");
+        let bytes = test_agent("2.4.0-beta.8", true, "candidate");
+        let expected = release_for_binary(Channel::Beta, "2.4.0-beta.8", &bytes);
+        let changed = release_for_binary(Channel::Beta, "2.4.0-beta.9", &bytes);
+        write_release_agent(&manager.paths, Slot::B, &changed, &bytes);
+
+        let error = verify_staged_slot(&manager.paths, Slot::B, &expected).unwrap_err();
+        assert!(error.contains("metadata changed"), "{error}");
+    }
+
+    #[test]
+    fn install_preflight_rejects_a_corrupted_bootstrap_fallback() {
+        let manager = manager("bootstrap-preflight");
+        let original = test_agent(crate::build_info::VERSION, true, "active");
+        let mut corrupted = original.clone();
+        *corrupted.last_mut().unwrap() = b'y';
+        fs::write(manager.paths.slot_binary(Slot::A), corrupted).unwrap();
+        fs::set_permissions(
+            manager.paths.slot_binary(Slot::A),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        fs::write(
+            manager.paths.slot_bootstrap_digest(Slot::A),
+            format!("{}\n{}\n", sha256(&original), crate::build_info::VERSION),
+        )
+        .unwrap();
+
+        let error = verify_active_slot(&manager.paths, Slot::A).unwrap_err();
+        assert!(error.contains("SHA-256"), "{error}");
+    }
+
+    #[test]
+    fn helper_launch_failure_clears_the_pending_marker() {
+        let manager = manager("helper-launch");
+        let error = launch_helper(
+            &manager.paths,
+            &manager.paths.root.join("missing-helper"),
+            Slot::B,
+            Slot::A,
+            "2.4.0-beta.8",
+            std::process::id(),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("cannot start update helper"), "{error}");
+        assert!(!manager.paths.pending.exists());
+    }
+
+    #[test]
+    fn helper_immediate_exit_clears_the_pending_marker() {
+        let manager = manager("helper-exit");
+        let error = launch_helper(
+            &manager.paths,
+            Path::new("/usr/bin/false"),
+            Slot::B,
+            Slot::A,
+            "2.4.0-beta.8",
+            std::process::id(),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("exited before handoff"), "{error}");
+        assert!(!manager.paths.pending.exists());
+    }
+
+    #[test]
+    fn helper_must_confirm_startup_before_the_agent_can_exit() {
+        let manager = manager("helper-handshake");
+        let helper = manager.paths.root.join("fixture-helper.sh");
+        fs::write(
+            &helper,
+            format!(
+                "#!/bin/sh\nprintf 'ready\\n' > '{}'\nsleep 1\n",
+                manager.paths.helper_ready.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
+
+        launch_helper(
+            &manager.paths,
+            &helper,
+            Slot::B,
+            Slot::A,
+            "2.4.0-beta.8",
+            std::process::id(),
+        )
+        .unwrap();
+
+        assert!(manager.paths.pending.exists());
+        assert!(!manager.paths.helper_ready.exists());
+        manager.paths.clear_pending().unwrap();
+    }
+
+    #[test]
+    fn missing_or_damaged_supervisor_is_repaired_atomically() {
+        let manager = manager("supervisor-repair");
+        fs::write(&manager.paths.supervisor, b"damaged").unwrap();
+        fs::set_permissions(&manager.paths.supervisor, fs::Permissions::from_mode(0o600)).unwrap();
+
+        ensure_supervisor(&manager.paths).unwrap();
+
+        assert_eq!(
+            fs::read(&manager.paths.supervisor).unwrap(),
+            SUPERVISOR_SCRIPT
+        );
+        assert!(storage::executable(&manager.paths.supervisor));
+    }
+
+    #[test]
+    fn supervisor_skips_a_corrupted_active_slot_and_runs_the_verified_fallback() {
+        let manager = manager("supervisor-fallback");
+        ensure_supervisor(&manager.paths).unwrap();
+        let marker = manager.paths.root.join("started");
+        let active_bytes = test_agent("2.4.0-beta.7", true, "a");
+        let active = release_for_binary(Channel::Beta, "2.4.0-beta.7", &active_bytes);
+        let mut corrupted_active = active_bytes;
+        *corrupted_active.last_mut().unwrap() = b'y';
+        write_release_agent(&manager.paths, Slot::A, &active, &corrupted_active);
+        let fallback_bytes = test_agent("2.4.0-beta.8", true, "b");
+        let fallback = release_for_binary(Channel::Beta, "2.4.0-beta.8", &fallback_bytes);
+        write_release_agent(&manager.paths, Slot::B, &fallback, &fallback_bytes);
+        manager.paths.write_active(Slot::A).unwrap();
+
+        let status = Command::new("sh")
+            .arg(&manager.paths.supervisor)
+            .env("ZTE_OTA_ROOT", &manager.paths.root)
+            .env("ZTE_OTA_LEGACY_LINK", &manager.paths.legacy_link)
+            .env("ZTE_TEST_MARKER", &marker)
+            .status()
+            .unwrap();
+
+        assert!(status.success());
+        assert_eq!(fs::read_to_string(marker).unwrap(), "b");
+        assert_eq!(manager.paths.active_slot(), Some(Slot::B));
+    }
+
+    #[test]
+    fn supervisor_hash_checks_fresh_bootstrap_copies() {
+        let manager = manager("supervisor-bootstrap");
+        ensure_supervisor(&manager.paths).unwrap();
+        let marker = manager.paths.root.join("started");
+        let original = test_agent("bootstrap", true, "a");
+        let mut corrupted = original.clone();
+        *corrupted.last_mut().unwrap() = b'y';
+        fs::write(manager.paths.slot_binary(Slot::A), &corrupted).unwrap();
+        fs::set_permissions(
+            manager.paths.slot_binary(Slot::A),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        fs::write(
+            manager.paths.slot_bootstrap_digest(Slot::A),
+            format!("{}\nbootstrap\n", sha256(&original)),
+        )
+        .unwrap();
+        let fallback = test_agent("bootstrap", true, "b");
+        fs::write(manager.paths.slot_binary(Slot::B), &fallback).unwrap();
+        fs::set_permissions(
+            manager.paths.slot_binary(Slot::B),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        fs::write(
+            manager.paths.slot_bootstrap_digest(Slot::B),
+            format!("{}\nbootstrap\n", sha256(&fallback)),
+        )
+        .unwrap();
+        manager.paths.write_active(Slot::A).unwrap();
+
+        let status = Command::new("sh")
+            .arg(&manager.paths.supervisor)
+            .env("ZTE_OTA_ROOT", &manager.paths.root)
+            .env("ZTE_OTA_LEGACY_LINK", &manager.paths.legacy_link)
+            .env("ZTE_TEST_MARKER", &marker)
+            .status()
+            .unwrap();
+
+        assert!(status.success());
+        assert_eq!(fs::read_to_string(marker).unwrap(), "b");
+        assert_eq!(manager.paths.active_slot(), Some(Slot::B));
+    }
+
+    #[test]
+    fn pending_candidate_is_never_selected_during_boot_recovery() {
+        let manager = manager("supervisor-pending");
+        ensure_supervisor(&manager.paths).unwrap();
+        let marker = manager.paths.root.join("started");
+        let candidate_bytes = test_agent("2.4.0-beta.9", true, "candidate");
+        let candidate = release_for_binary(Channel::Beta, "2.4.0-beta.9", &candidate_bytes);
+        write_release_agent(&manager.paths, Slot::A, &candidate, &candidate_bytes);
+        let previous_bytes = test_agent("2.4.0-beta.8", false, "previous");
+        let previous = release_for_binary(Channel::Beta, "2.4.0-beta.8", &previous_bytes);
+        write_release_agent(&manager.paths, Slot::B, &previous, &previous_bytes);
+        let stable_bytes = test_agent("2.3.0", true, "stable");
+        let stable = release_for_binary(Channel::Stable, "2.3.0", &stable_bytes);
+        fs::write(manager.paths.stable_binary(), &stable_bytes).unwrap();
+        fs::set_permissions(
+            manager.paths.stable_binary(),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        storage::write_json(&manager.paths.stable_meta(), &stable).unwrap();
+        manager.paths.write_active(Slot::B).unwrap();
+        manager
+            .paths
+            .write_pending(Slot::A, Slot::B, "2.4.0-beta.9")
+            .unwrap();
+
+        let status = Command::new("sh")
+            .arg(&manager.paths.supervisor)
+            .env("ZTE_OTA_ROOT", &manager.paths.root)
+            .env("ZTE_OTA_LEGACY_LINK", &manager.paths.legacy_link)
+            .env("ZTE_TEST_MARKER", &marker)
+            .status()
+            .unwrap();
+
+        assert!(status.success());
+        assert_eq!(fs::read_to_string(marker).unwrap(), "stable");
+        assert!(!manager.paths.pending.exists());
+        assert_eq!(manager.paths.active_slot(), None);
+    }
+
+    #[test]
+    fn supervisor_never_boots_a_quarantined_candidate() {
+        let manager = manager("supervisor-quarantine");
+        ensure_supervisor(&manager.paths).unwrap();
+        let marker = manager.paths.root.join("started");
+        let broken_bytes = test_agent("2.4.0-beta.7", false, "broken");
+        let broken = release_for_binary(Channel::Beta, "2.4.0-beta.7", &broken_bytes);
+        write_release_agent(&manager.paths, Slot::A, &broken, &broken_bytes);
+        let blocked_bytes = test_agent("2.4.0-beta.8", true, "blocked");
+        let blocked = release_for_binary(Channel::Beta, "2.4.0-beta.8", &blocked_bytes);
+        write_release_agent(&manager.paths, Slot::B, &blocked, &blocked_bytes);
+        storage::write_json(&manager.paths.blocked, &vec![blocked.version.clone()]).unwrap();
+        let stable_bytes = test_agent("2.3.0", true, "stable");
+        let stable = release_for_binary(Channel::Stable, "2.3.0", &stable_bytes);
+        fs::write(manager.paths.stable_binary(), &stable_bytes).unwrap();
+        fs::set_permissions(
+            manager.paths.stable_binary(),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        storage::write_json(&manager.paths.stable_meta(), &stable).unwrap();
+        manager.paths.write_active(Slot::A).unwrap();
+
+        let status = Command::new("sh")
+            .arg(&manager.paths.supervisor)
+            .env("ZTE_OTA_ROOT", &manager.paths.root)
+            .env("ZTE_OTA_LEGACY_LINK", &manager.paths.legacy_link)
+            .env("ZTE_TEST_MARKER", &marker)
+            .status()
+            .unwrap();
+
+        assert!(status.success());
+        assert_eq!(fs::read_to_string(marker).unwrap(), "stable");
+        assert_eq!(manager.paths.active_slot(), None);
+    }
+
+    #[test]
+    fn failed_candidate_recovery_uses_only_a_verified_stable_rescue() {
+        let manager = manager("helper-stable-rescue");
+        let previous_bytes = test_agent(crate::build_info::VERSION, false, "previous");
+        let previous =
+            release_for_binary(Channel::Stable, crate::build_info::VERSION, &previous_bytes);
+        write_release_agent(&manager.paths, Slot::B, &previous, &previous_bytes);
+        let stable_bytes = test_agent("2.3.0", true, "stable");
+        let stable = release_for_binary(Channel::Stable, "2.3.0", &stable_bytes);
+        fs::write(manager.paths.stable_binary(), &stable_bytes).unwrap();
+        fs::set_permissions(
+            manager.paths.stable_binary(),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        storage::write_json(&manager.paths.stable_meta(), &stable).unwrap();
+
+        assert_eq!(recover(&manager.paths, Slot::B, None), 6);
+        assert_eq!(manager.paths.active_slot(), None);
+        assert_eq!(
+            fs::read_link(&manager.paths.legacy_link).unwrap(),
+            manager.paths.stable_binary()
+        );
     }
 }

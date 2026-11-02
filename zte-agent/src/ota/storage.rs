@@ -45,6 +45,7 @@ pub struct Paths {
     pub state: PathBuf,
     pub active: PathBuf,
     pub pending: PathBuf,
+    pub helper_ready: PathBuf,
     pub blocked: PathBuf,
     pub update_log: PathBuf,
     pub supervisor: PathBuf,
@@ -72,6 +73,7 @@ impl Paths {
             state: root.join("state.json"),
             active: root.join("active"),
             pending: root.join("pending"),
+            helper_ready: root.join("helper-ready"),
             blocked: root.join("blocked.json"),
             update_log: root.join("update.log"),
             root,
@@ -96,6 +98,18 @@ impl Paths {
         self.slot_dir(slot).join("release.json")
     }
 
+    pub fn slot_meta_download(&self, slot: Slot) -> PathBuf {
+        self.slot_dir(slot).join("release.json.download")
+    }
+
+    pub fn slot_bootstrap_digest(&self, slot: Slot) -> PathBuf {
+        self.slot_dir(slot).join("bootstrap.sha256")
+    }
+
+    pub fn clear_slot_bootstrap_digest(&self, slot: Slot) -> io::Result<()> {
+        remove_if_present(&self.slot_bootstrap_digest(slot))
+    }
+
     pub fn stable_dir(&self) -> PathBuf {
         self.root.join("last-stable")
     }
@@ -112,7 +126,13 @@ impl Paths {
         create_private_dir(&self.root)?;
         create_private_dir(&self.slot_dir(Slot::A))?;
         create_private_dir(&self.slot_dir(Slot::B))?;
-        create_private_dir(&self.stable_dir())
+        create_private_dir(&self.stable_dir())?;
+        for slot in [Slot::A, Slot::B] {
+            remove_if_present(&self.slot_download(slot))?;
+            remove_if_present(&self.slot_meta_download(slot))?;
+        }
+        remove_if_present(&self.helper_ready)?;
+        Ok(())
     }
 
     pub fn active_slot(&self) -> Option<Slot> {
@@ -140,6 +160,10 @@ impl Paths {
         )
     }
 
+    pub fn write_rescue(&self) -> io::Result<()> {
+        atomic_write(&self.active, b"rescue\n", 0o600)
+    }
+
     pub fn write_pending(&self, candidate: Slot, previous: Slot, version: &str) -> io::Result<()> {
         if version.contains(['\n', '\r']) {
             return Err(io::Error::new(
@@ -162,13 +186,29 @@ impl Paths {
         }
     }
 
+    pub fn write_helper_ready(&self) -> io::Result<()> {
+        atomic_write(&self.helper_ready, b"ready\n", 0o600)
+    }
+
+    pub fn clear_helper_ready(&self) -> io::Result<()> {
+        match fs::remove_file(&self.helper_ready) {
+            Ok(()) => sync_parent(&self.helper_ready),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
     pub fn point_legacy_link(&self, slot: Slot) -> io::Result<()> {
+        self.point_legacy_path(&self.slot_binary(slot))
+    }
+
+    pub fn point_legacy_path(&self, binary: &Path) -> io::Result<()> {
         let parent = self.legacy_link.parent().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "legacy path has no parent")
         })?;
         let tmp = parent.join(".zte-agent.ota-link");
         let _ = fs::remove_file(&tmp);
-        symlink(self.slot_binary(slot), &tmp)?;
+        symlink(binary, &tmp)?;
         fs::rename(&tmp, &self.legacy_link)?;
         File::open(parent)?.sync_all()
     }
@@ -239,6 +279,28 @@ pub fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
     File::open(parent)?.sync_all()
 }
 
+/// Atomically replace a file without changing the permissions of its parent.
+/// OTA state lives in private directories, while the supervisor lives in
+/// `/data/local/tmp`, whose shared directory mode must remain untouched.
+pub fn atomic_write_preserving_parent(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no parent"))?;
+    fs::create_dir_all(parent)?;
+    let tmp = temporary_path(path);
+    remove_if_present(&tmp)?;
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(mode)
+        .open(&tmp)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(&tmp, path)?;
+    File::open(parent)?.sync_all()
+}
+
 pub fn sync_parent(path: &Path) -> io::Result<()> {
     let parent = path
         .parent()
@@ -265,6 +327,14 @@ pub fn available_bytes(path: &Path) -> io::Result<u64> {
 fn create_private_dir(path: &Path) -> io::Result<()> {
     fs::create_dir_all(path)?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+}
+
+fn remove_if_present(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 fn temporary_path(path: &Path) -> PathBuf {
@@ -336,5 +406,53 @@ mod tests {
         )
         .unwrap();
         assert!(paths.rollback_available());
+    }
+
+    #[test]
+    fn prepare_removes_abandoned_downloads_without_touching_slots() {
+        let paths = paths("download-cleanup");
+        paths.prepare().unwrap();
+        fs::write(paths.slot_binary(Slot::A), b"active").unwrap();
+        fs::write(paths.slot_download(Slot::A), b"partial binary").unwrap();
+        fs::write(paths.slot_meta_download(Slot::A), b"partial metadata").unwrap();
+        fs::write(&paths.helper_ready, b"stale").unwrap();
+
+        paths.prepare().unwrap();
+
+        assert_eq!(fs::read(paths.slot_binary(Slot::A)).unwrap(), b"active");
+        assert!(!paths.slot_download(Slot::A).exists());
+        assert!(!paths.slot_meta_download(Slot::A).exists());
+        assert!(!paths.helper_ready.exists());
+    }
+
+    #[test]
+    fn supervisor_write_preserves_shared_parent_permissions() {
+        let paths = paths("supervisor-parent");
+        paths.prepare().unwrap();
+        let shared = paths.root.join("shared");
+        fs::create_dir(&shared).unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o755)).unwrap();
+        let supervisor = shared.join("supervisor.sh");
+
+        atomic_write_preserving_parent(&supervisor, b"#!/bin/sh\n", 0o755).unwrap();
+
+        assert_eq!(
+            fs::metadata(&shared).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert!(executable(&supervisor));
+    }
+
+    #[test]
+    fn native_release_retires_only_its_bootstrap_digest() {
+        let paths = paths("bootstrap-digest");
+        paths.prepare().unwrap();
+        fs::write(paths.slot_bootstrap_digest(Slot::A), b"a").unwrap();
+        fs::write(paths.slot_bootstrap_digest(Slot::B), b"b").unwrap();
+
+        paths.clear_slot_bootstrap_digest(Slot::A).unwrap();
+
+        assert!(!paths.slot_bootstrap_digest(Slot::A).exists());
+        assert!(paths.slot_bootstrap_digest(Slot::B).exists());
     }
 }
