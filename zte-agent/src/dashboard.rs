@@ -81,7 +81,7 @@ const EXTRA_READINGS: &[(&str, u64, usize)] = &[
     ("esim_status", 0, ESIM_TOPIC),
     ("battery_details", 5, 9),
     ("https_status", 5, 10),
-    ("ota_status", 0, OTA_TOPIC),
+    ("ota_status", 5, OTA_TOPIC),
 ];
 
 #[derive(Clone, Copy, Default)]
