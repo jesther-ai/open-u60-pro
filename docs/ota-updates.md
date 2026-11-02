@@ -32,9 +32,15 @@ ZTE_AGENT_DOWNLOAD_URL=https://github.com/jesther-ai/open-u60-pro/releases/downl
 
 ## Release lanes
 
-- `vMAJOR.MINOR.PATCH` publishes a Stable release.
-- `vMAJOR.MINOR.PATCH-beta.N` publishes a Beta prerelease without replacing
-  GitHub's latest Stable release.
+- `main` is the production branch. A `vMAJOR.MINOR.PATCH` Stable tag is
+  accepted only when it points at the exact current `main` head.
+- `beta` is the permanent pre-release branch. Feature changes should reach it
+  first, and a `vMAJOR.MINOR.PATCH-beta.N` tag is accepted only when it points
+  at the exact current `beta` head. Beta releases never replace GitHub's latest
+  Stable release.
+- Promote a tested release through a `beta` → `main` pull request. After the
+  promotion merge and Stable release, bring `main` back into `beta` before the
+  next development cycle so both lanes share the production fixes.
 - `v2.4.0-beta.1` is the minimum updater version so the first manually
   bootstrapped Beta build can receive later Beta and Stable releases.
 - Beta devices consider both lanes and choose the newer version. Returning to
