@@ -2377,7 +2377,7 @@ dialog .button {
 .update-current>span,.update-progress span { display:block; color:var(--muted); font:8px var(--mono); letter-spacing:.11em; }
 .update-current strong { display:block; margin:8px 0 5px; color:var(--selected-ink); font-size:24px; overflow-wrap:anywhere; }
 .update-current small { display:block; color:var(--muted); font-size:8px; line-height:1.5; overflow-wrap:anywhere; }
-.update-state-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); margin:24px 0; border:1px solid var(--line); }
+.update-state-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); margin:24px 0; border:1px solid var(--line); }
 .update-state-grid article { min-width:0; padding:18px; }
 .update-state-grid article+article { border-left:1px solid var(--line); }
 .update-state-grid strong { display:block; margin:8px 0 5px; font-size:13px; overflow-wrap:anywhere; }

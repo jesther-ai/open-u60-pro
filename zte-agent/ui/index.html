@@ -66,6 +66,7 @@
       <div class="update-state-grid">
         <article><span class="eyebrow">RELEASE CHANNEL</span><strong id="update-channel-state">Stable</strong><small id="update-check-time">Not checked yet</small></article>
         <article><span class="eyebrow">UPDATE STATE</span><strong id="update-phase">Waiting</strong><small id="update-state-detail">Connect to read update status.</small></article>
+        <article><span class="eyebrow">INSTALL READINESS</span><strong id="update-ready">Checking</strong><small id="update-ready-detail">Battery, signal and WAN are checked before installation.</small></article>
         <article><span class="eyebrow">ROLLBACK GUARD</span><strong id="update-guard">Checking</strong><small id="update-slot">No active slot reported</small></article>
       </div>
       <div class="update-progress" id="update-progress" hidden><div><span>DOWNLOAD VERIFICATION</span><strong><span id="update-percent">0</span>%</strong></div><div class="update-progress-track"><i id="update-progress-bar"></i></div><small id="update-bytes">Preparing download…</small></div>
@@ -80,7 +81,7 @@
       <div class="update-release" id="update-release" hidden><div><span class="eyebrow">AVAILABLE RELEASE</span><h3 id="update-available-version">—</h3><p id="update-release-copy">A signed release is available.</p></div><a class="button" id="update-notes" target="_blank" rel="noopener noreferrer">Release notes ↗</a></div>
       <div class="form-actions update-actions"><button class="button primary" type="button" id="update-download" disabled>Download &amp; verify</button><button class="button primary" type="button" id="update-install" disabled>Install &amp; restart agent</button><button class="button" type="button" id="update-rollback" disabled>Return to previous agent</button></div>
       <p class="action-status" id="update-feedback" role="status" aria-live="polite">Waiting for live update status.</p>
-      <p class="panel-note">Only the agent restarts; Wi-Fi and the cellular modem stay up. Automatic installation is intentionally unavailable until the recovery path is validated on physical U60 hardware.</p>
+      <p class="panel-note">Only the agent restarts; Wi-Fi and the cellular modem stay up. Installation waits for safe battery, cellular signal and WAN conditions. Manual rollback remains available during a carrier outage.</p>
     </section>
     <section class="panel about-panel" data-views="settings/about"><span class="eyebrow">OPENU60 · LOCAL ROUTER CONSOLE</span><h2>Your network, in view.</h2><p>OpenU60 connects directly to the Rust agent on your ZTE U60 Pro. Connection, signal and device readings arrive over a live event stream.</p><p>The console runs from the router, without external fonts, scripts or a cloud account.</p><a class="button" href="https://github.com/jesther-ai/open-u60-pro" target="_blank" rel="noopener noreferrer">Project &amp; source ↗</a><a class="button" href="#settings/https">HTTPS &amp; install on your devices →</a><p class="table-note">Independent community software. Not affiliated with or endorsed by ZTE.</p></section>
     <footer><span>OpenU60 <span class="footer-divider">/</span> Local router console</span><span id="updated">No live data yet</span></footer>

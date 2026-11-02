@@ -10,7 +10,7 @@ pub(crate) fn read(state: &AppState, name: &str) -> Value {
     match name {
         "client_details" => state.client_details.snapshot(),
         "https_status" => state.tls.status_json().1,
-        "ota_status" => state.ota.status(),
+        "ota_status" => crate::ota::dashboard_status(state),
         "battery_details" => crate::battery_details::snapshot(state),
         "esim_status" => esim::dashboard_status(state),
         "operators" => json!({"ok":true,"data":{

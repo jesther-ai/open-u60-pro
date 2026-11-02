@@ -15,6 +15,7 @@
     return `${(n / ({MB:1048576,KB:1024,B:1}[unit])).toFixed(unit === 'B' ? 0 : 1)} ${unit}`;
   };
   const title = value => String(value || 'idle').replaceAll('_',' ').replace(/^./,letter=>letter.toUpperCase());
+  const numeric = value => value !== null && value !== undefined && Number.isFinite(Number(value));
   const currentSettings = () => JSON.stringify({channel:channel.value,automatic_checks:autoCheck.checked,automatic_downloads:autoDownload.checked});
   function setBusy(value) {
     busy = value; form.inert = value; check.disabled = value;
@@ -29,6 +30,12 @@
     $('update-channel-state').textContent = status.channel === 'beta' ? 'Beta' : 'Stable';
     $('update-check-time').textContent = status.last_check ? `Last checked ${new Date(status.last_check * 1000).toLocaleString()}` : 'Not checked yet';
     $('update-phase').textContent = status.trial_in_progress ? 'Health trial' : title(status.phase);
+    const readiness = status.install_readiness || {};
+    $('update-ready').textContent = readiness.ready ? 'Ready' : 'Waiting';
+    const battery = numeric(readiness.battery_percent) ? `${readiness.battery_percent}%${readiness.external_power ? ' · charging' : ''}` : 'battery unavailable';
+    const signalValue = numeric(readiness.signal_bars) && readiness.signal_bars > 0 ? ` · ${readiness.signal_bars} bar${readiness.signal_bars === 1 ? '' : 's'}` : numeric(readiness.signal_dbm) ? ` · ${readiness.signal_dbm} dBm` : '';
+    const signal = readiness.network_type ? `${readiness.network_type}${signalValue}` : 'cellular unavailable';
+    $('update-ready-detail').textContent = readiness.reason || `${battery} · ${signal} · WAN online`;
     $('update-guard').textContent = status.bootstrap_ready ? 'A/B recovery ready' : 'Bootstrap required';
     $('update-slot').textContent = status.active_slot ? `Active slot ${status.active_slot.toUpperCase()} · agent-only restart` : 'Install once over SSH to enable OTA';
     const release = status.available, staged = status.staged;
@@ -55,7 +62,7 @@
     save.disabled = busy || currentSettings() === baseline;
     check.disabled = busy || !status.signing_configured;
     download.disabled = busy || !release || staged?.version === release.version;
-    install.disabled = busy || !staged || !status.bootstrap_ready || status.trial_in_progress;
+    install.disabled = busy || !staged || !status.bootstrap_ready || status.trial_in_progress || readiness.ready !== true;
     rollback.disabled = busy || !status.bootstrap_ready || !status.rollback_available || status.trial_in_progress;
   }
   form.addEventListener('input',()=>{ save.disabled = busy || currentSettings() === baseline; });

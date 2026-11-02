@@ -5,6 +5,7 @@
 //! supervisor until a short local health trial succeeds.
 
 pub mod manifest;
+mod readiness;
 pub mod storage;
 
 use std::fs::{self, OpenOptions};
@@ -1212,7 +1213,11 @@ pub fn unix_now() -> u64 {
 }
 
 pub fn status_api(state: &crate::handlers::AppState) -> (u16, Value) {
-    (200, state.ota.status())
+    (200, status_with_readiness(state, readiness::STATUS_MAX_AGE))
+}
+
+pub(crate) fn dashboard_status(state: &crate::handlers::AppState) -> Value {
+    status_with_readiness(state, readiness::STATUS_MAX_AGE)
 }
 
 pub fn settings_api(state: &crate::handlers::AppState, body: &[u8]) -> (u16, Value) {
@@ -1234,10 +1239,17 @@ pub fn install_api(state: &crate::handlers::AppState, body: &[u8]) -> (u16, Valu
             json!({"ok":false,"error":"explicit confirmation required"}),
         );
     }
-    if let Some(reason) = install_busy_reason(state) {
+    if let Some(reason) = restart_busy_reason(state) {
         return (
             409,
             json!({"ok":false,"error":format!("update deferred during {reason}")}),
+        );
+    }
+    let readiness = readiness::read(state, Duration::ZERO);
+    if let Some(reason) = readiness.blocking_reason().map(str::to_owned) {
+        return (
+            409,
+            json!({"ok":false,"error":format!("update deferred: {reason}"),"data":{"install_readiness":readiness}}),
         );
     }
     mutate(state, || state.ota.install())
@@ -1250,7 +1262,7 @@ pub fn rollback_api(state: &crate::handlers::AppState, body: &[u8]) -> (u16, Val
             json!({"ok":false,"error":"explicit confirmation required"}),
         );
     }
-    if let Some(reason) = install_busy_reason(state) {
+    if let Some(reason) = restart_busy_reason(state) {
         return (
             409,
             json!({"ok":false,"error":format!("rollback deferred during {reason}")}),
@@ -1267,12 +1279,23 @@ fn mutate(
         return (403, json!({"ok":false,"error":"agent password required"}));
     }
     match action() {
-        Ok(()) => (200, state.ota.status()),
+        Ok(()) => (200, status_with_readiness(state, readiness::STATUS_MAX_AGE)),
         Err(error) => (
             503,
-            json!({"ok":false,"error":error,"data":state.ota.status()["data"].clone()}),
+            json!({"ok":false,"error":error,"data":status_with_readiness(state, readiness::STATUS_MAX_AGE)["data"].clone()}),
         ),
     }
+}
+
+fn status_with_readiness(state: &crate::handlers::AppState, max_age: Duration) -> Value {
+    let mut status = state.ota.status();
+    if let Some(data) = status["data"].as_object_mut() {
+        data.insert(
+            "install_readiness".into(),
+            json!(readiness::read(state, max_age)),
+        );
+    }
+    status
 }
 
 fn confirmed(body: &[u8]) -> bool {
@@ -1281,7 +1304,7 @@ fn confirmed(body: &[u8]) -> bool {
         .is_some_and(|value| value["confirm"] == true)
 }
 
-fn install_busy_reason(state: &crate::handlers::AppState) -> Option<&'static str> {
+fn restart_busy_reason(state: &crate::handlers::AppState) -> Option<&'static str> {
     use std::sync::atomic::Ordering;
     if state.speedtest.is_running() {
         return Some("a speed test");
