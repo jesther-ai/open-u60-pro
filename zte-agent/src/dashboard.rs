@@ -59,9 +59,11 @@ const TOPICS: &[&str] = &[
     "power",
     "https",
     "dns",
+    "ota",
 ];
 const ESIM_TOPIC: usize = 8;
-const DNS_TOPIC: usize = TOPICS.len() - 1;
+const DNS_TOPIC: usize = TOPICS.len() - 2;
+const OTA_TOPIC: usize = TOPICS.len() - 1;
 const EXTRA_READINGS: &[(&str, u64, usize)] = &[
     ("operators", 2, 0),
     ("forwarding", 2, 1),
@@ -79,6 +81,7 @@ const EXTRA_READINGS: &[(&str, u64, usize)] = &[
     ("esim_status", 0, ESIM_TOPIC),
     ("battery_details", 5, 9),
     ("https_status", 5, 10),
+    ("ota_status", 0, OTA_TOPIC),
 ];
 
 #[derive(Clone, Copy, Default)]

@@ -11,6 +11,7 @@
 use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use flate2::write::ZlibEncoder;
 use flate2::{Compression, Crc, GzBuilder};
@@ -47,8 +48,45 @@ struct Built {
 }
 
 fn main() {
+    for name in [
+        "ZTE_AGENT_VERSION",
+        "ZTE_AGENT_COMMIT",
+        "ZTE_AGENT_TARGET",
+        "ZTE_OTA_PUBLIC_KEY_PEM",
+    ] {
+        println!("cargo:rerun-if-env-changed={name}");
+    }
+    let version = std::env::var("ZTE_AGENT_VERSION")
+        .unwrap_or_else(|_| std::env::var("CARGO_PKG_VERSION").expect("CARGO_PKG_VERSION"));
+    let commit = std::env::var("ZTE_AGENT_COMMIT").unwrap_or_else(|_| {
+        Command::new("git")
+            .args(["rev-parse", "--short=12", "HEAD"])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "development".into())
+    });
+    let target = std::env::var("ZTE_AGENT_TARGET")
+        .or_else(|_| std::env::var("TARGET"))
+        .unwrap_or_else(|_| "unknown".into());
+    println!("cargo:rustc-env=ZTE_AGENT_BUILD_VERSION={version}");
+    println!("cargo:rustc-env=ZTE_AGENT_BUILD_COMMIT={commit}");
+    println!("cargo:rustc-env=ZTE_AGENT_BUILD_TARGET={target}");
     let dir = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let out = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));
+    // The release workflow injects the public half of the offline OTA signing
+    // key.  Keeping it in a generated file supports multi-line PEM without
+    // leaking it through a rustc environment directive.  Development builds
+    // deliberately contain an empty file and expose OTA as unavailable.
+    write(
+        &out.join("ota-public-key.pem"),
+        std::env::var("ZTE_OTA_PUBLIC_KEY_PEM")
+            .unwrap_or_default()
+            .as_bytes(),
+    );
     for f in ["build.rs", CSS, DATASTAR, THEME_JS] {
         println!("cargo:rerun-if-changed={f}");
     }

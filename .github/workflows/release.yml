@@ -12,6 +12,8 @@ on:
       - 'Cargo.lock'
       - 'zte-agent/**'
       - 'euicc/**'
+      - 'scripts/release/**'
+      - 'scripts/router/**'
 
 permissions:
   contents: write
@@ -32,13 +34,45 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu musl-tools
 
+      - name: Prepare signed-release identity
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          OTA_SIGNING_KEY_PEM: ${{ secrets.OTA_SIGNING_KEY_PEM }}
+        run: |
+          test -n "$OTA_SIGNING_KEY_PEM" || { echo 'OTA_SIGNING_KEY_PEM is required for release tags' >&2; exit 1; }
+          VERSION="${GITHUB_REF_NAME#v}"
+          test "v$VERSION" = "$GITHUB_REF_NAME"
+          if [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            CHANNEL=stable
+          elif [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+-beta\.[0-9]+$ ]]; then
+            CHANNEL=beta
+          else
+            echo 'Tags must be vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-beta.N' >&2
+            exit 1
+          fi
+          printf '%s' "$OTA_SIGNING_KEY_PEM" > ota-private.pem
+          chmod 600 ota-private.pem
+          openssl ec -in ota-private.pem -check -noout
+          openssl ec -in ota-private.pem -pubout -out ota-public.pem
+          openssl ec -pubin -in ota-public.pem -text -noout > ota-key-info.txt
+          grep -q 'ASN1 OID: prime256v1' ota-key-info.txt
+          rm -f ota-key-info.txt
+          printf 'OTA_VERSION=%s\nOTA_CHANNEL=%s\n' "$VERSION" "$CHANNEL" >> "$GITHUB_ENV"
+
       - name: Build zte-agent
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
           # ring (TLS for operator servers and Apple push) compiles C and assembly for the target.
           CC_aarch64_unknown_linux_musl: aarch64-linux-gnu-gcc
           AR_aarch64_unknown_linux_musl: aarch64-linux-gnu-ar
-        run: cargo build --release --target aarch64-unknown-linux-musl -p zte-agent
+        run: |
+          if [ -n "${OTA_VERSION:-}" ]; then
+            export ZTE_AGENT_VERSION="$OTA_VERSION"
+            export ZTE_AGENT_COMMIT="${GITHUB_SHA}"
+            export ZTE_AGENT_TARGET=aarch64-unknown-linux-musl
+            export ZTE_OTA_PUBLIC_KEY_PEM="$(cat ota-public.pem)"
+          fi
+          cargo build --locked --release --target aarch64-unknown-linux-musl -p zte-agent
 
       # The binary links the LGPL-2.1 euicc crate: its notice and license travel with it.
       - name: Collect release files
@@ -48,12 +82,43 @@ jobs:
           cp THIRD_PARTY_NOTICES.md dist/
           cp euicc/LICENSE dist/LICENSE-LGPL-2.1.txt
           cp LICENSE dist/LICENSE-MIT.txt
+          (cd dist && sha256sum zte-agent THIRD_PARTY_NOTICES.md LICENSE-LGPL-2.1.txt LICENSE-MIT.txt > SHA256SUMS)
+
+      - name: Sign OTA channel envelope
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          chmod +x scripts/release/make-ota-manifest.sh
+          scripts/release/make-ota-manifest.sh \
+            dist/zte-agent "$OTA_VERSION" "$GITHUB_SHA" "$OTA_CHANNEL" \
+            ota-private.pem "dist/$OTA_CHANNEL.json"
+          rm -f ota-private.pem ota-public.pem
 
       - name: Upload binary to release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*
+          prerelease: ${{ contains(github.ref_name, '-beta.') }}
+          make_latest: ${{ contains(github.ref_name, '-beta.') && 'false' || 'true' }}
+
+      - name: Publish signed channel pointer
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git fetch origin ota-channels:refs/remotes/origin/ota-channels || true
+          rm -rf /tmp/open-u60-ota-channels
+          if git show-ref --verify --quiet refs/remotes/origin/ota-channels; then
+            git worktree add -B ota-channels /tmp/open-u60-ota-channels refs/remotes/origin/ota-channels
+          else
+            git worktree add --detach /tmp/open-u60-ota-channels
+            git -C /tmp/open-u60-ota-channels switch --orphan ota-channels
+            git -C /tmp/open-u60-ota-channels rm -rf . || true
+          fi
+          cp "dist/$OTA_CHANNEL.json" "/tmp/open-u60-ota-channels/$OTA_CHANNEL.json"
+          git -C /tmp/open-u60-ota-channels add "$OTA_CHANNEL.json"
+          git -C /tmp/open-u60-ota-channels commit -m "release: point $OTA_CHANNEL to v$OTA_VERSION"
+          git -C /tmp/open-u60-ota-channels push origin HEAD:ota-channels
 
       - name: Keep the build for review
         if: "!startsWith(github.ref, 'refs/tags/')"

@@ -30,6 +30,7 @@ pub struct AppState {
     pub tailscale: Arc<crate::tailscale::TailscaleManager>,
     pub ttl: Arc<crate::ttl::TtlManager>,
     pub wireguard: Arc<crate::wireguard::WireGuardManager>,
+    pub ota: Arc<crate::ota::OtaManager>,
     /// Single-flight TTL cache in front of the `ubus` CLI (see cache.rs).
     pub cache: Arc<UbusCache>,
     pub oos_policy: Arc<crate::oos_policy::OosPolicy>,
@@ -50,9 +51,11 @@ pub struct AppState {
 impl AppState {
     pub fn new() -> Self {
         let live_activity = Arc::new(crate::live_activity::LiveActivity::new());
+        let dashboard = Arc::new(crate::dashboard::Dashboard::default());
+        let ota = crate::ota::OtaManager::system(Arc::downgrade(&dashboard));
         Self {
             client_details: crate::client_details::ClientMonitor::default(),
-            dashboard: Arc::new(crate::dashboard::Dashboard::default()),
+            dashboard,
             tls: Arc::new(crate::tls::Tls::router(Arc::clone(&live_activity))),
             live_activity,
             auth: Arc::new(AuthState::new()),
@@ -70,6 +73,7 @@ impl AppState {
             tailscale: Arc::new(crate::tailscale::TailscaleManager::new()),
             ttl: Arc::new(crate::ttl::TtlManager::new()),
             wireguard: Arc::new(crate::wireguard::WireGuardManager::new()),
+            ota,
             cache: Arc::new(UbusCache::new()),
             oos_policy: Arc::new(crate::oos_policy::OosPolicy::new()),
             conn_watchdog: Arc::new(crate::conn_watchdog::ConnWatchdog::new()),

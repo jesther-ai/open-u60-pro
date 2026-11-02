@@ -55,6 +55,8 @@ png = "0.18"
 # Web UI, Add eSIM's photo upload: the multipart delimiter search (`web::upload`;
 # already linked via serde_json, same features).
 memchr = "2"
+semver = "1"
+thiserror = "2"
 
 [build-dependencies]
 # build.rs: asset hashing, gzip and icon PNGs (host-only; both already in Cargo.lock).
