@@ -367,7 +367,7 @@
   }
   function streamOptions() {
     const {group,key} = OpenU60Navigation.current;
-    const topic = {'settings/https':'https','network/esim':'esim','network/clients':'clients','network/dns-cache':'dns','network/lan':'routing','network/firewall':'routing','network/ports':'routing','network/qos':'routing','network/operators':'operators','sms/forwarding':'forwarding','tools/battery':'power','tools/diagnostics':'health','tools/radio':'radio','tools/speedtest':'speedtest','tools/terminal':'terminal'}[key];
+    const topic = {'dashboard/overview':'esim','settings/https':'https','network/esim':'esim','network/clients':'clients','network/dns-cache':'dns','network/lan':'routing','network/firewall':'routing','network/ports':'routing','network/qos':'routing','network/operators':'operators','sms/forwarding':'forwarding','tools/battery':'power','tools/diagnostics':'health','tools/radio':'radio','tools/speedtest':'speedtest','tools/terminal':'terminal'}[key];
     const query = [...(group === 'sms' ? ['sms=1'] : []),...(topic ? [`topics=${topic}`] : [])].join('&');
     return {includeSms:group === 'sms',key:query ? `?${query}` : '',topic};
   }

@@ -16,7 +16,7 @@ pub mod sse;
 pub mod stream;
 pub mod watched;
 
-use std::sync::{Arc, OnceLock};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -211,9 +211,43 @@ pub(crate) fn object(pairs: &mut [(&str, Value)]) -> Value {
 }
 
 static HUB: OnceLock<Arc<Hub>> = OnceLock::new();
+static TOUCH_SUBSCRIBERS: OnceLock<Mutex<Vec<(TopicSet, mpsc::SyncSender<()>)>>> = OnceLock::new();
 
 fn install(h: Arc<Hub>) {
     let _ = HUB.set(h);
+}
+
+/// A bounded wake-up feed for local composites that depend on watched topics.
+/// Capacity one deliberately coalesces bursts: consumers always read the latest
+/// in-memory state after waking, so queueing every intermediate transition would
+/// only add work and memory.
+pub(crate) fn subscribe_touches(topics: &[Topic]) -> mpsc::Receiver<()> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let wanted = topics.iter().copied().collect();
+    TOUCH_SUBSCRIBERS
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push((wanted, sender));
+    receiver
+}
+
+fn notify_touch_subscribers(topic: Topic) {
+    let Some(subscribers) = TOUCH_SUBSCRIBERS.get() else {
+        return;
+    };
+    subscribers
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .retain(|(wanted, sender)| {
+            if !wanted.contains(topic) {
+                return true;
+            }
+            match sender.try_send(()) {
+                Ok(()) | Err(mpsc::TrySendError::Full(())) => true,
+                Err(mpsc::TrySendError::Disconnected(())) => false,
+            }
+        });
 }
 
 /// A watched value changed (see `watched.rs`): mark the topic stale, so it
@@ -224,6 +258,7 @@ pub fn touch(t: Topic) {
     if readers::in_hub_read() {
         return;
     }
+    notify_touch_subscribers(t);
     #[cfg(test)]
     {
         test_sink::record(t);
