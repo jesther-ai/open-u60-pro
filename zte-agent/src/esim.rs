@@ -1296,7 +1296,11 @@ fn read_data_connection() -> Option<Value> {
 }
 
 fn data_connected() -> bool {
-    read_data_connection().is_some_and(|data| crate::esim_network::bearer_connected(&data))
+    // Download and receipt delivery need a usable IP bearer, not the firmware's
+    // sometimes-stale `enable` preference. Keep the stricter enabled check in
+    // profile handover, where it prevents automatic recovery from overriding
+    // a deliberate mobile-data-off choice.
+    read_data_connection().is_some_and(|data| crate::esim_network::bearer_reported_connected(&data))
 }
 
 fn recovery_current(inner: &Arc<Inner>, generation: u64, revision: u64, target: &str) -> bool {
