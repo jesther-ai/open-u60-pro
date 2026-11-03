@@ -19,11 +19,11 @@
 
   async function api(path, options = {}) {
     const requestAuthEpoch = authEpoch;
-    const {timeoutMs = 8000, ...fetchOptions} = options;
+    const {timeoutMs = 8000, contentType = 'application/json', ...fetchOptions} = options;
     const response = await fetch(path, {
       ...fetchOptions, cache: 'no-store',
       signal: AbortSignal.timeout(Math.min(Math.max(timeoutMs,1000),600000)),
-      headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}), ...(options.body ? { 'Content-Type': 'application/json' } : {}) }
+      headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}), ...(options.body ? { 'Content-Type': contentType } : {}) }
     });
     if (response.status === 401) {
       const error = new Error('Enter your agent password to continue.');

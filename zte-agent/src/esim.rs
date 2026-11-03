@@ -40,6 +40,10 @@ use crate::esim_download::DownloadCtl;
 use crate::events::watched::Watched;
 use crate::events::Topic;
 use crate::handlers::AppState;
+#[cfg(not(test))]
+use crate::qr_decode;
+#[cfg(test)]
+use crate::web::qr_decode;
 
 /// Every card-only command observed on the router finished in under 4 s.
 const CARD_LIMIT: Duration = Duration::from_secs(30);
@@ -80,6 +84,10 @@ const RECEIPT_MAX_ATTEMPTS: u32 = 10;
 const RECEIPT_MAX_ROUNDS: u32 = 24;
 /// SGP.22 profileNickname is a UTF8String of at most 64 bytes.
 const NICKNAME_MAX_BYTES: usize = 64;
+/// Largest JPEG or PNG accepted by the responsive console's QR upload.
+pub const QR_IMAGE_MAX: usize = qr_decode::MAX_BYTES;
+/// A crafted finder-pattern image must not occupy the QR decoder indefinitely.
+const QR_DECODE_LIMIT: Duration = Duration::from_secs(15);
 /// Shared with `zte-agent esim-native` runs by hand.
 const DEFAULT_LOCK_PATH: &str = "/tmp/esim.lock";
 
@@ -1929,6 +1937,66 @@ fn check_activation_code(code: &str) -> Result<bool, &'static str> {
     Ok(parts.get(4) == Some(&"1"))
 }
 
+/// POST `/api/esim/qr` after the async listener has bounded and read the image.
+/// The decoder runs in its isolated child process; neither the image nor the
+/// activation code is stored or logged.
+pub fn decode_qr_image(state: &AppState, image: Vec<u8>) -> (u16, Value) {
+    crate::httpd::gate::debug_assert_may_block();
+    if !state.auth.has_password() {
+        return error(403, "agent password required");
+    }
+    let payloads = match qr_decode::codes(image, QR_DECODE_LIMIT) {
+        Ok(payloads) => payloads,
+        Err(qr_decode::Fail::NotImage) => {
+            return error(415, "choose a JPEG or PNG QR image")
+        }
+        Err(qr_decode::Fail::TooLarge) => {
+            return error(413, "the QR image is too large; choose a smaller image")
+        }
+        Err(qr_decode::Fail::Busy) => {
+            return error(503, "the router is already reading another QR image")
+        }
+        Err(qr_decode::Fail::TimedOut) => {
+            return error(504, "QR reading timed out; crop closer to the code and try again")
+        }
+        Err(qr_decode::Fail::Unreadable) => {
+            return error(422, "the QR image could not be read; choose a clearer image")
+        }
+    };
+    match activation_from_payloads(&payloads) {
+        Ok((activation_code, confirmation_code_required)) => (
+            200,
+            json!({
+                "ok": true,
+                "data": {
+                    "activation_code": activation_code,
+                    "confirmation_code_required": confirmation_code_required,
+                }
+            }),
+        ),
+        Err(message) => error(422, message),
+    }
+}
+
+fn activation_from_payloads(payloads: &[String]) -> Result<(String, bool), &'static str> {
+    let mut found = Vec::new();
+    for payload in payloads {
+        let code = payload.trim();
+        let Ok(needs_confirmation) = check_activation_code(code) else {
+            continue;
+        };
+        let normalized = format!("LPA:{}", &code[4..]);
+        if !found.iter().any(|(known, _)| known == &normalized) {
+            found.push((normalized, needs_confirmation));
+        }
+    }
+    match found.len() {
+        0 => Err("no eSIM activation code was found in this QR image"),
+        1 => Ok(found.pop().expect("one checked activation code")),
+        _ => Err("multiple eSIM activation codes were found; choose an image with one code"),
+    }
+}
+
 /// The card's form of an ICCID: digits only. The modem pads an odd-length ICCID with `F`, which
 /// is accepted and dropped (a 20-digit ICCID never has one).
 fn normalize_iccid(s: &str) -> Option<String> {
@@ -2217,6 +2285,43 @@ mod tests {
         assert!(check_activation_code("LPA:1$sm dp$ABC").is_err());
         assert!(check_activation_code("LPA:1$;reboot$ABC").is_err());
         assert!(check_activation_code("").is_err());
+    }
+
+    #[test]
+    fn qr_payloads_select_one_esim_code_without_exposing_other_codes() {
+        let payloads = vec![
+            "https://example.com/not-an-esim".to_string(),
+            "lpa:1$smdp.example.com$FAKE-123".to_string(),
+            "lpa:1$smdp.example.com$FAKE-123".to_string(),
+        ];
+        assert_eq!(
+            activation_from_payloads(&payloads),
+            Ok(("LPA:1$smdp.example.com$FAKE-123".to_string(), false))
+        );
+    }
+
+    #[test]
+    fn qr_payloads_report_missing_multiple_and_confirmation_codes() {
+        assert_eq!(
+            activation_from_payloads(&["WIFI:T:WPA;S:Router;P:secret;;".to_string()]),
+            Err("no eSIM activation code was found in this QR image")
+        );
+        assert_eq!(
+            activation_from_payloads(&[
+                "LPA:1$one.example$FAKE-1".to_string(),
+                "LPA:1$two.example$FAKE-2".to_string(),
+            ]),
+            Err("multiple eSIM activation codes were found; choose an image with one code")
+        );
+        assert_eq!(
+            activation_from_payloads(&[
+                "LPA:1$smdp.example.com$FAKE-3$1.3.6.1$1".to_string(),
+            ]),
+            Ok((
+                "LPA:1$smdp.example.com$FAKE-3$1.3.6.1$1".to_string(),
+                true,
+            ))
+        );
     }
 
     #[test]

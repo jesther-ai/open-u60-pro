@@ -28,6 +28,9 @@ use crate::handlers;
 use crate::lan_test;
 use crate::server::{self, Encoded, Method, Pre, PreEnv, ReqInfo, LOGIN_BODY_MAX};
 
+/// A phone can take more than the ordinary API body timeout to send an 8 MiB photo.
+const ESIM_QR_UPLOAD_WAIT: Duration = Duration::from_secs(120);
+
 /// Fallback handler for every path.
 pub async fn api_entry(State(ctx): State<Ctx>, req: Request) -> Response {
     let (parts, body) = req.into_parts();
@@ -86,6 +89,42 @@ pub async fn api_entry(State(ctx): State<Ctx>, req: Request) -> Response {
             }
             Err(_) => finish_early(headers, body.into_data_stream(), 0, busy()).await,
         },
+        Pre::EsimQr => {
+            let media_type = header(headers, "content-type")
+                .unwrap_or("")
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim();
+            if !matches!(media_type, "image/jpeg" | "image/png") {
+                return finish_early(
+                    headers,
+                    body.into_data_stream(),
+                    0,
+                    json_reply(415, &server::error_body("choose a JPEG or PNG QR image")),
+                )
+                .await;
+            }
+            let body = match read_capped(
+                headers,
+                body,
+                crate::esim::QR_IMAGE_MAX,
+                ESIM_QR_UPLOAD_WAIT,
+            )
+            .await
+            {
+                Ok(body) => body,
+                Err(e) => return read_failed(headers, e).await,
+            };
+            let app = Arc::clone(&ctx.app);
+            gated(
+                ctx.gate
+                    .run(Lane::Slow, move || {
+                        server::encode(crate::esim::decode_qr_image(&app, body))
+                    })
+                    .await,
+            )
+        }
         // A stream: no gate, nothing blocks.
         Pre::Events { owner } => {
             let resp = events(&ctx, owner, parts.uri.query());
@@ -603,6 +642,45 @@ mod tests {
         r.assert_json(413, err("body too large"));
         // Drained (small), so the connection may stay open.
         assert_eq!(r.header("connection"), None);
+    }
+
+    #[tokio::test]
+    async fn esim_qr_upload_is_authenticated_typed_bounded_and_decoded_off_lane() {
+        use crate::web::qr_decode::tests::{photo, png, CODE};
+
+        let c = ctx(Some(PW));
+        let auth = format!("Bearer {}", token(&c, 16));
+        let upload = |content_type: &str, body: Body| {
+            req("POST", "/api/esim/qr", peer(16, 1))
+                .header("authorization", &auth)
+                .header("content-type", content_type)
+                .body(body)
+                .unwrap()
+        };
+
+        send(&c, upload("application/octet-stream", Body::from("not an image")))
+            .await
+            .assert_json(415, err("choose a JPEG or PNG QR image"));
+
+        let too_large = req("POST", "/api/esim/qr", peer(16, 2))
+            .header("authorization", &auth)
+            .header("content-type", "image/png")
+            .header("content-length", (crate::esim::QR_IMAGE_MAX + 1).to_string())
+            .body(Body::empty())
+            .unwrap();
+        send(&c, too_large)
+            .await
+            .assert_json(413, err("body too large"));
+
+        let grey = photo(520, 520, CODE, 5.0, 0.0, false);
+        let image = png(&grey, 520, 520, false);
+        let response = send(&c, upload("image/png", Body::from(image))).await;
+        assert_eq!(response.status, 200);
+        assert_eq!(response.json()["data"]["activation_code"], CODE);
+        assert_eq!(
+            response.json()["data"]["confirmation_code_required"],
+            false
+        );
     }
 
     /// A body that never arrives, as hyper would hand it over.
