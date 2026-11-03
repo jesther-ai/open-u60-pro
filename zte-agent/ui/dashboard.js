@@ -1,7 +1,7 @@
 'use strict';
 (() => {
   const $ = id => document.getElementById(id);
-  const animated = new Set(['download','upload','battery','temperature','rsrp','sinr','rsrq','lte-count','nr-count','device-count','outage-count','received','sent','sms-count']);
+  const animated = new Set(['download','upload','battery','temperature','device-temperature','rsrp','sinr','rsrq','lte-count','nr-count','device-count','outage-count','received','sent','sms-count']);
   const text = (id,value) => { if (animated.has(id)) OpenU60Numbers.set($(id),value); else $(id).textContent = value ?? '—'; };
   const number = value => value !== null && value !== undefined && String(value).trim() !== '' && Number.isFinite(Number(value)) ? Number(value) : null;
   const sessionKey = 'openu60.session';
@@ -122,6 +122,11 @@
   function renderSignal(data) {
     const model = OpenU60Cellular.parse(data || {});
     text('operator', data?.network_provider ?? 'Operator unavailable'); text('network-type', data ? model.mode : '—');
+    const reportedBars = number(data?.signalbar), bars = reportedBars === null ? null : Math.max(0,Math.min(5,Math.trunc(reportedBars)));
+    const meter = $('operator-signal');
+    meter.dataset.available = String(bars !== null);
+    meter.setAttribute('aria-label',bars === null ? 'Cellular signal unavailable' : `Cellular signal ${bars} of 5 bars`);
+    [...meter.children].forEach((bar,index)=>{ bar.dataset.active = String(bars !== null && index < bars); });
     text('access-mode', data ? model.mode : '—'); text('mode-explanation', model.explanation || 'No serving signal reported by the modem.');
     text('lte-count', data ? model.lte.carriers.length : '—'); text('nr-count', data ? model.nr.carriers.length : '—');
     const primary = model.primary;
@@ -203,6 +208,10 @@
     $('battery-bar').style.width = `${capacity ?? 0}%`;
     const temperature = number(data?.temperature);
     text('temperature', temperature === null ? null : `${(temperature / 10).toFixed(1)} °C`);
+  }
+  function renderThermal(data) {
+    const temperature = number(data?.device_temp);
+    text('device-temperature',temperature === null ? null : `${temperature.toFixed(1)} °C`);
   }
   function renderWifi(data) {
     for (const band of ['2g', '5g']) {
@@ -302,7 +311,7 @@
     client_details: () => {}, battery_details: () => {}, https_status: () => {}, dns_cache: () => {}, ota_status: () => {},
     esim_status: () => {},
     lan_config: () => {}, firewall_config: () => {}, upnp_config: () => {}, port_rules: () => {}, qos_config: () => {},
-    operators: () => {}, forwarding: () => {}, resources: () => {}, neighbors: () => {}, sweep: () => {}, speedtest: () => {}, at_port: () => {}, guest: () => {}, mobile: () => {}, charging: () => {}, speed: renderSpeed, battery: renderBattery, wifi: renderWifi, clients: renderClients, modem: renderModem, sms: renderSMS, sms_capacity: renderSMSCapacity
+    operators: () => {}, forwarding: () => {}, resources: () => {}, neighbors: () => {}, sweep: () => {}, speedtest: () => {}, at_port: () => {}, guest: () => {}, mobile: () => {}, charging: () => {}, thermal: renderThermal, speed: renderSpeed, battery: renderBattery, wifi: renderWifi, clients: renderClients, modem: renderModem, sms: renderSMS, sms_capacity: renderSMSCapacity
   };
   function setStreamState(state, label) {
     $('stream-state').dataset.state = state;

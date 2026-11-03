@@ -36,6 +36,7 @@ const READINGS: &[(&str, u64)] = &[
     ("modem", 5),
     ("mobile", 5),
     ("charging", 10),
+    ("thermal", 10),
     // `get_wwandst` publishes a fresh one-second rate; sampling at the same
     // cadence avoids skipped peaks and keeps the animated values responsive.
     ("speed", 1),
@@ -532,6 +533,7 @@ fn read(state: &AppState, name: &str) -> Value {
         "modem" => handlers::modem_status(state),
         "mobile" => modem_ext::modem_data_get(state),
         "charging" => device_ext::charge_control_get(state),
+        "thermal" => device_ext::device_thermal(state),
         "speed" => speed_reading(state),
         "battery" => handlers::battery(state),
         "wifi" => wifi::wifi_status(state),

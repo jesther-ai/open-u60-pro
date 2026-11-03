@@ -216,7 +216,11 @@ impl OtaManager {
             "staged_slot":state.persistent.staged_slot,
             "last_check":state.persistent.last_check,
             "last_error":state.persistent.last_error,
-            "progress":{"received":state.bytes_received,"total":state.bytes_total},
+            "progress":{
+                "received":state.bytes_received,
+                "total":state.bytes_total,
+                "percent":progress_percent(state.bytes_received, state.bytes_total),
+            },
             "signing_configured":self.verifier.configured(),
             "bootstrap_ready":self.paths.bootstrap_ready(),
             "rollback_available":rollback_available,
@@ -415,7 +419,7 @@ impl OtaManager {
             manifest.size,
             &manifest.sha256,
             DOWNLOAD_TIMEOUT,
-            |received| self.change(|state| state.bytes_received = received),
+            |received| self.set_progress(received),
         )?;
         file.sync_all().map_err(|e| e.to_string())?;
         drop(file);
@@ -582,11 +586,28 @@ impl OtaManager {
         self.notify();
     }
 
+    /// Download byte counts are live-only state. Publishing them must not rewrite
+    /// the persistent OTA journal for every network chunk.
+    fn set_progress(&self, received: u64) {
+        {
+            let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            state.bytes_received = received.min(state.bytes_total);
+        }
+        self.notify();
+    }
+
     fn notify(&self) {
         if let Some(dashboard) = self.dashboard.upgrade() {
             dashboard.request_refresh();
         }
     }
+}
+
+fn progress_percent(received: u64, total: u64) -> u8 {
+    if total == 0 {
+        return 0;
+    }
+    ((u128::from(received.min(total)) * 100) / u128::from(total)) as u8
 }
 
 struct RemoveFilesOnDrop([PathBuf; 2]);
@@ -1335,6 +1356,16 @@ fn restart_busy_reason(state: &crate::handlers::AppState) -> Option<&'static str
 mod tests {
     use super::*;
     use p256::ecdsa::SigningKey;
+
+    #[test]
+    fn progress_percentage_is_exact_bounded_and_never_rounds_up() {
+        assert_eq!(progress_percent(0, 0), 0);
+        assert_eq!(progress_percent(0, 1000), 0);
+        assert_eq!(progress_percent(999, 1000), 99);
+        assert_eq!(progress_percent(1000, 1000), 100);
+        assert_eq!(progress_percent(1001, 1000), 100);
+        assert_eq!(progress_percent(u64::MAX - 1, u64::MAX), 99);
+    }
 
     struct TimedOutReader;
 
