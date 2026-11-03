@@ -92,13 +92,23 @@ impl Handover {
     }
 }
 
+/// The modem's bearer status says packets have an active IP path. Some U60
+/// firmware reports `enable: 0` even while this field, the assigned address
+/// and the kernel route are live, so callers that only need usable transport
+/// must not treat that preference flag as stronger evidence than this status.
+pub(crate) fn bearer_reported_connected(data: &Value) -> bool {
+    matches!(
+        data["connect_status"].as_str(),
+        Some("connected" | "ipv4_connected" | "ipv6_connected" | "ipv4_ipv6_connected")
+    )
+}
+
+/// Strict state for profile handover and automatic recovery. Here the user's
+/// enable preference matters in addition to the modem's bearer status.
 pub(crate) fn bearer_connected(data: &Value) -> bool {
     !matches!(integer(&data["enable"]), Some(0))
         && data["enable"] != false
-        && matches!(
-            data["connect_status"].as_str(),
-            Some("connected" | "ipv4_connected" | "ipv6_connected" | "ipv4_ipv6_connected")
-        )
+        && bearer_reported_connected(data)
 }
 
 fn sources(data: &Value) -> Vec<IpAddr> {
@@ -237,9 +247,15 @@ mod tests {
             assert!(!bearer_connected(
                 &json!({"enable":"0","connect_status":state})
             ));
+            assert!(bearer_reported_connected(
+                &json!({"enable":0,"connect_status":state})
+            ));
         }
         for state in ["disconnected", "not_connected", "connecting", "unknown"] {
             assert!(!bearer_connected(
+                &json!({"enable":1,"connect_status":state})
+            ));
+            assert!(!bearer_reported_connected(
                 &json!({"enable":1,"connect_status":state})
             ));
         }
