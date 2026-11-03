@@ -341,7 +341,7 @@ impl Dashboard {
                 };
                 if active && (pending || missing || refresh != version) {
                     let mut updates = Readings::new();
-                    updates.insert("esim_status".into(), crate::esim::dashboard_status(&app));
+                    updates.insert("esim_status".into(), esim_reading(&app));
                     feed.publish(updates);
                     pending = false;
                 }
@@ -487,6 +487,10 @@ fn dns_signature(reading: &Value) -> Value {
 
 fn is_sms(name: &str) -> bool {
     matches!(name, "sms" | "sms_capacity")
+}
+
+fn esim_reading(state: &AppState) -> Value {
+    crate::events::readers::without_touch_notifications(|| crate::esim::dashboard_status(state))
 }
 
 /// Prefer the firmware's traffic accounting: IPA offload can bypass the
@@ -703,6 +707,13 @@ pub fn response(app: Arc<AppState>, url: String, token: String) -> axum::respons
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn esim_dashboard_projection_does_not_wake_its_collector() {
+        crate::events::test_sink::take();
+        let _ = esim_reading(&AppState::new());
+        assert!(crate::events::test_sink::take().is_empty());
+    }
 
     #[test]
     fn speed_sampling_matches_the_modems_one_second_rate() {
