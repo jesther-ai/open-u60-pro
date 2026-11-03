@@ -453,6 +453,7 @@ pub fn route(method: &Method, path: &str, state: &AppState, body: &[u8]) -> (u16
         (&Method::Post, "/api/wifi-relay/connect") => crate::wifi_relay::change(state, "connect", body),
         (&Method::Post, "/api/wifi-relay/disconnect") => crate::wifi_relay::change(state, "disconnect", body),
         (&Method::Post, "/api/wifi-relay/clock") => crate::wifi_relay::change(state, "clock", body),
+        (&Method::Post, "/api/wifi-relay/tuning") => crate::wifi_relay::change(state, "tuning", body),
         (&Method::Post, "/api/wifi-relay/forget") => crate::wifi_relay::change(state, "forget", body),
         (&Method::Get, "/api/tailscale/status") => tailscale::status(state),
         // LAN HTTPS (docs/web-ui.md, "LAN HTTPS"): read-only for the apps.

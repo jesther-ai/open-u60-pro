@@ -255,11 +255,11 @@ async fn remembered_wifi_and_fixed_ips_are_private_and_csrf_protected() {
     let c = ctx(Some(PW));
     let cookie = format!("zte_ui_session={}",login(&c,252,1).await);
     let _d = device::set(&c.app,device::Device { gets:vec![
-        ("/api/wifi-relay/status",Ok(json!({"networks":[{"id":"scan","ssid":"Saved Wi-Fi","security":"wpa2","supported":true,"remembered":true}],"saved_networks":[{"id":"saved","ssid":"Saved Wi-Fi"}]}))),
+        ("/api/wifi-relay/status",Ok(json!({"networks":[{"id":"scan","ssid":"Saved Wi-Fi","security":"wpa2","supported":true,"remembered":true,"width_mode":"off"}],"saved_networks":[{"id":"saved","ssid":"Saved Wi-Fi","security":"wpa2","remembered":true,"width_mode":"off"}]}))),
         ("/api/router/reservations",Ok(json!({"entries":[{"id":"opaque","name":"Phone <test>","mac":"02:aa:bb:00:01:02","ip":"192.168.0.60"}]}))),
     ],..Default::default() });
     let page = get_with(&c,network::RELAY,peer(252,2),&cookie).await;
-    assert!(page.text().contains("Remember this network") && page.text().contains("Remembered networks"));
+    assert!(page.text().contains("Remember this network") && page.text().contains("Saved Wi-Fi networks"));
     assert!(page.text().contains("<span class=\"badge gr\">Saved</span>"));
     browser_fixture(&c,"relay-saved",&page).await;
     let form = format!("csrf={}&once={}&id=saved",page.input("csrf"),page.input("once"));
@@ -569,6 +569,178 @@ async fn relay_connect_options_default_on_but_unchecked_choices_are_respected() 
     assert_eq!(device::calls(&c.app).len(), 2, "unchecked consent must not connect");
 }
 
+fn relay_form_with<'a>(html: &'a str, marker: &str) -> &'a str {
+    html.split("<form").skip(1)
+        .map(|form| form.split("</form>").next().unwrap())
+        .find(|form| form.contains(marker))
+        .unwrap_or_else(|| panic!("No form containing {marker}"))
+}
+
+#[tokio::test]
+async fn relay_width_forms_show_current_and_saved_choices_without_exposing_credentials() {
+    let c = ctx(Some(PW));
+    let cookie = format!("zte_ui_session={}", login(&c, 220, 1).await);
+    for (active, saved) in [("off", "auto"), ("auto", "off")] {
+        let _d = device::set(&c.app, device::Device {
+            gets: vec![("/api/wifi-relay/status", Ok(json!({
+                "connected":true,"ssid":"Hotel <test>","network_id":"scan-current","saved_network_id":"saved-current","width_mode":active,
+                "networks":[
+                    {"id":"scan-current","ssid":"Hotel <test>","security":"wpa2","supported":true,"remembered":false,"width_mode":saved},
+                    {"id":"scan-other","ssid":"Hotel <test>","security":"wpa2","supported":true,"remembered":true,"width_mode":"off"}
+                ],
+                "saved_networks":[
+                    {"id":"saved-current","ssid":"Hotel <test>","security":"wpa2","remembered":false,"width_mode":saved},
+                    {"id":"saved-other","ssid":"Hotel <test>","security":"wpa2","remembered":true,"width_mode":"off","password":"must-not-render"},
+                    {"id":"saved-open","ssid":"Lobby","security":"open","remembered":true,"width_mode":"off"}
+                ]
+            })))],
+            ..Default::default()
+        });
+        let page = get_with(&c, network::RELAY, peer(220, 2), &cookie).await;
+        page.assert_secure_html(200);
+        let html = page.text();
+        let connect = relay_form_with(&html, &format!("action=\"{}\"", network::CONNECT));
+        assert!(connect.contains("<option value=\"saved\" selected>Use saved choice</option>"));
+        assert_eq!(connect.matches("<select").count(), 1);
+        assert!(connect.contains("Saved bandwidth: Keep negotiated bandwidth"));
+        assert!(connect.contains("Each Wi-Fi remembers its choice."));
+        assert!(connect.find("name=\"confirmed\"").unwrap() < connect.find("id=\"relay-connect-width\"").unwrap());
+        assert!(connect.find("id=\"relay-connect-width\"").unwrap() < connect.find("Connect to Wi-Fi").unwrap());
+        let current = relay_form_with(&html, "id=\"relay-active-width\"");
+        assert!(current.contains(&format!("<option value=\"{active}\" selected>")));
+        assert!(current.contains("name=\"id\" value=\"saved-current\""));
+        assert!(!current.contains("scan-current"), "Tuning requires the persistent ID, not the scan ID");
+        assert!(current.contains("Applying reconnects this Wi-Fi and briefly interrupts internet access."));
+        assert!(current.contains("name=\"confirmed\" value=\"1\" checked required"));
+        let stored = relay_form_with(&html, "id=\"relay-saved-width-0\"");
+        assert!(stored.contains(&format!("<option value=\"{saved}\" selected>")), "Stored policy must not be replaced by the active mode");
+        assert!(stored.contains("Applying reconnects this Wi-Fi"));
+        let other = relay_form_with(&html, "id=\"relay-saved-width-1\"");
+        assert!(other.contains("<option value=\"off\" selected>Keep negotiated bandwidth</option>"));
+        assert!(other.contains("Saved for the next connection."));
+        assert!(!other.contains("Applying reconnects this Wi-Fi"), "Equal SSIDs must not mark a different persistent network active");
+        assert_eq!(html.matches(&format!("action=\"{}\"", network::TUNING)).count(), 4);
+        for text in ["Hotel &lt;test&gt;", "Password not saved; enter it when connecting", "Password remembered; leave it empty when connecting", "Open network; no password needed", "Auto tuning"] {
+            assert!(html.contains(text), "{text}");
+        }
+        assert!(!html.contains("Hotel <test>") && !html.contains("must-not-render"));
+        assert!(device::calls(&c.app).is_empty(), "Rendering policies must not save or reconnect");
+        browser_fixture(&c, &format!("relay-width-{active}"), &page).await;
+    }
+}
+
+#[tokio::test]
+async fn relay_connect_forwards_explicit_width_or_defers_to_the_saved_choice() {
+    let c = ctx(Some(PW));
+    let cookie = format!("zte_ui_session={}", login(&c, 219, 1).await);
+    let _d = devices(&c, false);
+    for (index, mode) in [None, Some("saved"), Some("off"), Some("auto")].into_iter().enumerate() {
+        let page = get_with(&c, network::RELAY, peer(219, 2), &cookie).await;
+        let mut body = format!("csrf={}&once={}&network=1234567890abcdef&password=private-width-password&confirmed=1&ipv6=1", page.input("csrf"), page.input("once"));
+        if let Some(mode) = mode { body.push_str(&format!("&width_mode={mode}")); }
+        let sent = post(&c, network::CONNECT, peer(219, 2), &cookie, &body).await;
+        assert_eq!(sent.status, 303);
+        assert!(sent.header("location").unwrap().starts_with("/ui/relay?r="));
+        assert!(!sent.text().contains("private-width-password"));
+        post(&c, network::CONNECT, peer(219, 2), &cookie, &body).await;
+        let calls = device::calls(&c.app);
+        assert_eq!(calls.len(), index + 1, "Replaying the form must not reconnect twice");
+        assert_eq!(calls[index], ("/api/wifi-relay/connect".into(), json!({
+            "network":"1234567890abcdef","password":"private-width-password","confirmed":true,"ipv6":true,"remember":false,
+            "width_mode":mode.filter(|mode| *mode != "saved")
+        })));
+    }
+}
+
+#[tokio::test]
+async fn relay_tuning_forwards_persistent_id_and_policy_once_with_no_js_feedback() {
+    let c = ctx(Some(PW));
+    let cookie = format!("zte_ui_session={}", login(&c, 218, 1).await);
+    let _d = device::set(&c.app, device::Device {
+        gets: vec![("/api/wifi-relay/status", Ok(json!({
+            "connected":true,"network_id":"scan-current","saved_network_id":"saved-current","width_mode":"off",
+            "saved_networks":[{"id":"saved-other","ssid":"Other","remembered":false,"width_mode":"auto"}]
+        })))],
+        ..Default::default()
+    });
+    for (index, (select, id, mode)) in [
+        ("relay-active-width", "saved-current", "auto"),
+        ("relay-saved-width-0", "saved-other", "off"),
+    ].into_iter().enumerate() {
+        let page = get_with(&c, network::RELAY, peer(218, 2), &cookie).await;
+        let html = page.text();
+        let form = relay_form_with(&html, &format!("id=\"{select}\""));
+        let field = |name| form.split(&format!("name=\"{name}\" value=\"")).nth(1).unwrap().split('"').next().unwrap().to_owned();
+        assert_eq!(field("id"), id);
+        let body = format!("csrf={}&once={}&id={}&width_mode={mode}&confirmed={}", field("csrf"), field("once"), field("id"), field("confirmed"));
+        let sent = post(&c, network::TUNING, peer(218, 2), &cookie, &body).await;
+        assert_eq!(sent.status, 303);
+        let location = sent.header("location").unwrap();
+        assert!(location.starts_with("/ui/relay?r="));
+        post(&c, network::TUNING, peer(218, 2), &cookie, &body).await;
+        let calls = device::calls(&c.app);
+        assert_eq!(calls.len(), index + 1);
+        assert_eq!(calls[index], ("/api/wifi-relay/tuning".into(), json!({"id":id,"width_mode":mode,"confirmed":true})));
+        let result = get_with(&c, location, peer(218, 2), &cookie).await;
+        result.assert_secure_html(200);
+        assert!(result.text().contains("Wi-Fi bandwidth choice saved."));
+    }
+}
+
+#[tokio::test]
+async fn relay_width_posts_reject_invalid_modes_and_missing_confirmation_before_calling() {
+    let c = ctx(Some(PW));
+    let cookie = format!("zte_ui_session={}", login(&c, 217, 1).await);
+    let _d = devices(&c, false);
+    let page = get_with(&c, network::RELAY, peer(217, 2), &cookie).await;
+    let tokens = format!("csrf={}&once={}&network=scan&id=saved", page.input("csrf"), page.input("once"));
+    for path in [network::CONNECT, network::TUNING] {
+        for mode in ["observe", "unexpected", "", "<script>bad</script>"] {
+            let body = format!("{tokens}&confirmed=1&width_mode={}", enc(mode));
+            let refused = post(&c, path, peer(217, 2), &cookie, &body).await;
+            refused.assert_secure_html(400);
+            assert!(refused.text().contains("Invalid bandwidth choice"));
+            assert!(!refused.text().contains("<script>bad</script>"));
+        }
+        let body = format!("{tokens}&width_mode=off");
+        let refused = post(&c, path, peer(217, 2), &cookie, &body).await;
+        refused.assert_secure_html(400);
+        assert!(refused.text().contains("Confirmation required"));
+    }
+    for suffix in ["", "&width_mode=saved"] {
+        let body = format!("{tokens}&confirmed=1{suffix}");
+        assert_eq!(post(&c, network::TUNING, peer(217, 2), &cookie, &body).await.status, 400);
+    }
+    assert!(device::calls(&c.app).is_empty());
+    let valid = format!("{tokens}&confirmed=1&width_mode=off");
+    assert_eq!(post(&c, network::TUNING, peer(217, 2), &cookie, &valid).await.status, 303);
+    assert_eq!(device::calls(&c.app).len(), 1, "Validation must not consume the once token");
+}
+
+#[tokio::test]
+async fn relay_tuning_requires_csrf_and_a_once_token_before_saving_or_reconnecting() {
+    let c = ctx(Some(PW));
+    let cookie = format!("zte_ui_session={}", login(&c, 216, 1).await);
+    let _d = devices(&c, false);
+    let page = get_with(&c, network::RELAY, peer(216, 2), &cookie).await;
+    let choice = "id=saved&width_mode=auto&confirmed=1";
+    post(&c, network::TUNING, peer(216, 2), "", choice).await
+        .assert_see_other("/ui/login?next=%2Fui%2Frelay&expired=1");
+    for csrf in [None, Some("invalid")] {
+        let mut body = format!("once={}&{choice}", page.input("once"));
+        if let Some(csrf) = csrf { body.push_str(&format!("&csrf={csrf}")); }
+        let refused = post(&c, network::TUNING, peer(216, 2), &cookie, &body).await;
+        refused.assert_secure_html(403);
+        assert!(refused.text().contains("href=\"/ui/relay\""));
+    }
+    let body = format!("csrf={}&{choice}", page.input("csrf"));
+    assert_eq!(post(&c, network::TUNING, peer(216, 2), &cookie, &body).await.status, 303);
+    assert!(device::calls(&c.app).is_empty());
+    let body = format!("{body}&once={}", page.input("once"));
+    assert_eq!(post(&c, network::TUNING, peer(216, 2), &cookie, &body).await.status, 303);
+    assert_eq!(device::calls(&c.app).len(), 1);
+}
+
 #[tokio::test]
 async fn relay_ipv6_consent_and_nat66_state_are_explicit() {
     let c = ctx(Some(PW));
@@ -725,7 +897,8 @@ async fn relay_redesign_keeps_six_named_tabs_and_explicit_network_selection() {
     assert_eq!(html.matches("type=\"radio\" name=\"network\"").count(), 4);
     assert!(!html.contains("<span class=\"badge gr\">Saved</span>"));
     assert!(html.contains("value=\"wpa3\" required disabled"));
-    assert!(!html.contains("<select"));
+    assert!(!html.contains("<select name=\"network\""), "Network selection remains explicit radio cards");
+    assert_eq!(html.matches("<select").count(), 1, "Only bandwidth uses a selector");
     assert!(html.contains("class=\"relay-btn relay-primary\""));
     assert!(html.contains("<details class=\"relay-notes\"><summary>Compatibility &amp; safety</summary>"));
     for label in ["Dashboard", "SMS", "Tools", "Router", "Settings"] {
@@ -859,7 +1032,7 @@ async fn network_posts_require_session_csrf_origin_and_once_token() {
     let c = ctx(Some(PW));
     let cookie = format!("zte_ui_session={}", login(&c, 243, 1).await);
     let _d = devices(&c, false);
-    for path in [network::CONFIG, network::CONNECT, network::CLOCK] {
+    for path in [network::CONFIG, network::CONNECT, network::CLOCK, network::TUNING] {
         assert_eq!(post(&c, path, peer(243, 2), "", "yaml=x").await.status, 303);
         assert_eq!(post(&c, path, peer(243, 2), &cookie, "yaml=x").await.status, 403);
         let page = get_with(&c, if path == network::CONFIG { network::MIHOMO } else { network::RELAY }, peer(243, 2), &cookie).await;

@@ -19,24 +19,46 @@ use std::time::{Duration, Instant};
 /// `BSS` fields: id, bssid, freq, level, age, flags, ssid and the entry delimiter.
 const BSS_MASK: u32 = 0x1 | 0x2 | 0x4 | 0x80 | 0x200 | 0x800 | 0x1000 | 0x20000;
 
-/// Scan requests from `iw phy <phy> channels`: all usable 2.4 GHz channels in
-/// one request, then each usable 5 GHz channel alone. Disabled channels would make cfg80211 refuse
-/// the request; relay does not use 6 GHz.
-pub(super) fn plan(text: &str) -> Vec<Vec<u32>> {
-    let mut low = Vec::new();
-    let mut plan = Vec::new();
-    for line in text.lines() {
-        let Some((mhz, rest)) = line.trim_start().strip_prefix("* ").and_then(|l| l.split_once(" MHz [")) else { continue };
-        match (mhz.parse::<u32>(), rest.contains("(disabled)")) {
-            (Ok(freq @ 2400..=2500), false) => low.push(freq),
-            (Ok(freq @ 4900..=5899), false) => plan.push(vec![freq]),
-            _ => {}
+/// One read of the PHY's enabled frequencies drives scanning, selection and
+/// hotspot preparation. DFS is a property of the radio, not a relay blacklist.
+pub(super) struct Channels(Vec<(u32, bool)>);
+
+impl Channels {
+    pub(super) fn parse(text: &str) -> Self {
+        let mut channels = Vec::new();
+        let mut current = None;
+        for line in text.lines() {
+            if let Some((mhz, rest)) = line.trim_start().strip_prefix("* ").and_then(|l| l.split_once(" MHz [")) {
+                current = None;
+                if let Ok(frequency) = mhz.parse::<u32>() {
+                    if super::channel(frequency).is_some() && !rest.contains("(disabled)") {
+                        current = Some(channels.len());
+                        channels.push((frequency, false));
+                    }
+                }
+            } else if line.trim() == "Radar detection" {
+                if let Some(index) = current { channels[index].1 = true; }
+            }
         }
+        Self(channels)
     }
-    if !low.is_empty() {
-        plan.insert(0, low);
+
+    pub(super) fn contains(&self, frequency: u32) -> bool {
+        self.0.iter().any(|&(f, _)| f == frequency)
     }
-    plan
+
+    pub(super) fn staging_5ghz(&self) -> Option<u32> {
+        self.0.iter().find(|&&(f, dfs)| f >= 5000 && !dfs).map(|&(f, _)| f)
+    }
+
+    /// Group 2.4 GHz, then scan each 5 GHz frequency separately for B31.
+    pub(super) fn plan(&self) -> Vec<Vec<u32>> {
+        let low: Vec<_> = self.0.iter().filter(|&&(f, _)| f < 3000).map(|&(f, _)| f).collect();
+        let mut plan = Vec::new();
+        if !low.is_empty() { plan.push(low); }
+        plan.extend(self.0.iter().filter(|&&(f, _)| f >= 5000).map(|&(f, _)| vec![f]));
+        plan
+    }
 }
 
 /// The supplicant as the scan sequence sees it, so tests can stand in for it.
@@ -191,10 +213,10 @@ mod tests {
     #[test]
     fn plan_scans_each_5ghz_channel_alone_and_2ghz_together() {
         assert_eq!(
-            plan(CHANNELS),
+            Channels::parse(CHANNELS).plan(),
             vec![vec![2412, 2437, 2472], vec![5180], vec![5220], vec![5260], vec![5745], vec![5825]]
         );
-        assert!(plan("Band 1:\n\t* 2484 MHz [14] (disabled)\n").is_empty());
+        assert!(Channels::parse("Band 1:\n\t* 2484 MHz [14] (disabled)\n").plan().is_empty());
     }
 
     /// Behaves like the B31 driver while the 5 GHz hotspot runs at 160 MHz:
@@ -271,7 +293,7 @@ mod tests {
     fn trimmed_5ghz_upstreams_are_found_fresh_and_cached_ones_dropped() {
         let mut driver = TrimmingDriver::new();
         driver.busy_once = true;
-        let (table, took) = run(&mut driver, &plan(CHANNELS)).unwrap();
+        let (table, took) = run(&mut driver, &Channels::parse(CHANNELS).plan()).unwrap();
         let networks = crate::wifi_relay::parse_bss(&table, took.as_secs() + 1);
         let mut found: Vec<_> = networks.iter().map(|n| (n.frequency, n.ssid.as_str())).collect();
         found.sort();
@@ -281,7 +303,7 @@ mod tests {
 
         // The old single full-band request: the 5 GHz upstream never appears.
         let mut driver = TrimmingDriver::new();
-        let all = plan(CHANNELS).concat();
+        let all = Channels::parse(CHANNELS).plan().concat();
         let (table, took) = run(&mut driver, &[all]).unwrap();
         let networks = crate::wifi_relay::parse_bss(&table, took.as_secs() + 1);
         assert!(networks.iter().all(|n| n.frequency < 3000), "{:?}", networks.iter().map(|n| n.frequency).collect::<Vec<_>>());
@@ -298,6 +320,6 @@ mod tests {
                 Err("Wi-Fi scan did not finish".into())
             }
         }
-        assert_eq!(run(&mut Refusing, &plan(CHANNELS)).unwrap_err(), "Wi-Fi scan was refused");
+        assert_eq!(run(&mut Refusing, &Channels::parse(CHANNELS).plan()).unwrap_err(), "Wi-Fi scan was refused");
     }
 }

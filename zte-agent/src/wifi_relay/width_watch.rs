@@ -47,11 +47,11 @@ pub(super) struct LinkWidth {
     gateway: Option<Ipv4Addr>,
 }
 impl LinkWidth {
-    pub(super) fn new(network: &super::Network, neighbours: &[(u32, i32)]) -> Self {
+    pub(super) fn new(network: &super::Network, neighbours: &[(u32, i32)], tuning: super::saved::Tuning) -> Self {
         Self {
             tuner: None, network: network.id.clone(), neighbours: neighbours.to_vec(), signal: network.signal,
             generation: GENERATION.fetch_add(1, Ordering::Relaxed), scan: 0,
-            mode: Mode::parse(&std::env::var("ZTE_AGENT_WIDTH").unwrap_or_default()),
+            mode: Mode::parse(tuning.as_str()),
             enabled: None, last_rx: None, last: None, last_log: None, phy: None, gateway: None,
         }
     }
@@ -417,7 +417,7 @@ mod tests {
     fn link(mode: Mode) -> LinkWidth {
         let network = super::super::Network { id: "test-only".into(), ssid: "not-logged".into(), bssid: "not-logged".into(),
             frequency: 2412, signal: -40, security: "open", supported: true };
-        let mut link = LinkWidth::new(&network, &[]);
+        let mut link = LinkWidth::new(&network, &[], super::super::saved::Tuning::Off);
         link.mode = mode;
         link
     }

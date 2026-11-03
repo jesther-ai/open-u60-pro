@@ -27,7 +27,7 @@ const VERIFY_TOGGLES: u8 = 2;
 pub(super) enum Mode { Auto, Observe, Off }
 impl Mode {
     pub(super) fn parse(value: &str) -> Self {
-        match value { "observe" => Self::Observe, "off" => Self::Off, _ => Self::Auto }
+        match value { "auto" => Self::Auto, "observe" => Self::Observe, _ => Self::Off }
     }
 }
 

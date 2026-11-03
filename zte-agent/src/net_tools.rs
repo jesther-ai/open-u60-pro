@@ -70,6 +70,9 @@ impl Cmd {
     }
 
     pub fn run(&self) -> Result<String, String> {
+        if self.program == "@u60-relay-channel" {
+            return crate::wifi_relay::hotspot::switch(&self.args).map(|_| String::new());
+        }
         if self.program == "@u60-relay-ipv6-dad" {
             return crate::wifi_relay::ipv6::wait_addresses(&self.args).map(|_| String::new());
         }
@@ -120,10 +123,17 @@ impl Cmd {
     }
 
     fn undo(&self) -> Result<(), String> {
+        if crate::wifi_relay::hotspot::skip_undo(self) {
+            return Ok(());
+        }
         let error = match self.run() {
             Ok(_) => return Ok(()),
             Err(error) => error,
         };
+        // OFF during a channel switch/CAC makes that runtime snapshot obsolete.
+        if crate::wifi_relay::hotspot::skip_undo(self) {
+            return Ok(());
+        }
         // A crash may have occurred after journaling but before applying a
         // step. Already-absent objects are successful, idempotent recovery.
         if matches!(self.program.as_str(), "iptables" | "ip6tables") {

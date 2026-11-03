@@ -494,3 +494,23 @@ Settings › Appearance (owner decision 55) has to colour what the browser and t
 - A live stream with curl needs `-H 'Datastar-Request: true'`, the session cookie and the page key from the page's `data-init`. Never paste a session cookie or token into shared logs.
 - DNS-rebinding check: `curl -H 'Host: evil.example' http://192.168.0.1:9090/ui/login` must give `403`.
 - LAN HTTPS: `tls::x509::tests` (every certificate field parsed back; the chain verified with rustls/webpki for the address and the name, and refused for names and addresses outside the constraints, also with a root that has none; the router's narrow scope and a name-only CA; the scope read back), `tls::tests` (temporary directories, fake clocks, a fake LAN address and a fake dnsmasq: files and modes, the hosts line and SIGHUP, forged certificates from the stored issuing key refused, start, repair of the directory and key modes, a lost or mismatched server pair issued again from the same CA (old dates, verified clock, or kept for Turn On), renewal only on the verified clock and never past the CA, a new LAN address (name only, same dates, the line cleared once back), Turn On again after a failed bind, reset, the API answer, the profile), `tls::hosts` (the temporary file new and outside the directory, a planted link not followed), `router::tests` (a LAN apply moves HTTPS), `httpd::mobile` (each listener's fail-open flag), `httpd::tls::tests` (the listener on 127.0.0.1 with a rustls client that trusts only the generated root: TLS 1.2 and 1.3, ALPN, the chain, the local name only over HTTPS, the cookie and origin rules per origin, hot swap, lazy renewal before a handshake, reset and resumed sessions, reset ending a live stream and a keep-alive connection while its own reply gets through, a failed bind and Try Again, a listener that ends by itself without a busy loop, the mobile-side check before the handshake, shared caps, a live stream over TLS) and `web::tests::https` (Settings, the questions and their single-use posts, a kept CA, Try Again, the install page, the downloads' types, the hints, `GET /api/https`). On the router: `openssl s_client -connect 192.168.0.1:9443 -servername u60.home.arpa -showcerts </dev/null` shows the two certificates.
+
+
+### Per-network relay bandwidth (2026-11-03)
+
+`/ui/relay` offers Keep negotiated bandwidth (default) or Auto tuning.
+The full-width selector sits immediately above Connect to Wi-Fi and defaults
+to the selected network's saved choice; scan cards
+show that choice. The current connection and saved networks have preselected
+selectors and Apply forms. Applying a different active choice reconnects through
+the ordinary relay lifecycle and explicitly warns about interruption; inactive
+choices are only saved. Both routes use the same CSRF/session/once-job protection.
+
+`POST /api/wifi-relay/connect` accepts optional `width_mode: "off" | "auto"`;
+null/omitted loads the saved choice. `POST /api/wifi-relay/tuning` accepts
+`{id, width_mode, confirmed:true}`, where id is the persistent SSID/security ID.
+Status exposes current `width_mode`, `network_id`, `saved_network_id`, plus each
+scan/saved network's choice. Old credential records default to off. Preferences
+are saved even without passwords; remembered metadata distinguishes them.
+Changing a password-unsaved active WPA2 network requires re-entering its password
+in the connection form. Forget deletes the preference and saved credential.

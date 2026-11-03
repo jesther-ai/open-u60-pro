@@ -861,3 +861,10 @@ fn an_unsteady_candidate_window_cannot_win() {
     assert_eq!(r.c.anchor, 160);
     assert_eq!(r.writes.last(), Some(&160));
 }
+
+#[test]
+fn adaptive_width_requires_explicit_opt_in() {
+    for value in ["", "off", "unexpected"] { assert_eq!(Mode::parse(value), Mode::Off); }
+    assert_eq!(Mode::parse("auto"), Mode::Auto);
+    assert_eq!(Mode::parse("observe"), Mode::Observe);
+}

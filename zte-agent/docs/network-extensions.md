@@ -292,9 +292,13 @@ earlier B31 association observations, not a translation of enhanced's GPL code.
 
 - Creates only its own `u60sta0`; PHY is discovered from `wlan2/phy80211`.
 - Requires 5 GHz main AP enabled and Guest WiFi disabled. The matching upstream
-  band's main AP must also be enabled. Open/WPA2-Personal only, 2.4 GHz channels
-  1-13 and non-DFS 5 GHz channels 36/40/44/48/149/153/157/161/165. Hidden,
-  enterprise, WPA3-only and DFS networks are not supported.
+  band's main AP must also be enabled. Open/WPA2-Personal only, on 2.4 GHz
+  and 5 GHz channels enabled by the PHY, including DFS. Scans and connects
+  honor the driver's current country/channel restrictions; disabled channels
+  remain unavailable even if present in the BSS cache. Hidden, enterprise and
+  WPA3-only networks are not supported. DFS radar checks may delay hotspot
+  availability; see the device acceptance record for tested channels. The
+  [relay lifecycle](relay-lifecycle.md) describes switching and recovery.
 - Uses the existing `wpa_supplicant`, `wpa_cli`, `hostapd_cli`, `iw`, `ip`,
   `iptables`, `ip6tables`, `udhcpc` and `uci`; optional IPv6 also uses `odhcp6c`
   and the existing `odhcpd`. It does not disable vendor daemons.
@@ -302,8 +306,9 @@ earlier B31 association observations, not a translation of enhanced's GPL code.
   STA shares its channel with the same-band AP. For a 2.4 GHz upstream the
   agent moves `wlan0` to the upstream channel at 20 MHz before associating
   (runtime `hostapd_cli` disable/set/enable, snapshotted and restored, no UCI
-  commit; client reconnection is expected). A 5 GHz upstream leaves `wlan2`
-  alone: runtime reconfiguration of it is unreliable on B31. Measured
+  commit; client reconnection is expected). Every 5 GHz upstream uses a temporary non-DFS 20 MHz staging channel
+  on `wlan2`, then lets the driver follow the STA. The older disable/set/enable
+  reconfiguration of this radio is unreliable on B31. Measured
   2026-10-27 without a connected STA: ch 44 at 20 MHz was refused by
   `enable`; ch 36/44 at 40 and 80 MHz reached `HT_SCAN`, then `DISABLED`
   without any `START AP` reaching the driver; ch 36/44 at 160 MHz started (DFS
@@ -326,6 +331,16 @@ earlier B31 association observations, not a translation of enhanced's GPL code.
   back to the configured 160 on the STA's channel, whatever the STA's width.
   Validated 2026-10-29 with the switch turned off by hand before an agent
   restart (`2026-10-29-width-v2-acceptance.md`); a real reboot is not yet tested.
+- All 5 GHz upstreams share the same preparation (`wifi_relay/hotspot.rs`).
+  A join to 5260 MHz while SAP runs 36/160 repeatedly failed before authentication:
+  `hdd_validate_channel_and_bandwidth: BW 3 not possible in 2.4GHz band`,
+  `Set channel with CSA IE failed, can't allow STA`. Before any 5 GHz join, snapshot
+  SAP's actual primary/width/center, journal its restoration, and use runtime
+  `chan_switch` to an enabled non-DFS 5 GHz channel at 20 MHz. Then associate;
+  the driver follows the DFS STA (tested 52/160). Disconnect detaches STA first,
+  restores the original SAP channel, and waits for CAC (about 60 s for 36/160).
+  No persistent wireless setting or radar detection is disabled. See
+  [2026-11-03 DFS acceptance](2026-11-03-dfs-acceptance.md) for test coverage.
 - Scans go over an attached wpa_supplicant control socket: all enabled 2.4 GHz
   channels in one request, then each enabled 5 GHz channel alone, each waiting
   for its completion event (about 3 s in all, instead of a fixed 6 s sleep).
@@ -792,9 +807,10 @@ AP's rate to the STA rising from HE-MCS 1 to HE-MCS 9-11, 2 SS.
 实现为 `wifi_relay/width.rs` 的纯状态机与 `wifi_relay/width_watch.rs` 的 watcher
 适配层，替换旧版逐档搜索、PHY fallback 和从最宽档重测规则。
 
-- `ZTE_AGENT_WIDTH=auto`（默认）：2.4 GHz、5 GHz 都自动调节；`observe`：两个频段
-  都只测量、记录“会挑战哪一档”，不自动挑战或维持窄档、不写历史；`off`：保持协商宽度，
-  不启用或读取 LL stats。三种模式在新关联时都执行下述遗留宽度复位。
+- 2026-11-03 起，网页按每个 Wi-Fi（SSID＋加密方式）保存 `off`（默认，保持协商带宽）
+  或 `auto`（实验性自动调优）。新连接默认沿用保存选择，当前连接修改时共用重连流程；
+  `ZTE_AGENT_WIDTH` 不再覆盖网页设置。内部 Observe 状态机只用于测试，不提供第三套用户路径。
+  Off 不启用或读取 LL stats；两种模式新关联时都执行下述遗留宽度复位。
   持续调优 I/O 仅由已有 `relay-watch` 执行；空闲时只在保持窄档时约每 60 s 读回、重设并
   ping 网关一次。
 - 锚点持续滚动测量；只有一个新鲜锚点窗口刚完成的 tick 能发起单候选挑战。挑战期间

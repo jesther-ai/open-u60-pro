@@ -478,45 +478,50 @@ input:checked + .sw::after { transform: translateX(20px); }
 .rf [aria-invalid] { box-shadow: inset 0 -2px var(--red); }
 /* Networking. */
 .net-yaml { width: 100%; min-width: 0; padding: .5rem; border: 1px solid var(--field-border); border-radius: 8px; background: var(--card); color: var(--fg); font: .85rem/1.4 ui-monospace, monospace; resize: vertical; }
-.relay-page { display: grid; gap: 1rem; }
-.relay-hero,.relay-panel { padding: 1.25rem; border: 1px solid var(--sep); border-radius: 20px; background: var(--card); }
-.relay-hero { background: radial-gradient(ellipse at 100% 0,var(--tint-blue),transparent 75%),var(--card); }
-.relay-head, .relay-path { display: flex; align-items: center; justify-content: space-between; }
-.relay-head { gap: .75rem; }
-.relay-glyph { display: grid; place-items: center; width: 48px; height: 48px; border-radius: 15px; background: var(--card); color: var(--accent); }
-.relay-state { display: flex; align-items: center; gap: .4rem; padding: .35rem .65rem; border-radius: 999px; font-size: .75rem; background: var(--tint-gray); color: var(--muted); }
-.relay-state::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
-.relay-state.on { color: var(--green); background: var(--tint-green); }
-.relay-hero h2 { margin: 1rem 0 .4rem; font-size: 1.6rem; letter-spacing: -.035em; overflow-wrap: anywhere; }
-.relay-hero > p,.relay-copy { color: var(--muted); font-size: .85rem; }
-.relay-path { margin-top: 1.4rem; padding-top: 1rem; border-top: 1px solid var(--sep); font-size: .75rem; color: var(--muted); }
-.relay-hop { display: grid; justify-items: center; gap: .35rem; }
-.relay-path>.i,.relay-primary>.i { transform: rotate(90deg); }
-.relay-panel h2 { font-size: 1rem; margin-bottom: .2rem; }
-.relay-btn { display: inline-flex; align-items: center; justify-content: center; gap: .5rem; min-height: 48px; padding: .65rem 1rem; border: 1px solid transparent; border-radius: 13px; font: inherit; font-size: .9rem; font-weight: 600; text-decoration: none; cursor: pointer; }
-.relay-secondary, .relay-stop { border-color: var(--sep); background: var(--card); }
-.relay-secondary { color: var(--accent); }
-.relay-primary { width: 100%; justify-content: space-between; color: #fff; background: var(--btn); }
-.relay-stop { width: 100%; color: var(--red); margin-top: 1rem; }
-.relay-panel > .relay-btn { width: 100%; margin: 1rem 0; }
-.relay-caution,.relay-private { display: flex; gap: .5rem; color: var(--muted); font-size: .75rem; }
-.relay-connect { display: grid; gap: .8rem; margin-top: 1rem; }
-.relay-networks { display: grid; gap: .5rem; border: 0; margin: 0; padding: 0; max-height: 22rem; overflow: auto; }
-.relay-network { display: flex; align-items: center; gap: .65rem; padding: .8rem; border: 1px solid var(--sep); border-radius: 13px; cursor: pointer; }
-.relay-network:has(:checked) { border-color: var(--accent); background: var(--tint-blue); }
-.relay-network:has(:disabled) { opacity: .5; cursor: not-allowed; }
-.relay-network > input { order: 3; width: 18px; height: 18px; flex: none; margin: 0; accent-color: var(--btn); }
-.relay-network-name { flex: 1; min-width: 0; }
-.relay-network-name strong { display: block; overflow-wrap: anywhere; font-size: .9rem; font-weight: 600; }
-.relay-network-name small,.relay-password small { display: block; font-size: .75rem; font-weight: 400; color: var(--muted); }
-.relay-password { font-size: .85rem; }
-.relay-input { width: 100%; min-width: 0; min-height: 48px; padding: .7rem .8rem; border: 1px solid var(--field-border); border-radius: 12px; background: var(--card); color: var(--fg); font: inherit; }
-.relay-consent { display: flex; gap: .6rem; padding: .25rem 0; font-size: .8rem; font-weight: 400; color: var(--muted); }
-.relay-consent input { width: 19px; height: 19px; flex: none; margin: 0; accent-color: var(--btn); }
-.relay-address { display: flex; flex-wrap: wrap; justify-content: space-between; gap: .4rem; margin-top: 1.2rem; font-size: .75rem; color: var(--muted); }
-.relay-empty { text-align: center; padding: 2rem 0 1rem; color: var(--muted); font-size: .85rem; }
-.relay-notes { font-size: .8rem; color: var(--muted); padding: 0 .25rem; }
-.relay-notes p + p { margin-top: .65rem; }
+.relay-page{display:grid;grid-template-columns:minmax(0,1fr);gap:1rem;}
+.relay-page form,.relay-page section,.relay-connect>*{min-width:0;}
+.relay-hero,.relay-panel{padding:1.25rem;border:1px solid var(--sep);border-radius:20px;background:var(--card);}
+.relay-hero{background:radial-gradient(ellipse at 100% 0,var(--tint-blue),transparent 75%),var(--card);}
+.relay-head,.relay-path{display:flex;align-items:center;justify-content:space-between;}
+.relay-head{gap:.75rem;}
+.relay-glyph{display:grid;place-items:center;width:48px;height:48px;border-radius:15px;background:var(--card);color:var(--accent);}
+.relay-state{display:flex;align-items:center;gap:.4rem;padding:.35rem .65rem;border-radius:999px;font-size:.75rem;background:var(--tint-gray);color:var(--muted);}
+.relay-state::before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor;}
+.relay-state.on{color:var(--green);background:var(--tint-green);}
+.relay-hero h2{margin:1rem 0 .4rem;font-size:1.6rem;letter-spacing:-.035em;overflow-wrap:anywhere;}
+.relay-hero>p,.relay-copy{color:var(--muted);font-size:.85rem;}
+.relay-path{margin-top:1.4rem;padding-top:1rem;border-top:1px solid var(--sep);font-size:.75rem;color:var(--muted);}
+.relay-hop{display:grid;justify-items:center;gap:.35rem;}
+.relay-path>.i,.relay-primary>.i{transform:rotate(90deg);}
+.relay-panel h2{font-size:1rem;margin-bottom:.2rem;}
+.relay-btn{display:inline-flex;align-items:center;justify-content:center;gap:.5rem;min-height:48px;padding:.65rem 1rem;border:1px solid transparent;border-radius:13px;font:inherit;font-size:.9rem;font-weight:600;text-decoration:none;cursor:pointer;}
+.relay-secondary,.relay-stop{border-color:var(--sep);background:var(--card);}
+.relay-secondary{color:var(--accent);}
+.relay-primary{width:100%;justify-content:space-between;color:#fff;background:var(--btn);}
+.relay-stop{width:100%;color:var(--red);margin-top:1rem;}
+.relay-panel>.relay-btn{width:100%;margin:1rem 0;}
+.relay-caution,.relay-private{display:flex;gap:.5rem;color:var(--muted);font-size:.75rem;}
+.relay-connect{display:grid;grid-template-columns:minmax(0,1fr);gap:.8rem;margin-top:1rem;}
+.relay-bandwidth{display:grid;gap:.4rem;min-width:0;}
+.relay-bandwidth label{margin:0;font-size:.85rem;}
+.relay-bandwidth select{width:100%;max-width:100%;min-width:0;min-height:48px;padding:.6rem .75rem;border:1px solid var(--field-border);border-radius:12px;text-align:left;background:var(--card);}
+.relay-bandwidth small{color:var(--muted);font-size:.75rem;}
+.relay-networks{min-width:0;display:grid;gap:.5rem;border:0;margin:0;padding:0;max-height:22rem;overflow:auto;}
+.relay-network{display:flex;align-items:center;gap:.65rem;padding:.8rem;border:1px solid var(--sep);border-radius:13px;cursor:pointer;}
+.relay-network:has(:checked){border-color:var(--accent);background:var(--tint-blue);}
+.relay-network:has(:disabled){opacity:.5;cursor:not-allowed;}
+.relay-network>input{order:3;width:18px;height:18px;flex:none;margin:0;accent-color:var(--btn);}
+.relay-network-name{flex:1;min-width:0;}
+.relay-network-name strong{display:block;overflow-wrap:anywhere;font-size:.9rem;font-weight:600;}
+.relay-network-name small,.relay-password small{display:block;font-size:.75rem;font-weight:400;color:var(--muted);}
+.relay-password{font-size:.85rem;}
+.relay-input{width:100%;min-width:0;min-height:48px;padding:.7rem .8rem;border:1px solid var(--field-border);border-radius:12px;background:var(--card);color:var(--fg);font:inherit;}
+.relay-consent{display:flex;gap:.6rem;padding:.25rem 0;font-size:.8rem;font-weight:400;color:var(--muted);}
+.relay-consent input{width:19px;height:19px;flex:none;margin:0;accent-color:var(--btn);}
+.relay-address{display:flex;flex-wrap:wrap;justify-content:space-between;gap:.4rem;margin-top:1.2rem;font-size:.75rem;color:var(--muted);}
+.relay-empty{text-align:center;padding:2rem 0 1rem;color:var(--muted);font-size:.85rem;}
+.relay-notes{font-size:.8rem;color:var(--muted);padding:0 .25rem;}
+.relay-notes p + p{margin-top:.65rem;}
 .hr { flex-wrap: wrap; gap: .5rem; }
 .hr input { flex: 1 1 0; }
 .hr input + input { border-left: 1px solid var(--sep); padding-left: .5rem; }

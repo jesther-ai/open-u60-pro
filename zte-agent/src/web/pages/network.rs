@@ -31,6 +31,7 @@ pub const CONNECT: &str = "/ui/relay/connect";
 pub const DISCONNECT: &str = "/ui/relay/disconnect";
 pub const CLOCK: &str = "/ui/relay/clock";
 pub const FORGET: &str = "/ui/relay/forget";
+pub const TUNING: &str = "/ui/relay/tuning";
 
 pub fn mihomo_card(pd: &PageData) -> Markup {
     let Some(status) = pd.read(0) else {
@@ -150,6 +151,13 @@ pub fn relay_page(pd: &PageData) -> Markup {
                         }
                     }
                     div.relay-address {
+                        span { "BANDWIDTH POLICY" }
+                        span { (width_label(s["width_mode"].as_str().unwrap_or("off"))) }
+                    }
+                    @if let Some(id) = s["saved_network_id"].as_str().filter(|id| !id.is_empty()) {
+                        (width_form(pd, id, "relay-active-width", s["width_mode"].as_str().unwrap_or("off"), true))
+                    }
+                    div.relay-address {
                         span { "AFTER A RESTART" }
                         span { (match s["autostart"].as_bool() {
                             Some(true) => "Automatic reconnect enabled",
@@ -228,6 +236,7 @@ pub fn relay_page(pd: &PageData) -> Markup {
                                             " / " (n["signal"].as_i64().unwrap_or(0)) " dBm / "
                                             (if n["supported"].as_bool() != Some(true) { "Unsupported" } else if n["security"].as_str() == Some("open") { "Open" } else { "WPA2" })
                                         }
+                                        small { "Saved bandwidth: " (width_label(n["width_mode"].as_str().unwrap_or("off"))) }
                                     }
                                     @if n["remembered"].as_bool() == Some(true) { span.badge.gr { "Saved" } }
                                 }
@@ -235,7 +244,7 @@ pub fn relay_page(pd: &PageData) -> Markup {
                         }
                         label.relay-password for="relay-password" { span { "Wi-Fi password" } small { "Leave empty for saved or open networks" } }
                         input.relay-input #relay-password type="password" name="password" maxlength="64" autocomplete="new-password" placeholder="Network password";
-                        label.relay-consent { input type="checkbox" name="remember" value="1" checked; span { "Remember this network after a successful connection." } }
+                        label.relay-consent { input type="checkbox" name="remember" value="1" checked; span { "Remember this network’s password after a successful connection." } }
                         label.relay-consent {
                             input type="checkbox" name="ipv6" value="1" checked;
                             span { "Use upstream IPv6 for Clash and enable LAN NAT66 when available (experimental)." }
@@ -243,6 +252,14 @@ pub fn relay_page(pd: &PageData) -> Markup {
                         label.relay-consent {
                             input type="checkbox" name="confirmed" value="1" checked required;
                             span { "I accept hotspot reconnection and possible cellular data charges." }
+                        }
+                        div.relay-bandwidth {
+                            label for="relay-connect-width" { "Bandwidth" }
+                            select #relay-connect-width name="width_mode" {
+                                option value="saved" selected { "Use saved choice" }
+                                (width_options("saved"))
+                            }
+                            small { "New networks keep negotiated bandwidth. Each Wi-Fi remembers its choice." }
                         }
                         button.relay-btn.relay-primary type="submit" { "Connect to Wi-Fi" (kit::icon(kit::Icon::Arrows)) }
                         p.relay-private { (kit::icon(kit::Icon::Lock)) "Password stays private on U60. After a successful connection, the last selected remembered or open network can reconnect after restart. Disconnect clears that choice; a dropped link does not reconnect automatically while the agent runs." }
@@ -254,13 +271,27 @@ pub fn relay_page(pd: &PageData) -> Markup {
             @if let Some(error) = s["saved_error"].as_str() { p.msg.err { (error) } }
             @if let Some(saved) = s["saved_networks"].as_array().filter(|s| !s.is_empty()) {
                 section.relay-panel {
-                    h2 { "Remembered networks" }
-                    p.relay-copy { "Scan, select a saved network and leave the password empty. Forget does not disconnect an active relay." }
-                    @for network in saved {
-                        form method="post" action=(FORGET) {
-                            (pd.csrf()) (once_field(&pd.once()))
-                            input type="hidden" name="id" value=(network["id"].as_str().unwrap_or(""));
-                            p.actions { span { (network["ssid"].as_str().unwrap_or("")) } button.btn type="submit" { "Forget" } }
+                    h2 { "Saved Wi-Fi networks" }
+                    p.relay-copy { "Bandwidth choices are saved separately from passwords. Scan and select a network to connect. Forget removes its choice and any remembered password without disconnecting an active relay." }
+                    @for (index, network) in saved.iter().enumerate() {
+                        @let id = network["id"].as_str().unwrap_or("");
+                        @let active = connected && s["saved_network_id"].as_str() == Some(id);
+                        @let mode = network["width_mode"].as_str().unwrap_or("off");
+                        div.relay-connect {
+                            div.relay-head {
+                                span.relay-network-name {
+                                    strong { (network["ssid"].as_str().unwrap_or("")) }
+                                    small { (if network["security"].as_str() == Some("open") { "Open network; no password needed" } else if network["remembered"].as_bool() == Some(true) { "Password remembered; leave it empty when connecting" } else { "Password not saved; enter it when connecting" }) }
+                                    small { "Saved bandwidth: " (width_label(mode)) }
+                                }
+                                @if active { span.badge.gr { "Connected" } }
+                            }
+                            (width_form(pd, id, &format!("relay-saved-width-{index}"), mode, active))
+                            form method="post" action=(FORGET) {
+                                (pd.csrf()) (once_field(&pd.once()))
+                                input type="hidden" name="id" value=(id);
+                                p.actions { button.btn type="submit" { "Forget" } }
+                            }
                         }
                     }
                 }
@@ -268,7 +299,7 @@ pub fn relay_page(pd: &PageData) -> Markup {
             details.relay-notes {
                 summary { "Compatibility & safety" }
                 p { "Experimental B31 AP + STA, IPv4 NAT. Keep both main hotspots enabled and Guest WiFi off. Do not change WiFi, LAN or USB settings while connected." }
-                p { "Open and WPA2-Personal networks only. WPA3-only, enterprise, hidden SSIDs and DFS channels are not supported." }
+                p { "Open and WPA2-Personal networks on radio-enabled 2.4 GHz and 5 GHz channels, including DFS. DFS may delay hotspot availability during radar checks. WPA3-only, enterprise and hidden SSIDs are not supported." }
                 p { "Optional upstream IPv6 with LAN SLAAC/NAT66. Without a usable upstream IPv6 address and default route, relay stays IPv4-only. Cellular IPv6 bypass stays blocked. Internet access and hotel authorization are not verified automatically." }
                 p { "IPv6 needs the existing LAN odhcpd service and kernel NAT support. Its temporary settings are restored on disconnect; do not change the vendor LAN/DHCP settings while relaying. Restart resumes only the saved connection choice, not every remembered network. Upgrading an older agent cannot infer that choice from saved credentials." }
                 p { "Refresh this page to read the current state. No background scanning or polling runs while relay is off and no startup restoration is pending." }
@@ -277,17 +308,53 @@ pub fn relay_page(pd: &PageData) -> Markup {
     }
 }
 
+fn width_label(mode: &str) -> &'static str {
+    if mode == "auto" { "Auto tuning" } else { "Keep negotiated bandwidth" }
+}
+
+fn width_options(selected: &str) -> Markup {
+    html! {
+        @for mode in ["off", "auto"] {
+            option value=(mode) selected[selected == mode] { (width_label(mode)) }
+        }
+    }
+}
+
+fn width_form(pd: &PageData, id: &str, select_id: &str, mode: &str, active: bool) -> Markup {
+    html! {
+        form method="post" action=(TUNING) {
+            (pd.csrf()) (once_field(&pd.once()))
+            input type="hidden" name="id" value=(id);
+            div.relay-bandwidth {
+                label for=(select_id) { "Bandwidth" }
+                select id=(select_id) name="width_mode" { (width_options(mode)) }
+            }
+            p.relay-copy { "Auto tuning may briefly interrupt traffic while adjusting bandwidth." }
+            @if active {
+                label.relay-consent {
+                    input type="checkbox" name="confirmed" value="1" checked required;
+                    span { "Applying reconnects this Wi-Fi and briefly interrupts internet access. Cellular data may be used if already enabled." }
+                }
+            } @else {
+                input type="hidden" name="confirmed" value="1";
+                p.relay-copy { "Saved for the next connection. If this Wi-Fi is connected when you apply, it will reconnect." }
+            }
+            p.actions { button.relay-btn.relay-secondary type="submit" { "Apply" } }
+        }
+    }
+}
+
 pub fn custom_post(path: &str) -> bool {
-    [CONFIG, CONNECT, FORGET, CLOCK, super::reservations::APPLY].contains(&path)
+    [CONFIG, CONNECT, FORGET, CLOCK, TUNING, super::reservations::APPLY].contains(&path)
 }
 
 pub async fn post(ctx: Ctx, req: Request) -> Response {
     let nonce = CspNonce::of(&req);
     let path = req.uri().path().to_owned();
-    let home = if path == super::reservations::APPLY { super::reservations::PATH } else if [CONNECT, FORGET, CLOCK].contains(&path.as_str()) { RELAY } else { MIHOMO };
+    let home = if path == super::reservations::APPLY { super::reservations::PATH } else if [CONNECT, FORGET, CLOCK, TUNING].contains(&path.as_str()) { RELAY } else { MIHOMO };
     let (parts, body) = req.into_parts();
     let Some(p) = session::find_session(&ctx.app.auth, &parts.headers) else {
-        return session::reply_unread(&parts.headers, body, session::login_redirect(&HttpMethod::POST, &path, None)).await;
+        return session::reply_unread(&parts.headers, body, session::login_redirect(&HttpMethod::POST, home, None)).await;
     };
     if !api::header(&parts.headers, "content-type").is_some_and(|s| s.split(';').next() == Some("application/x-www-form-urlencoded")) {
         return session::reply_unread(&parts.headers, body, render::bad_request(&nonce)).await;
@@ -300,20 +367,29 @@ pub async fn post(ctx: Ctx, req: Request) -> Response {
     if !session::verify_post(&ctx.app.auth, &parts.headers, &p, form.get("csrf")) {
         return render::form_refused(&nonce, home);
     }
-    let api_path = if path == super::reservations::APPLY { "/api/router/reservations" } else if path == CONNECT { "/api/wifi-relay/connect" } else if path == FORGET { "/api/wifi-relay/forget" } else if path == CLOCK { "/api/wifi-relay/clock" } else { "/api/mihomo/config" };
-    let (method, data, success) = if path == super::reservations::APPLY {
-        (Method::Post, json!({"action":form.get("action").unwrap_or(""),"id":form.get("id").unwrap_or(""),"name":form.get("name").unwrap_or(""),"mac":form.get("mac").unwrap_or(""),"ip":form.get("ip").unwrap_or("")}), "Reservation updated. Reconnect the client to renew its IPv4 lease.")
-    } else if path == FORGET {
-        (Method::Post, json!({"id":form.get("id").unwrap_or("")}), "Remembered network removed. Active relay is unchanged.")
-    } else if path == CLOCK {
-        (Method::Post, json!({}), "Time verified over Wi-Fi. Relay connection was not restarted.")
-    } else if path == CONNECT {
+    let width_mode = if path == CONNECT || path == TUNING {
         if form.get("confirmed") != Some("1") {
             return render::error(400, "Confirmation required", "Confirm the hotspot interruption and possible cellular data charges.", &nonce);
         }
+        match form.get("width_mode") {
+            Some(mode @ ("off" | "auto")) => Some(mode),
+            None | Some("saved") if path == CONNECT => None,
+            _ => return render::error(400, "Invalid bandwidth choice", "Choose negotiated bandwidth or experimental Auto. When connecting, you can also use the network’s saved choice.", &nonce),
+        }
+    } else { None };
+    let api_path = if path == super::reservations::APPLY { "/api/router/reservations" } else if path == CONNECT { "/api/wifi-relay/connect" } else if path == FORGET { "/api/wifi-relay/forget" } else if path == CLOCK { "/api/wifi-relay/clock" } else if path == TUNING { "/api/wifi-relay/tuning" } else { "/api/mihomo/config" };
+    let (method, data, success) = if path == super::reservations::APPLY {
+        (Method::Post, json!({"action":form.get("action").unwrap_or(""),"id":form.get("id").unwrap_or(""),"name":form.get("name").unwrap_or(""),"mac":form.get("mac").unwrap_or(""),"ip":form.get("ip").unwrap_or("")}), "Reservation updated. Reconnect the client to renew its IPv4 lease.")
+    } else if path == FORGET {
+        (Method::Post, json!({"id":form.get("id").unwrap_or("")}), "Saved Wi-Fi choice and any remembered password removed. Active relay is unchanged.")
+    } else if path == CLOCK {
+        (Method::Post, json!({}), "Time verified over Wi-Fi. Relay connection was not restarted.")
+    } else if path == TUNING {
+        (Method::Post, json!({"id":form.get("id").unwrap_or(""),"width_mode":width_mode,"confirmed":true}), "Wi-Fi bandwidth choice saved.")
+    } else if path == CONNECT {
         (
             Method::Post,
-            json!({"network":form.get("network").unwrap_or(""),"password":form.get("password").unwrap_or(""),"confirmed":true,"ipv6":form.get("ipv6")==Some("1"),"remember":form.get("remember")==Some("1")}),
+            json!({"network":form.get("network").unwrap_or(""),"password":form.get("password").unwrap_or(""),"confirmed":true,"ipv6":form.get("ipv6")==Some("1"),"remember":form.get("remember")==Some("1"),"width_mode":width_mode}),
             "Wi-Fi relay connected. Internet access still needs verification; a hotel may require web login.",
         )
     } else {
