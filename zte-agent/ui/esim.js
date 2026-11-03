@@ -1,12 +1,12 @@
 'use strict';
 (() => {
   const UI=OpenU60UI,API=OpenU60Console,E=OpenU60Esim,{el,button,say,json,request,confirm,mutate}=UI;
-  let inventory=null,chip=null,receipts=null,switchState={state:'idle'},download={state:'idle'},attempted=false,loading=false,chipLoading=false;
+  let inventory=null,chip=null,receipts=null,switchState={state:'idle'},download={state:'idle'},attempted=false,loading=false,chipLoading=false,qrBusy=false;
   let pendingSwitch=null,pendingDownload=false,refreshQueued=false,renameId=null,renameBaseline='',renameDirty=false,activationDirty=false,passwordRequired=false;
-  let lastStatusAt=null,sourceAvailable=false,agentInstance=null,downloadRevision=0;
+  let lastStatusAt=null,sourceAvailable=false,agentInstance=null,downloadRevision=0,qrMessage='',qrError=false;
   const route=()=>OpenU60Navigation.current.key==='network/esim';
   const online=()=>API.connected && !API.locked;
-  const busy=()=>loading || chipLoading || UI.saving || E.switchBusy(switchState) || E.downloadBusy(download) || !!pendingSwitch || pendingDownload;
+  const busy=()=>loading || chipLoading || qrBusy || UI.saving || E.switchBusy(switchState) || E.downloadBusy(download) || !!pendingSwitch || pendingDownload;
   const ready=()=>online() && sourceAvailable && !passwordRequired && inventory && !inventory.stale && !inventory.updating && !busy();
   const dashboardProfiles=document.querySelector('#dashboard-esim-profiles'),dashboardStatus=document.querySelector('#dashboard-esim-status'),dashboardFeedback=document.querySelector('#dashboard-esim-feedback');
   const switchPanel=UI.panel('network/esim','esim-switch','Profile connection','A profile is fully connected only after the card, modem and mobile data are confirmed.');switchPanel.classList.add('esim-status-panel');
@@ -21,10 +21,11 @@
   const renameChoice=el('select'),renameInput=el('input');renameChoice.id='esim-rename-profile';renameInput.id='esim-nickname';renameInput.maxLength=64;renameInput.autocomplete='off';
   function formField(parent,label,input,help){const wrapper=el('div','form-field'),name=el('label','',label);name.htmlFor=input.id;wrapper.append(name,input);if(help){const note=el('small','field-help',help);note.id=input.id+'-help';input.setAttribute('aria-describedby',note.id);wrapper.append(note);}parent.append(wrapper);}
   formField(renameFields,'Profile',renameChoice);formField(renameFields,'Nickname',renameInput,'At most 64 UTF-8 bytes. Leave blank to clear the saved nickname.');const renameActions=el('div','form-actions'),saveName=button('Save nickname',null,'primary'),discardName=button('Discard edits',()=>selectRename(renameId));saveName.type='submit';renameActions.append(saveName,discardName);renameForm.append(renameFields,renameActions);rename.append(renameForm);const renameFeedback=UI.status(rename);
-  const add=UI.panel('network/esim','esim-add','Add an eSIM profile','Paste the activation code supplied by your operator or decoded from its QR code. The router downloads the profile using its mobile connection.');
+  const add=UI.panel('network/esim','esim-add','Add an eSIM profile','Choose your operator’s QR image or enter its activation code. The router downloads the profile using its mobile connection.');
   const addForm=el('form','settings-form'),addFields=el('fieldset','form-grid');addFields.disabled=true;addFields.append(el('legend','sr-only','Add an eSIM profile'));
+  const qrUpload=el('div','esim-qr-upload'),qrMark=el('span','esim-qr-mark'),qrCopy=el('div','esim-qr-copy'),qrTitle=el('strong','','Use a QR image'),qrHelp=el('small','','JPEG or PNG · up to 8 MB · decoded only by this U60'),qrState=el('span','esim-qr-state','No image selected'),qrInput=el('input','esim-qr-file'),qrLabel=el('label','button esim-qr-button','Choose QR image');qrMark.setAttribute('aria-hidden','true');qrState.id='esim-qr-status';qrState.setAttribute('role','status');qrState.setAttribute('aria-live','polite');qrInput.id='esim-qr-file';qrInput.type='file';qrInput.accept='image/jpeg,image/png';qrInput.setAttribute('aria-describedby',qrState.id);qrLabel.htmlFor=qrInput.id;qrCopy.append(qrTitle,qrHelp,qrState);qrUpload.append(qrMark,qrCopy,qrInput,qrLabel);addFields.append(qrUpload);
   const activation=el('input'),confirmationCode=el('input');activation.id='esim-activation-code';activation.type='password';activation.autocomplete='off';activation.maxLength=512;activation.required=true;activation.placeholder='LPA:1$server$matching-ID';confirmationCode.id='esim-confirmation-code';confirmationCode.type='password';confirmationCode.autocomplete='off';confirmationCode.maxLength=64;
-  formField(addFields,'Activation code',activation,'Activation and confirmation codes stay in this tab and are cleared after submission.');formField(addFields,'Confirmation code (if supplied)',confirmationCode);
+  formField(addFields,'Activation code',activation,'The QR image is discarded after decoding. Activation and confirmation codes stay in this tab and are cleared after submission.');formField(addFields,'Confirmation code (if supplied)',confirmationCode);
   const addActions=el('div','form-actions'),start=button('Review & download',null,'primary'),clearCode=button('Clear codes',clearCodes);start.type='submit';addActions.append(start,clearCode);addForm.append(addFields,addActions);add.append(addForm);const addFeedback=UI.status(add);
   const progressPanel=UI.panel('network/esim','esim-download','Download & installation','You review the operator’s profile details before installation. A downloaded profile stays disabled until you activate it.');
   const progressTitle=el('h3','','No download in progress'),progressCopy=el('p','section-subtitle'),preview=el('dl','settings-facts'),downloadActions=el('div','form-actions diagnostic-actions');
@@ -36,9 +37,11 @@
   const cards=new Map(),profileKeys=new Map(),keyProfiles=new Map();let nextProfileKey=0;
   function profileKey(id){if(!id)return '';if(!profileKeys.has(id)){const key=`profile-${++nextProfileKey}`;profileKeys.set(id,key);keyProfiles.set(key,id);}return profileKeys.get(id);}
   const byteText=value=>value===null || value===undefined ? 'Not reported' : Number.isFinite(Number(value)) ? `${(Number(value)/1024).toFixed(1)} KiB` : 'Not reported';
-  function clearCodes(){activation.value='';confirmationCode.value='';activationDirty=false;add.dataset.dirty='false';}
-  function markDraft(){activationDirty=!!(activation.value || confirmationCode.value);add.dataset.dirty=String(activationDirty);}
+  function drawQr(){qrUpload.dataset.state=qrError?'error':qrBusy?'busy':qrMessage?'ready':'idle';qrState.textContent=qrBusy?'Reading QR image on the router…':qrMessage || 'No image selected';qrLabel.textContent=qrBusy?'Reading image…':'Choose QR image';qrLabel.setAttribute('aria-disabled',String(!ready() || qrBusy));}
+  function clearCodes(){activation.value='';confirmationCode.value='';qrInput.value='';qrMessage='';qrError=false;activationDirty=false;add.dataset.dirty='false';drawQr();}
+  function markDraft(event){activationDirty=!!(activation.value || confirmationCode.value);add.dataset.dirty=String(activationDirty);if(event?.isTrusted && qrMessage){qrMessage='';qrError=false;drawQr();}}
   addForm.addEventListener('input',markDraft);
+  qrInput.addEventListener('change',decodeQr);
   function acceptInventory(data){const next=E.inventory(data);if(E.older(next,inventory))return false;inventory=next;drawProfiles();render();return true;}
   function selectRename(id){renameId=id;const profile=inventory?.profiles.find(profile=>profile.iccid===id);renameChoice.value=profileKey(id);renameBaseline=profile?.nickname || '';renameInput.value=renameBaseline;renameDirty=false;rename.dataset.dirty='false';render();}
   renameChoice.addEventListener('change',async()=>{const selected=keyProfiles.get(renameChoice.value);renameChoice.value=profileKey(renameId);if(!renameDirty || await confirm('Discard nickname edits?','Choose another profile and discard this nickname draft.',{label:'Discard edits'}))selectRename(selected);});
@@ -74,7 +77,7 @@
     if(!inventory?.profiles.some(profile=>profile.state==='enabled'))statNodes.active.textContent='Not reported';OpenU60Numbers.set(statNodes.receipts,receipts?.count ?? inventory?.pending_receipts ?? '—');
     freshness.textContent=passwordRequired ? 'Set an agent password before managing eSIM profiles.' : lastStatusAt ? `${online() && sourceAvailable ? 'Live eSIM status' : 'Last received eSIM status'} · ${new Date(lastStatusAt).toLocaleTimeString()}${inventory?.updating ? ' · card busy or SIM reloading' : inventory?.stale ? ' · saved profile list; read again before changing it' : ''}` : 'Waiting for eSIM status.';freshness.dataset.stale=String(!online() || !sourceAvailable || passwordRequired || !!inventory?.stale);
     reload.disabled=!online() || loading || chipLoading || UI.saving || E.downloadBusy(download) || E.switchBusy(switchState);readChip.disabled=reload.disabled;readReceipts.disabled=reload.disabled;sendReceipts.disabled=!ready() || !receipts?.count || receipts?.retrying;
-    renameFields.disabled=!ready() || !renameId;saveName.disabled=!ready() || !renameDirty;discardName.disabled=!renameDirty || UI.saving;addFields.disabled=!ready();start.disabled=!ready() || !activation.value.trim() || download.state!=='idle';clearCode.disabled=!activationDirty || UI.saving;
+    renameFields.disabled=!ready() || !renameId;saveName.disabled=!ready() || !renameDirty;discardName.disabled=!renameDirty || UI.saving;addFields.disabled=!ready();start.disabled=!ready() || !activation.value.trim() || download.state!=='idle';clearCode.disabled=!activationDirty || UI.saving;qrInput.disabled=!ready() || qrBusy;drawQr();
     for(const profile of inventory?.profiles || []){const card=cards.get(profile.iccid);if(!card)continue;card.activate.disabled=!ready() || profile.state!=='disabled' || profile.class!=='operational';card.renameButton.disabled=!ready();card.remove.disabled=!ready() || profile.state!=='disabled';}
     switchPanel.dataset.state=pendingSwitch && !pendingSwitch.observed ? 'pending' : switchState.state;
     switchTitle.textContent=pendingSwitch && !pendingSwitch.observed ? 'Waiting for switch confirmation' : switchState.state==='idle' ? 'No switch in progress' : `Profile switch · ${switchState.state.replaceAll('_',' ')}`;
@@ -103,6 +106,21 @@
     finally{if(UI.current(epoch)){chipLoading=false;render();}}
   }
   async function freshProfile(id){const current=await getInventory();if(current.stale || current.updating)throw new Error('The card is busy or its list is stale. Read profiles again before changing it.');const profile=current.profiles.find(profile=>profile.iccid===id);if(!profile)throw new Error('That profile is no longer on the current card.');return {current,profile};}
+  async function decodeQr(){
+    const file=qrInput.files?.[0];if(!file)return;const epoch=UI.epoch,previous=!!(activation.value.trim() || confirmationCode.value.trim());
+    if(previous && !await confirm('Replace the current activation codes?','Reading this QR image will replace the activation and confirmation codes currently in the form.',{label:'Replace codes'})){qrInput.value='';return;}
+    const extension=file.name.toLowerCase().split('.').pop(),media=file.type==='image/jpeg'||file.type==='image/png'?file.type:extension==='jpg'||extension==='jpeg'?'image/jpeg':extension==='png'?'image/png':'';
+    if(!media){qrInput.value='';qrMessage='Choose a JPEG or PNG image.';qrError=true;drawQr();return;}
+    if(file.size>8*1024*1024){qrInput.value='';qrMessage='This image is larger than 8 MB. Choose a smaller image.';qrError=true;drawQr();return;}
+    qrBusy=true;qrMessage='';qrError=false;render();
+    try{
+      const result=await request('/api/esim/qr',{method:'POST',body:file,contentType:media,timeoutMs:135000});if(!UI.current(epoch))return;
+      if(typeof result.activation_code!=='string'||!/^[Ll][Pp][Aa]:1\$/.test(result.activation_code))throw new Error('The router returned an invalid activation code.');
+      activation.value=result.activation_code;confirmationCode.value='';markDraft();qrMessage=result.confirmation_code_required?'QR code read. Enter the separate confirmation code from your operator.':'QR code read. The activation code is ready for review.';qrError=false;
+      (result.confirmation_code_required?confirmationCode:start).focus({preventScroll:true});
+    }catch(error){if(UI.current(epoch)){qrMessage=error.message;qrError=true;}}
+    finally{qrBusy=false;qrInput.value='';if(UI.current(epoch))render();}
+  }
   async function switchProfile(id){
     if(!ready())return;const epoch=UI.epoch;
     try{const {current,profile}=await freshProfile(id);if(!UI.current(epoch))return;if(profile.state!=='disabled' || profile.class!=='operational')throw new Error('Only an inactive operational profile can be activated.');acceptInventory(current);
@@ -150,7 +168,7 @@
     switchState=data.switch || switchState;if(data.download){downloadRevision++;download=data.download;}receipts=data.receipts || receipts;if(E.downloadBusy(download))pendingDownload=false;reconcileSwitch();if(oldDownloadBusy && !E.downloadBusy(download) || oldSwitchBusy && !E.switchBusy(switchState))queueRefresh();render();refreshAfterJob();
   });
   window.addEventListener('dashboard:connection',render);window.addEventListener('dashboard:navigate',()=>{render();refreshAfterJob();});window.addEventListener('dashboard:mutation-complete',()=>{render();refreshAfterJob();});
-  UI.track({route:'network/esim',get loaded(){return attempted;},get dirty(){return renameDirty || activationDirty;},load,clear(){inventory=null;chip=null;receipts=null;switchState={state:'idle'};download={state:'idle'};attempted=false;loading=false;chipLoading=false;pendingSwitch=null;pendingDownload=false;refreshQueued=false;renameId=null;renameBaseline='';renameDirty=false;passwordRequired=false;lastStatusAt=null;sourceAvailable=false;agentInstance=null;downloadRevision++;clearCodes();renameInput.value='';renameChoice.replaceChildren();rename.dataset.dirty='false';cards.clear();profileKeys.clear();keyProfiles.clear();nextProfileKey=0;profileList.replaceChildren();for(const node of [feedback,renameFeedback,addFeedback,downloadFeedback,chipFeedback,receiptFeedback])say(node,'Unlock the console to read eSIM information.');say(dashboardFeedback,'Unlock the console to switch eSIM profiles.');drawProfiles();render();}});
+  UI.track({route:'network/esim',get loaded(){return attempted;},get dirty(){return renameDirty || activationDirty;},load,clear(){inventory=null;chip=null;receipts=null;switchState={state:'idle'};download={state:'idle'};attempted=false;loading=false;chipLoading=false;qrBusy=false;pendingSwitch=null;pendingDownload=false;refreshQueued=false;renameId=null;renameBaseline='';renameDirty=false;passwordRequired=false;lastStatusAt=null;sourceAvailable=false;agentInstance=null;downloadRevision++;clearCodes();renameInput.value='';renameChoice.replaceChildren();rename.dataset.dirty='false';cards.clear();profileKeys.clear();keyProfiles.clear();nextProfileKey=0;profileList.replaceChildren();for(const node of [feedback,renameFeedback,addFeedback,downloadFeedback,chipFeedback,receiptFeedback])say(node,'Unlock the console to read eSIM information.');say(dashboardFeedback,'Unlock the console to switch eSIM profiles.');drawProfiles();render();}});
   UI.track({route:'dashboard/overview',get loaded(){return attempted;},load,clear(){renderDashboard();}});
   drawProfiles();render();
 })();
