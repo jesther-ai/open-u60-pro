@@ -178,11 +178,12 @@
       text('signal-quality', signalQuality(OpenU60Cellular.parse(signal.data || {}).primary?.rsrp));
     }
   }
+  const speedValue = (data, modem, fallback) => data?.[modem] ?? data?.[fallback];
   function renderSpeed(data) {
-    const rx = number(data?.rx_speed), tx = number(data?.tx_speed);
+    const rx = number(speedValue(data,'real_rx_speed','rx_speed')), tx = number(speedValue(data,'real_tx_speed','tx_speed'));
     text('download', rx === null ? null : (rx * 8 / 1e6).toFixed(2));
     text('upload', tx === null ? null : (tx * 8 / 1e6).toFixed(2));
-    text('received', bytes(data?.rx_bytes)); text('sent', bytes(data?.tx_bytes));
+    text('received', bytes(speedValue(data,'real_rx_bytes','rx_bytes'))); text('sent', bytes(speedValue(data,'real_tx_bytes','tx_bytes')));
     history.push(rx === null || tx === null ? null : [rx, tx]);
     history = history.slice(-30);
     const ceiling = Math.max(1, ...history.filter(Boolean).flat());
@@ -319,7 +320,7 @@
     // Current rates must never masquerade as live while the connection is down.
     renderSpeed(null);
     const speed = lastGood.get('speed')?.data;
-    text('received', bytes(speed?.rx_bytes)); text('sent', bytes(speed?.tx_bytes));
+    text('received', bytes(speedValue(speed,'real_rx_bytes','rx_bytes'))); text('sent', bytes(speedValue(speed,'real_tx_bytes','tx_bytes')));
     if (streamIncludesSms) text('sms-status','Connection interrupted · Showing the last received messages.');
     updateConnection();
   }

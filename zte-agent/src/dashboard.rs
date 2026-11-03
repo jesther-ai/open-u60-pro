@@ -36,7 +36,9 @@ const READINGS: &[(&str, u64)] = &[
     ("modem", 5),
     ("mobile", 5),
     ("charging", 10),
-    ("speed", 2),
+    // `get_wwandst` publishes a fresh one-second rate; sampling at the same
+    // cadence avoids skipped peaks and keeps the animated values responsive.
+    ("speed", 1),
     ("battery", 10),
     ("wifi", 10),
     ("guest", 10),
@@ -487,6 +489,36 @@ fn is_sms(name: &str) -> bool {
     matches!(name, "sms" | "sms_capacity")
 }
 
+/// Prefer the firmware's traffic accounting: IPA offload can bypass the
+/// kernel counters behind `/api/network/speed`. The legacy endpoint remains a
+/// compatibility fallback when this firmware does not return a complete
+/// sample.
+fn speed_reading(state: &AppState) -> (u16, Value) {
+    let modem = network_ext::network_speeds(state);
+    if modem.0 == 200 && complete_modem_speed(&modem.1["data"]) {
+        modem
+    } else {
+        handlers::network_speed(state)
+    }
+}
+
+fn complete_modem_speed(data: &Value) -> bool {
+    let counter = |key: &str| {
+        data[key].as_u64().is_some()
+            || data[key]
+                .as_str()
+                .is_some_and(|value| value.trim().parse::<u64>().is_ok())
+    };
+    [
+        "real_rx_speed",
+        "real_tx_speed",
+        "real_rx_bytes",
+        "real_tx_bytes",
+    ]
+    .into_iter()
+    .all(counter)
+}
+
 fn read(state: &AppState, name: &str) -> Value {
     let (_, mut result) = match name {
         "device" => handlers::device(state),
@@ -496,7 +528,7 @@ fn read(state: &AppState, name: &str) -> Value {
         "modem" => handlers::modem_status(state),
         "mobile" => modem_ext::modem_data_get(state),
         "charging" => device_ext::charge_control_get(state),
-        "speed" => handlers::network_speed(state),
+        "speed" => speed_reading(state),
         "battery" => handlers::battery(state),
         "wifi" => wifi::wifi_status(state),
         "guest" => wifi::guest_status(state),
@@ -671,6 +703,54 @@ pub fn response(app: Arc<AppState>, url: String, token: String) -> axum::respons
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn speed_sampling_matches_the_modems_one_second_rate() {
+        assert_eq!(
+            READINGS.iter().find(|(name, _)| *name == "speed"),
+            Some(&("speed", 1))
+        );
+    }
+
+    #[test]
+    fn modem_speed_accepts_complete_idle_sample() {
+        assert!(complete_modem_speed(&json!({
+            "real_rx_speed": 0,
+            "real_tx_speed": "0",
+            "real_rx_bytes": 2_039_609_516u64,
+            "real_tx_bytes": "312816092",
+        })));
+    }
+
+    #[test]
+    fn modem_speed_rejects_incomplete_sample() {
+        let complete = json!({
+            "real_rx_speed": 0,
+            "real_tx_speed": 0,
+            "real_rx_bytes": 2_039_609_516u64,
+            "real_tx_bytes": 312_816_092u64,
+        });
+        for missing in [
+            "real_rx_speed",
+            "real_tx_speed",
+            "real_rx_bytes",
+            "real_tx_bytes",
+        ] {
+            let mut incomplete = complete.clone();
+            incomplete.as_object_mut().unwrap().remove(missing);
+            assert!(!complete_modem_speed(&incomplete), "missing {missing}");
+        }
+    }
+
+    #[test]
+    fn modem_speed_rejects_invalid_counter() {
+        assert!(!complete_modem_speed(&json!({
+            "real_rx_speed": "1.5",
+            "real_tx_speed": 0,
+            "real_rx_bytes": 1,
+            "real_tx_bytes": 1,
+        })));
+    }
 
     #[test]
     fn dns_topic_is_private_and_ttl_only_changes_do_not_emit() {

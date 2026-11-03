@@ -20,7 +20,7 @@ const path = require('node:path');
     modem: {operate_mode:'ONLINE'},
     sms: {messages:[{id:2,number:'+639170001234',content:'00480065006C006C006F0020005500360030',date:'26,10,25,12,30,00,+32',tag:'1',mem_store:'nv'},{id:1,number:'Carrier',content:'003C0069006D00670020007300720063003D0078003E',date:'26,10,25,11,00,00,+32',tag:'0',mem_store:'sim'}]},
     sms_capacity: {sms_nv_total:500,sms_nvused_total:2,sms_sim_total:30,sms_simused_total:1,sms_dev_unread_num:1},
-    speed: {rx_speed:15400000,tx_speed:1640000,rx_bytes:8400000000,tx_bytes:1200000000},
+    speed: {real_rx_speed:15400000,real_tx_speed:1640000,real_rx_bytes:8400000000,real_tx_bytes:1200000000},
     battery: {capacity:86,status:'Charging',temperature:327},
     wifi: {wifi_onoff:'1',radio2_disabled:'0',radio5_disabled:'0',ssid_2g:'OpenU60',ssid_5g:'OpenU60 · 5G',channel_2g:'6',channel_5g:'149'},
     clients: {hosts:{'aa:bb:cc:dd:ee:01':{name:'MacBook Pro',ipaddrs:['192.168.0.102']},'aa:bb:cc:dd:ee:02':{name:'<img src=x onerror=alert(1)>',ipaddrs:['192.168.0.104']}},dhcp_leases:[{hostname:'Living room TV',ipaddr:'192.168.0.108',macaddr:'aa:bb:cc:dd:ee:03'}]},
@@ -100,6 +100,7 @@ const path = require('node:path');
   fixtures.esim_status.switch={state:'reloading',generation:2,target_iccid:esimIds[1]};esimInventory.updating=true;push(['esim_status']);await page.waitForFunction(()=>document.querySelector('#dashboard-esim-status').textContent.includes('SIM to reload'));
   const switchReads=profileReadCount();esimInventory.profiles[0].state='disabled';esimInventory.profiles[1].state='enabled';esimInventory.updating=false;esimInventory.generation=2;fixtures.esim_status.switch={state:'connected',generation:2,target_iccid:esimIds[1]};push(['esim_status']);await page.waitForFunction(()=>document.querySelector('#dashboard-esim-profiles .dashboard-esim-profile[aria-current="true"] strong').textContent==='GOMO');await page.waitForTimeout(100);assert.equal(profileReadCount(),switchReads,'dashboard switch completion is pushed over SSE without polling');
   assert.equal(await page.locator('#download').textContent(),'123.20');
+  const modemSpeed=fixtures.speed;fixtures.speed={rx_speed:2000000,tx_speed:250000,rx_bytes:10,tx_bytes:5};push(['speed']);await page.waitForFunction(()=>document.querySelector('#download').textContent==='16.00');assert.equal(await page.locator('#upload').textContent(),'2.00','legacy kernel fallback remains renderable');fixtures.speed=modemSpeed;push(['speed']);await page.waitForFunction(()=>document.querySelector('#download').textContent==='123.20');
   assert.equal(await page.locator('#device-count').textContent(),'3');
   assert.equal(await page.locator('#wan-ip').textContent(),'10.154.28.6');
   assert.equal(await page.locator('#wan-ipv6').textContent(),'2001:db8:4870:7d0c:1cc7:b83e:60e4:a9c8');
