@@ -18,7 +18,7 @@ thread_local! {
     static IN_HUB_READ: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Inside `read` on this thread: `events::touch` is suppressed.
+/// Inside an internal status projection on this thread: `events::touch` is suppressed.
 pub fn in_hub_read() -> bool {
     IN_HUB_READ.with(Cell::get)
 }
@@ -35,6 +35,13 @@ impl Drop for ReadScope {
     fn drop(&mut self) {
         IN_HUB_READ.with(|c| c.set(self.0));
     }
+}
+
+/// Runs an internal status projection without feeding its watched reads back
+/// into the event sources. The caller must publish the returned projection.
+pub(crate) fn without_touch_notifications<R>(read: impl FnOnce() -> R) -> R {
+    let _scope = ReadScope::enter();
+    read()
 }
 
 /// One read of `t`; `None` for push-only topics (no reader).
