@@ -4,15 +4,46 @@ Notable changes to OpenU60 (the `zte-agent` for the ZTE U60 Pro, and the iOS, An
 
 ## [Unreleased]
 
+## [2.4.0] - 2026-11-04
+
+### Highlights
+
+- **Signed on-device updates.** The agent can now discover, download, verify and install signed Stable or Beta releases without a Mac companion. A/B slots, a boot supervisor, a last-Stable rescue copy, readiness checks and a 60-second health trial keep the previous agent available when a download, install, restart or power loss fails.
+- **One responsive management console.** The responsive console is now the default Web UI on phones, tablets and desktops. It adds data-usage budgets, encrypted DNS and live cache inspection, cellular TTL controls, native WireGuard split tunnels, battery and power details, eSIM switching and QR-image import.
+- **Mobile-first live telemetry.** The operator card leads with the carrier and cellular generation, retains real modem signal bars on narrow screens, and reports the hottest valid device thermal sensor. Modem counters provide accurate live upload/download rates across IPv4- and IPv6-capable carriers.
+
+### Added
+
+- Signed OTA Stable and Beta lanes with immutable GitHub release assets, P-256 channel envelopes, bounded streaming downloads, exact size and SHA-256 verification, compatibility probes and signed channel pointers.
+- Recovery-safe OTA installation: inactive-slot staging, boot-time integrity checks, interrupted-state reconciliation, candidate quarantine, automatic rollback and a separately retained last-Stable binary.
+- Update readiness checks for WAN availability, signal, battery, external power, speed tests, recent eSIM switches and other operations that should not be interrupted. Automatic checking is on by default; automatic download is opt-in and automatic installation remains unavailable.
+- Network → Data Usage with live daily, monthly and total usage, billing-cycle controls, limits and alerts.
+- Network → DNS & Privacy with carrier/manual DNS, DNS-over-HTTPS, DNS-over-TLS/QUIC, resolver testing, rollback, local-cache inspection and Server-Sent Event updates.
+- Configurable cellular packet TTL controls that are reapplied after agent restarts and WAN reconnects.
+- Native WireGuard management with safe split routes; default routes remain blocked in this first release so the local console and cellular fallback stay reachable.
+- eSIM profile switching from the dashboard and activation-code extraction from uploaded QR images.
+- Tools → Battery & Power with streamed charging state, temperature, voltage/current, battery and USB power, time estimates, health, cycles, capacity, input limits and charge-policy details.
+- Overall device temperature on the operator card, derived from the hottest valid reported thermal zone.
+
 ### Changed
 
 - Make the responsive console the only served Web UI. Root and old page bookmarks redirect to the new screens; legacy actions/assets/live streams are retired. Move HTTPS enable/renew/reset, certificate trust instructions and installation into the console while preserving shared security and TLS services. Installed shortcuts launch the new UI.
 
-### Added
+- Redesign mobile navigation to avoid horizontal tab scrolling and use collapsible navigation at tablet and desktop sizes.
+
+- Use firmware modem counters for live traffic rates so carrier-specific IPv4/IPv6 interface layouts do not under-report throughput.
+
+- Make OTA download progress byte-accurate, hold it at 99% during signature verification, and show 100% only after successful staging. Transient chunk progress no longer rewrites the persistent OTA journal for every network read.
+
+### Fixed
 
 - eSIM handover checks the selected profile’s source-bound HTTPS data path before reporting success. A stalled handover may refresh the ZTE data session once when mobile data was already enabled in automatic mode; newer user modem commands cancel recovery. Disabled data, manual mode, APN and roaming preferences are preserved.
 
-- Tools → Battery & Power in the responsive console: streamed charging/discharging state, temperature, voltage/current, battery and USB power, device time-to-full/runtime estimates, health, cycles, capacity, input limits and charge-policy details. Battery power uses voltage × current to avoid an inconsistent driver power reading. Missing measurements remain unreported.
+- Accept an already-active firmware bearer during eSIM downloads instead of incorrectly reporting that the router has no mobile-data connection.
+
+- Stop an eSIM dashboard status feedback loop that could leave the agent using sustained CPU after a profile rename or switch.
+
+- Keep 5G NR bands out of the LTE carrier list in standalone mode and preserve the operator signal glyph on mobile layouts.
 
 ## [2.3.0] - 2026-10-29
 
