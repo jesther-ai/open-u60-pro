@@ -36,6 +36,11 @@ TARGET=aarch64-unknown-linux-musl
 BINARY=target/$TARGET/release/zte-agent
 OTA_ROOT=/data/open-u60/update
 REMOTE_SLOT=$OTA_ROOT/slot-a/zte-agent
+REMOTE_SLOT_META=$OTA_ROOT/slot-a/release.json
+REMOTE_SLOT_BOOTSTRAP_SHA=$OTA_ROOT/slot-a/bootstrap.sha256
+REMOTE_FALLBACK=$OTA_ROOT/slot-b/zte-agent
+REMOTE_FALLBACK_META=$OTA_ROOT/slot-b/release.json
+REMOTE_FALLBACK_BOOTSTRAP_SHA=$OTA_ROOT/slot-b/bootstrap.sha256
 REMOTE_BIN=/data/zte-agent
 SUPERVISOR=/data/local/tmp/zte-agent-supervisor.sh
 SUPERVISOR_LOCAL=scripts/router/zte-agent-supervisor.sh
@@ -383,9 +388,22 @@ else
     ok "Binary deployed to OTA slot A."
 fi
 
+# A bootstrap is an explicit repair/reset operation. Start it with two verified
+# copies rather than preserving an unknown inactive slot from an older layout.
+REMOTE_VERSION=$(rcmd "$REMOTE_SLOT --version" | awk 'NR == 1 {print $2}')
+if [[ ! "$REMOTE_VERSION" =~ ^[0-9A-Za-z][0-9A-Za-z.+-]{0,63}$ ]]; then
+    fail "The deployed agent reported an invalid build version."
+fi
+if ! rcmd "$REMOTE_SLOT ota-probe '$REMOTE_VERSION' >/dev/null 2>&1"; then
+    fail "The deployed agent failed its on-device compatibility probe."
+fi
+info "Seeding the fallback OTA slot..."
+rcmd "cp $REMOTE_SLOT $REMOTE_FALLBACK && chmod 755 $REMOTE_FALLBACK && printf '%s\n%s\n' '$LOCAL_SHA' '$REMOTE_VERSION' > $REMOTE_FALLBACK_BOOTSTRAP_SHA && chmod 600 $REMOTE_FALLBACK_BOOTSTRAP_SHA && rm -f $REMOTE_FALLBACK_META $OTA_ROOT/slot-b/release.json.download"
+ok "Fallback OTA slot seeded."
+
 info "Installing the A/B update supervisor..."
 rpush "$SUPERVISOR_LOCAL" "$SUPERVISOR"
-rcmd "chmod 755 $SUPERVISOR; printf 'a\n' > $OTA_ROOT/active; chmod 600 $OTA_ROOT/active; rm -f $OTA_ROOT/pending $OTA_ROOT/state.json; ln -sfn $REMOTE_SLOT $REMOTE_BIN.next; mv -f $REMOTE_BIN.next $REMOTE_BIN"
+rcmd "chmod 755 $SUPERVISOR; printf '%s\n%s\n' '$LOCAL_SHA' '$REMOTE_VERSION' > $REMOTE_SLOT_BOOTSTRAP_SHA; chmod 600 $REMOTE_SLOT_BOOTSTRAP_SHA; printf 'a\n' > $OTA_ROOT/active; chmod 600 $OTA_ROOT/active; rm -f $REMOTE_SLOT_META $OTA_ROOT/slot-a/release.json.download $OTA_ROOT/pending $OTA_ROOT/state.json; ln -sfn $REMOTE_SLOT $REMOTE_BIN.next; mv -f $REMOTE_BIN.next $REMOTE_BIN"
 BINARY_CHANGED=true
 ok "OTA bootstrap and rollback supervisor installed."
 

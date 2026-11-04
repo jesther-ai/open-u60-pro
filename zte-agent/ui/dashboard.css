@@ -592,13 +592,20 @@ h1>span {
   gap:5px;
   align-items:flex-end;
   height:50px;
-  opacity:.65;
   flex-shrink:0
 }
 .connection-symbol i {
   width:7px;
   background:var(--highlight);
-  border-radius:2px
+  border-radius:2px;
+  opacity:.2;
+  transition:opacity .2s ease
+}
+.connection-symbol i[data-active="true"] {
+  opacity:1
+}
+.connection-symbol[data-available="false"] {
+  opacity:.5
 }
 .connection-symbol i:nth-child(1) {
   height:10px
@@ -1333,21 +1340,52 @@ dialog .button {
   }
   .connection-panel {
     display: grid;
-    grid-template-columns: minmax(0, 1fr);
+    grid-template-columns: minmax(0, 1fr) auto;
     gap: 24px;
     padding: 24px;
+  }
+  .connection-identity {
+    grid-column:1 / -1;
+    grid-row:1;
+    padding-right:46px
   }
   .connection-panel h2 {
     max-width:none;
     font-size:clamp(29px,9vw,36px)
   }
   .connection-symbol {
-    display: none;
+    display:flex;
+    grid-column:2;
+    grid-row:1;
+    align-self:start;
+    justify-self:end;
+    gap:3px;
+    height:30px;
+    margin-top:3px
+  }
+  .connection-symbol i {
+    width:4px
+  }
+  .connection-symbol i:nth-child(1) {
+    height:6px
+  }
+  .connection-symbol i:nth-child(2) {
+    height:12px
+  }
+  .connection-symbol i:nth-child(3) {
+    height:18px
+  }
+  .connection-symbol i:nth-child(4) {
+    height:24px
+  }
+  .connection-symbol i:nth-child(5) {
+    height:30px
   }
   .connection-meta #network-type {
     font-size:19px
   }
   .connection-facts {
+    grid-column:1 / -1;
     display: grid;
     grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
     gap: 20px;
@@ -2377,7 +2415,7 @@ dialog .button {
 .update-current>span,.update-progress span { display:block; color:var(--muted); font:8px var(--mono); letter-spacing:.11em; }
 .update-current strong { display:block; margin:8px 0 5px; color:var(--selected-ink); font-size:24px; overflow-wrap:anywhere; }
 .update-current small { display:block; color:var(--muted); font-size:8px; line-height:1.5; overflow-wrap:anywhere; }
-.update-state-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); margin:24px 0; border:1px solid var(--line); }
+.update-state-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); margin:24px 0; border:1px solid var(--line); }
 .update-state-grid article { min-width:0; padding:18px; }
 .update-state-grid article+article { border-left:1px solid var(--line); }
 .update-state-grid strong { display:block; margin:8px 0 5px; font-size:13px; overflow-wrap:anywhere; }
@@ -2407,7 +2445,7 @@ dialog .button {
   .update-actions { display:grid; grid-template-columns:minmax(0,1fr); }
   .update-actions .button { width:100%; }
 }
-@media(prefers-reduced-motion:reduce) { .update-progress-track i { transition:none; } }
+@media(prefers-reduced-motion:reduce) { .update-progress-track i,.connection-symbol i { transition:none; } }
 @media (min-width:768px) and (max-width:1023px) and (max-height:500px) and (hover:none) and (pointer:coarse) {
   main {
     padding-top: 16px;
@@ -2803,12 +2841,31 @@ fieldset:disabled { opacity: .6; }
 #esim-switch .esim-switch-state .section-subtitle { max-width:760px; line-height:1.7; }
 #esim-download .settings-facts { margin: 24px 0; }
 #esim-chip .settings-facts dd { overflow-wrap: anywhere; }
+.esim-qr-upload { grid-column:1/-1; position:relative; display:grid; grid-template-columns:52px minmax(0,1fr) auto; align-items:center; gap:16px; min-width:0; padding:18px; border:1px solid var(--line); border-left:3px solid var(--accent); border-radius:6px; background:var(--surface-soft); }
+.esim-qr-mark { width:48px; height:48px; border:1px solid var(--live-border); border-radius:5px; color:var(--accent); background:linear-gradient(currentColor 0 0) 7px 7px/11px 11px no-repeat,linear-gradient(currentColor 0 0) 30px 7px/11px 11px no-repeat,linear-gradient(currentColor 0 0) 7px 30px/11px 11px no-repeat,linear-gradient(currentColor 0 0) 27px 27px/5px 5px no-repeat,linear-gradient(currentColor 0 0) 36px 32px/5px 9px no-repeat,var(--live-surface); box-shadow:inset 0 0 0 4px var(--surface-soft); }
+.esim-qr-copy { display:grid; gap:5px; min-width:0; }
+.esim-qr-copy strong { font-size:14px; letter-spacing:-.1px; }
+.esim-qr-copy small,.esim-qr-state { color:var(--muted); font-size:11px; line-height:1.55; overflow-wrap:anywhere; }
+.esim-qr-state { font-family:var(--mono); }
+.esim-qr-upload[data-state="ready"] .esim-qr-state { color:var(--accent); }
+.esim-qr-upload[data-state="error"] { border-left-color:var(--warning-accent); }
+.esim-qr-upload[data-state="error"] .esim-qr-state { color:var(--warning-ink); }
+.esim-qr-upload[data-state="busy"] .esim-qr-mark { animation:esim-qr-pulse 1.2s ease-in-out infinite alternate; }
+.control-panel .esim-qr-file { position:absolute; width:1px; min-width:1px; height:1px; min-height:1px; padding:0; opacity:0; overflow:hidden; pointer-events:none; }
+.esim-qr-button { cursor:pointer; }
+.esim-qr-button[aria-disabled="true"] { opacity:.5; cursor:default; pointer-events:none; }
+.esim-qr-file:focus-visible + .esim-qr-button { outline:2px solid var(--accent); outline-offset:3px; }
+@keyframes esim-qr-pulse { from { opacity:.55; } to { opacity:1; } }
 @media(max-width:1199px) { #esim-profile-list .rule-card { flex-direction: column; gap: 16px; } }
 @media(max-width:767px) {
   #esim-profiles .routing-stats { grid-template-columns: minmax(0,1fr); gap: 22px; }
   #esim-profile-list .rule-actions { flex-wrap: wrap; width: 100%; }
   #esim-profile-list .rule-actions .button { flex: 1 1 100px; }
+  .esim-qr-upload { grid-template-columns:44px minmax(0,1fr); padding:16px; }
+  .esim-qr-mark { width:40px; height:40px; background:linear-gradient(currentColor 0 0) 6px 6px/9px 9px no-repeat,linear-gradient(currentColor 0 0) 25px 6px/9px 9px no-repeat,linear-gradient(currentColor 0 0) 6px 25px/9px 9px no-repeat,linear-gradient(currentColor 0 0) 23px 23px/4px 4px no-repeat,linear-gradient(currentColor 0 0) 30px 27px/4px 7px no-repeat,var(--live-surface); }
+  .esim-qr-button { grid-column:1/-1; width:100%; }
 }
+@media(prefers-reduced-motion:reduce) { .esim-qr-upload[data-state="busy"] .esim-qr-mark { animation:none; } }
 
 /* Per-device measurements keep identity, measured peaks and configured caps distinct. */
 .client-detail-view[data-view-hidden="true"] { display: none; }

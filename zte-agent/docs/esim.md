@@ -52,6 +52,7 @@ All routes use the agent's bearer authentication and `{ok,data}` / `{ok:false,er
 | POST | `/api/esim/nickname` | Body `{"iccid": "...", "nickname": "..."}` (at most 64 bytes, no control characters; empty clears it). Returns `iccid`, `nickname`, `generation` |
 | GET | `/api/esim/notifications` | Operator receipts waiting on the card: `count`, `pending` (`seq`, `operation`, `address`, `iccid`, `attempts`, `last_error`, `gave_up`), `listed_at`, `last_attempt_at`, `last_sent_at`, `retrying`, `stale` |
 | POST | `/api/esim/notifications/process` | Sends the waiting receipts now in the background (202) and restarts the retry loop, including receipts that gave up |
+| POST | `/api/esim/qr` | Raw JPEG or PNG body (maximum 8 MiB). Reads one eSIM activation QR and returns `activation_code`, `confirmation_code_required`. Requires an agent password; the image is decoded in a bounded child process, then discarded without being stored or logged |
 | POST | `/api/esim/download` | Body `{"activation_code": "LPA:1$...", "confirmation_code": "...", "preview": true}`. Starts a background download; 202 with the status below |
 | GET | `/api/esim/download` | Status: `state` (`idle`, `running`, `confirm`, `cancelling`, `done`, `failed`, `cancelled`), `step` (last progress step, with lpac's names), `provider`, `name`, `iccid`, `error`, `started_at`, `finished_at` |
 | POST | `/api/esim/download/confirm` | Body `{"accept": true}` or `false`, while `state` is `confirm` |
@@ -61,6 +62,8 @@ All routes use the agent's bearer authentication and `{ok,data}` / `{ok:false,er
 ### Download
 
 The activation code must have the SGP.22 form `LPA:1$<server>$<matching ID>[$<OID>[$1]]`; a final `1` means the operator also issued a confirmation code, which the request must then include. The agent runs the download in a background thread. With preview on (the default), it stops once the operator's server has sent the profile metadata: the status moves to `confirm` with `provider` and `name` filled in, and the download waits for the answer from `/download/confirm`. An unanswered preview is cancelled after 2 minutes. Cancel stops the download at its next step (see Cancel timing above). A downloaded profile is disabled until it is enabled. A finished result (`done`, `failed`, `cancelled`) is reported for 10 minutes, then the status reads `idle`; the result is also lost when the agent restarts.
+
+The responsive console can upload an operator QR image before starting the download. It accepts JPEG or PNG only, caps the body at 8 MiB and sends the image only to the authenticated U60. The async listener receives the bounded body without taking a worker permit; decoding runs on the slow lane in the existing low-priority child process with CPU, memory and 15-second limits. Exactly one valid eSIM activation payload must be present. The photo is dropped after decoding, and neither it nor the decoded activation code is written to disk or logs.
 
 After a successful download or delete the agent sends the operator receipts (see [Operator receipts](#operator-receipts)). Activation codes are never logged.
 

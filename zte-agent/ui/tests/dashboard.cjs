@@ -13,15 +13,16 @@ const path = require('node:path');
     device: {hostname:'OpenU60',uptime_secs:183960,kernel:'5.4.260',load_avg:[0.12,0.18,0.15]},
     wan: {up:true,'ipv4-address':[{address:'10.154.28.6'}]},
     wan6: {up:true,'ipv6-address':[{address:'2001:db8:4870:7d0c:1cc7:b83e:60e4:a9c8'}]},
-    signal: {network_provider:'Example Mobile',network_type:'LTE-NSA',nr5g_rsrp:'-84',nr5g_snr:'22.4',nr5g_rsrq:'-10',nr5g_rssi:'-59',nr5g_action_band:'78',nr5g_pci:'231',nr5g_action_channel:'633984',nr5g_cell_id:'0x3456701',
+    signal: {network_provider:'Example Mobile',network_type:'LTE-NSA',signalbar:'4',nr5g_rsrp:'-84',nr5g_snr:'22.4',nr5g_rsrq:'-10',nr5g_rssi:'-59',nr5g_action_band:'78',nr5g_pci:'231',nr5g_action_channel:'633984',nr5g_cell_id:'0x3456701',
       nrca:'231,78,0,633984,100;231,78,1,641280,100;',nrcasig:'-91,-11,17,-64;',
       lte_rsrp:'-90',lte_snr:'18',lte_rsrq:'-11',lte_rssi:'-62',lte_pci:'265',wan_active_band:'3',wan_active_channel:'1775',cell_id:'0x12AB01',
       lteca:'265,3,0,1775,15;265,1,1,150,20;19,7,2,2850,20;',ltecasig:'-94,-12,16,-65;-99,-14,10,-70;'},
     modem: {operate_mode:'ONLINE'},
     sms: {messages:[{id:2,number:'+639170001234',content:'00480065006C006C006F0020005500360030',date:'26,10,25,12,30,00,+32',tag:'1',mem_store:'nv'},{id:1,number:'Carrier',content:'003C0069006D00670020007300720063003D0078003E',date:'26,10,25,11,00,00,+32',tag:'0',mem_store:'sim'}]},
     sms_capacity: {sms_nv_total:500,sms_nvused_total:2,sms_sim_total:30,sms_simused_total:1,sms_dev_unread_num:1},
-    speed: {rx_speed:15400000,tx_speed:1640000,rx_bytes:8400000000,tx_bytes:1200000000},
+    speed: {real_rx_speed:15400000,real_tx_speed:1640000,real_rx_bytes:8400000000,real_tx_bytes:1200000000},
     battery: {capacity:86,status:'Charging',temperature:327},
+    thermal: {device_temp:54.4,cpuss_temp:54.4,sensors:[]},
     wifi: {wifi_onoff:'1',radio2_disabled:'0',radio5_disabled:'0',ssid_2g:'OpenU60',ssid_5g:'OpenU60 · 5G',channel_2g:'6',channel_5g:'149'},
     clients: {hosts:{'aa:bb:cc:dd:ee:01':{name:'MacBook Pro',ipaddrs:['192.168.0.102']},'aa:bb:cc:dd:ee:02':{name:'<img src=x onerror=alert(1)>',ipaddrs:['192.168.0.104']}},dhcp_leases:[{hostname:'Living room TV',ipaddr:'192.168.0.108',macaddr:'aa:bb:cc:dd:ee:03'}]},
     esim_status: {agent_instance:1000,inventory_loaded:true,inventory:esimInventory,switch:{state:'idle',generation:0},download:{state:'idle'},receipts:{count:0,pending:[],retrying:false},password_required:false}
@@ -88,10 +89,18 @@ const path = require('node:path');
   await live();
   assert.equal(await page.locator('#operator').textContent(),'Example Mobile');
   assert.equal(await page.locator('#network-type').textContent(),'5G NSA');
+  assert.equal(await page.locator('#operator-signal').getAttribute('aria-label'),'Cellular signal 4 of 5 bars');
+  assert.equal(await page.locator('#operator-signal i[data-active="true"]').count(),4);
+  assert.equal(await page.locator('#device-temperature').textContent(),'54.4 °C');
   const connectionType = await page.locator('#network-type').evaluate(node=>parseFloat(getComputedStyle(node).fontSize));
   const connectionStatus = await page.locator('#connection-title').evaluate(node=>parseFloat(getComputedStyle(node).fontSize));
   const operatorSize = await page.locator('#operator').evaluate(node=>parseFloat(getComputedStyle(node).fontSize));
   assert.ok(operatorSize > connectionType && connectionType > connectionStatus,'operator, generation and status must have a clear descending type hierarchy');
+  await page.setViewportSize({width:390,height:900});
+  assert.equal(await page.locator('#operator-signal').isVisible(),true,'mobile operator card keeps its signal meter');
+  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth),false,'mobile operator telemetry does not overflow');
+  await page.screenshot({path:'/tmp/zte-dashboard-operator-mobile.png'});
+  await page.setViewportSize({width:1440,height:1100});
   await page.waitForFunction(()=>document.querySelectorAll('#dashboard-esim-profiles .dashboard-esim-profile').length===2);
   assert.equal(await page.locator('#dashboard-esim-profiles .dashboard-esim-profile[aria-current="true"] strong').textContent(),'SMART');
   const enableCount=()=>requests.filter(request=>request.url==='/api/esim/enable').length,profileReadCount=()=>requests.filter(request=>request.url==='/api/esim/profiles').length;
@@ -100,6 +109,7 @@ const path = require('node:path');
   fixtures.esim_status.switch={state:'reloading',generation:2,target_iccid:esimIds[1]};esimInventory.updating=true;push(['esim_status']);await page.waitForFunction(()=>document.querySelector('#dashboard-esim-status').textContent.includes('SIM to reload'));
   const switchReads=profileReadCount();esimInventory.profiles[0].state='disabled';esimInventory.profiles[1].state='enabled';esimInventory.updating=false;esimInventory.generation=2;fixtures.esim_status.switch={state:'connected',generation:2,target_iccid:esimIds[1]};push(['esim_status']);await page.waitForFunction(()=>document.querySelector('#dashboard-esim-profiles .dashboard-esim-profile[aria-current="true"] strong').textContent==='GOMO');await page.waitForTimeout(100);assert.equal(profileReadCount(),switchReads,'dashboard switch completion is pushed over SSE without polling');
   assert.equal(await page.locator('#download').textContent(),'123.20');
+  const modemSpeed=fixtures.speed;fixtures.speed={rx_speed:2000000,tx_speed:250000,rx_bytes:10,tx_bytes:5};push(['speed']);await page.waitForFunction(()=>document.querySelector('#download').textContent==='16.00');assert.equal(await page.locator('#upload').textContent(),'2.00','legacy kernel fallback remains renderable');fixtures.speed=modemSpeed;push(['speed']);await page.waitForFunction(()=>document.querySelector('#download').textContent==='123.20');
   assert.equal(await page.locator('#device-count').textContent(),'3');
   assert.equal(await page.locator('#wan-ip').textContent(),'10.154.28.6');
   assert.equal(await page.locator('#wan-ipv6').textContent(),'2001:db8:4870:7d0c:1cc7:b83e:60e4:a9c8');

@@ -1,7 +1,7 @@
 'use strict';
 (() => {
   const $ = id => document.getElementById(id);
-  const animated = new Set(['download','upload','battery','temperature','rsrp','sinr','rsrq','lte-count','nr-count','device-count','outage-count','received','sent','sms-count']);
+  const animated = new Set(['download','upload','battery','temperature','device-temperature','rsrp','sinr','rsrq','lte-count','nr-count','device-count','outage-count','received','sent','sms-count']);
   const text = (id,value) => { if (animated.has(id)) OpenU60Numbers.set($(id),value); else $(id).textContent = value ?? '—'; };
   const number = value => value !== null && value !== undefined && String(value).trim() !== '' && Number.isFinite(Number(value)) ? Number(value) : null;
   const sessionKey = 'openu60.session';
@@ -19,11 +19,11 @@
 
   async function api(path, options = {}) {
     const requestAuthEpoch = authEpoch;
-    const {timeoutMs = 8000, ...fetchOptions} = options;
+    const {timeoutMs = 8000, contentType = 'application/json', ...fetchOptions} = options;
     const response = await fetch(path, {
       ...fetchOptions, cache: 'no-store',
       signal: AbortSignal.timeout(Math.min(Math.max(timeoutMs,1000),600000)),
-      headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}), ...(options.body ? { 'Content-Type': 'application/json' } : {}) }
+      headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}), ...(options.body ? { 'Content-Type': contentType } : {}) }
     });
     if (response.status === 401) {
       const error = new Error('Enter your agent password to continue.');
@@ -122,6 +122,11 @@
   function renderSignal(data) {
     const model = OpenU60Cellular.parse(data || {});
     text('operator', data?.network_provider ?? 'Operator unavailable'); text('network-type', data ? model.mode : '—');
+    const reportedBars = number(data?.signalbar), bars = reportedBars === null ? null : Math.max(0,Math.min(5,Math.trunc(reportedBars)));
+    const meter = $('operator-signal');
+    meter.dataset.available = String(bars !== null);
+    meter.setAttribute('aria-label',bars === null ? 'Cellular signal unavailable' : `Cellular signal ${bars} of 5 bars`);
+    [...meter.children].forEach((bar,index)=>{ bar.dataset.active = String(bars !== null && index < bars); });
     text('access-mode', data ? model.mode : '—'); text('mode-explanation', model.explanation || 'No serving signal reported by the modem.');
     text('lte-count', data ? model.lte.carriers.length : '—'); text('nr-count', data ? model.nr.carriers.length : '—');
     const primary = model.primary;
@@ -178,11 +183,12 @@
       text('signal-quality', signalQuality(OpenU60Cellular.parse(signal.data || {}).primary?.rsrp));
     }
   }
+  const speedValue = (data, modem, fallback) => data?.[modem] ?? data?.[fallback];
   function renderSpeed(data) {
-    const rx = number(data?.rx_speed), tx = number(data?.tx_speed);
+    const rx = number(speedValue(data,'real_rx_speed','rx_speed')), tx = number(speedValue(data,'real_tx_speed','tx_speed'));
     text('download', rx === null ? null : (rx * 8 / 1e6).toFixed(2));
     text('upload', tx === null ? null : (tx * 8 / 1e6).toFixed(2));
-    text('received', bytes(data?.rx_bytes)); text('sent', bytes(data?.tx_bytes));
+    text('received', bytes(speedValue(data,'real_rx_bytes','rx_bytes'))); text('sent', bytes(speedValue(data,'real_tx_bytes','tx_bytes')));
     history.push(rx === null || tx === null ? null : [rx, tx]);
     history = history.slice(-30);
     const ceiling = Math.max(1, ...history.filter(Boolean).flat());
@@ -202,6 +208,10 @@
     $('battery-bar').style.width = `${capacity ?? 0}%`;
     const temperature = number(data?.temperature);
     text('temperature', temperature === null ? null : `${(temperature / 10).toFixed(1)} °C`);
+  }
+  function renderThermal(data) {
+    const temperature = number(data?.device_temp);
+    text('device-temperature',temperature === null ? null : `${temperature.toFixed(1)} °C`);
   }
   function renderWifi(data) {
     for (const band of ['2g', '5g']) {
@@ -301,7 +311,7 @@
     client_details: () => {}, battery_details: () => {}, https_status: () => {}, dns_cache: () => {}, ota_status: () => {},
     esim_status: () => {},
     lan_config: () => {}, firewall_config: () => {}, upnp_config: () => {}, port_rules: () => {}, qos_config: () => {},
-    operators: () => {}, forwarding: () => {}, resources: () => {}, neighbors: () => {}, sweep: () => {}, speedtest: () => {}, at_port: () => {}, guest: () => {}, mobile: () => {}, charging: () => {}, speed: renderSpeed, battery: renderBattery, wifi: renderWifi, clients: renderClients, modem: renderModem, sms: renderSMS, sms_capacity: renderSMSCapacity
+    operators: () => {}, forwarding: () => {}, resources: () => {}, neighbors: () => {}, sweep: () => {}, speedtest: () => {}, at_port: () => {}, guest: () => {}, mobile: () => {}, charging: () => {}, thermal: renderThermal, speed: renderSpeed, battery: renderBattery, wifi: renderWifi, clients: renderClients, modem: renderModem, sms: renderSMS, sms_capacity: renderSMSCapacity
   };
   function setStreamState(state, label) {
     $('stream-state').dataset.state = state;
@@ -319,7 +329,7 @@
     // Current rates must never masquerade as live while the connection is down.
     renderSpeed(null);
     const speed = lastGood.get('speed')?.data;
-    text('received', bytes(speed?.rx_bytes)); text('sent', bytes(speed?.tx_bytes));
+    text('received', bytes(speedValue(speed,'real_rx_bytes','rx_bytes'))); text('sent', bytes(speedValue(speed,'real_tx_bytes','tx_bytes')));
     if (streamIncludesSms) text('sms-status','Connection interrupted · Showing the last received messages.');
     updateConnection();
   }
