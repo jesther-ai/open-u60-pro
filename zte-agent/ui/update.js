@@ -16,6 +16,17 @@
   };
   const title = value => String(value || 'idle').replaceAll('_',' ').replace(/^./,letter=>letter.toUpperCase());
   const numeric = value => value !== null && value !== undefined && Number.isFinite(Number(value));
+  const progressValue = (progress,phase) => {
+    const total = numeric(progress?.total) ? Math.max(0,Number(progress.total)) : 0;
+    const received = numeric(progress?.received) ? Math.max(0,Number(progress.received)) : 0;
+    if (!total) return {total:0,received:0,percent:0,verifying:false};
+    const bounded = Math.min(received,total), exact = Math.floor(bounded / total * 100), reported = numeric(progress?.percent) ? Math.floor(Number(progress.percent)) : exact;
+    // The progress block represents download + signature/probe verification. Do
+    // not announce 100% while those final checks are still running.
+    const verifying = phase === 'downloading' && bounded >= total;
+    const percent = verifying ? 99 : Math.max(0,Math.min(100,exact,reported));
+    return {total,received:bounded,percent,verifying};
+  };
   const currentSettings = () => JSON.stringify({channel:channel.value,automatic_checks:autoCheck.checked,automatic_downloads:autoDownload.checked});
   function setBusy(value) {
     busy = value; form.inert = value; check.disabled = value;
@@ -46,12 +57,11 @@
       $('update-release-copy').textContent = release.channel === 'beta' ? 'Signed Beta release. Review the notes before installing.' : 'Signed Stable release available for this device.';
       $('update-notes').href = release.notes_url;
     }
-    const total = Number(progress.total || 0), received = Number(progress.received || 0);
-    const percent = total > 0 ? Math.min(100,Math.round(received / total * 100)) : 0;
+    const {total,received,percent,verifying} = progressValue(progress,status.phase);
     $('update-progress').hidden = status.phase !== 'downloading' && !(total && received);
     OpenU60Numbers.set($('update-percent'),percent);
     $('update-progress-bar').style.width = `${percent}%`;
-    $('update-bytes').textContent = `${bytes(received)} of ${bytes(total)} received and verified`;
+    $('update-bytes').textContent = verifying ? `${bytes(total)} received · verifying signed binary…` : status.phase === 'staged' && received >= total ? `${bytes(total)} downloaded and verified` : `${bytes(received)} of ${bytes(total)} downloaded`;
     if (!fields.matches(':focus-within') && !busy) {
       channel.value = status.settings?.channel || status.channel || 'stable';
       autoCheck.checked = status.settings?.automatic_checks !== false;

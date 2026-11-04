@@ -592,13 +592,20 @@ h1>span {
   gap:5px;
   align-items:flex-end;
   height:50px;
-  opacity:.65;
   flex-shrink:0
 }
 .connection-symbol i {
   width:7px;
   background:var(--highlight);
-  border-radius:2px
+  border-radius:2px;
+  opacity:.2;
+  transition:opacity .2s ease
+}
+.connection-symbol i[data-active="true"] {
+  opacity:1
+}
+.connection-symbol[data-available="false"] {
+  opacity:.5
 }
 .connection-symbol i:nth-child(1) {
   height:10px
@@ -1333,21 +1340,52 @@ dialog .button {
   }
   .connection-panel {
     display: grid;
-    grid-template-columns: minmax(0, 1fr);
+    grid-template-columns: minmax(0, 1fr) auto;
     gap: 24px;
     padding: 24px;
+  }
+  .connection-identity {
+    grid-column:1 / -1;
+    grid-row:1;
+    padding-right:46px
   }
   .connection-panel h2 {
     max-width:none;
     font-size:clamp(29px,9vw,36px)
   }
   .connection-symbol {
-    display: none;
+    display:flex;
+    grid-column:2;
+    grid-row:1;
+    align-self:start;
+    justify-self:end;
+    gap:3px;
+    height:30px;
+    margin-top:3px
+  }
+  .connection-symbol i {
+    width:4px
+  }
+  .connection-symbol i:nth-child(1) {
+    height:6px
+  }
+  .connection-symbol i:nth-child(2) {
+    height:12px
+  }
+  .connection-symbol i:nth-child(3) {
+    height:18px
+  }
+  .connection-symbol i:nth-child(4) {
+    height:24px
+  }
+  .connection-symbol i:nth-child(5) {
+    height:30px
   }
   .connection-meta #network-type {
     font-size:19px
   }
   .connection-facts {
+    grid-column:1 / -1;
     display: grid;
     grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
     gap: 20px;
@@ -2407,7 +2445,7 @@ dialog .button {
   .update-actions { display:grid; grid-template-columns:minmax(0,1fr); }
   .update-actions .button { width:100%; }
 }
-@media(prefers-reduced-motion:reduce) { .update-progress-track i { transition:none; } }
+@media(prefers-reduced-motion:reduce) { .update-progress-track i,.connection-symbol i { transition:none; } }
 @media (min-width:768px) and (max-width:1023px) and (max-height:500px) and (hover:none) and (pointer:coarse) {
   main {
     padding-top: 16px;
