@@ -1,5 +1,5 @@
 use std::fs;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
@@ -893,6 +893,7 @@ fn now_ts() -> i64 {
 // ── Core forwarder ──────────────────────────────────────────────────
 
 pub struct SmsForwarder {
+    revision: AtomicU64,
     config: Mutex<SmsForwardConfig>,
     state: Mutex<ForwardState>,
     has_service: AtomicBool,
@@ -924,6 +925,7 @@ impl SmsForwarder {
         }
 
         SmsForwarder {
+            revision: AtomicU64::new(0),
             config: Mutex::new(config),
             state: Mutex::new(state),
             has_service: AtomicBool::new(false),
@@ -1617,6 +1619,7 @@ pub fn config_get(state: &AppState) -> (u16, Value) {
             "ok": true,
             "data": {
                 "config": *config,
+                "revision": state.sms_forward.revision.load(Ordering::Relaxed),
                 "last_forwarded_id": fwd_state.last_forwarded_id,
             }
         }),
@@ -1661,6 +1664,7 @@ pub fn config_set(state: &AppState, body: &[u8]) -> (u16, Value) {
     }
 
     save_config(&config);
+    state.sms_forward.revision.fetch_add(1, Ordering::Relaxed);
     (200, json!({"ok": true, "data": *config}))
 }
 
@@ -1681,7 +1685,9 @@ pub fn rules_create(state: &AppState, body: &[u8]) -> (u16, Value) {
     };
 
     let mut config = state.sms_forward.config.lock().unwrap();
-    let next_id = config.rules.iter().map(|r| r.id).max().unwrap_or(0) + 1;
+    let Some(next_id) = next_rule_id(&config.rules, &state.sms_forward.state.lock().unwrap().log) else {
+        return (409, json!({"ok":false,"error":"forwarding rule IDs exhausted"}));
+    };
 
     let rule = ForwardRule {
         id: next_id,
@@ -1694,8 +1700,20 @@ pub fn rules_create(state: &AppState, body: &[u8]) -> (u16, Value) {
     let result = json!({"ok": true, "data": rule});
     config.rules.push(rule);
     save_config(&config);
+    state.sms_forward.revision.fetch_add(1, Ordering::Relaxed);
     (201, result)
 }
+
+fn next_rule_id(rules: &[ForwardRule], log: &[ForwardLogEntry]) -> Option<u32> {
+    rules
+        .iter()
+        .map(|rule| rule.id)
+        .chain(log.iter().map(|entry| entry.rule_id))
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+}
+
 
 fn default_true() -> bool {
     true
@@ -1730,6 +1748,7 @@ pub fn rules_update(state: &AppState, body: &[u8]) -> (u16, Value) {
 
     let result = json!({"ok": true, "data": rule.clone()});
     save_config(&config);
+    state.sms_forward.revision.fetch_add(1, Ordering::Relaxed);
     (200, result)
 }
 
@@ -1753,6 +1772,7 @@ pub fn rules_delete(state: &AppState, body: &[u8]) -> (u16, Value) {
     }
 
     save_config(&config);
+    state.sms_forward.revision.fetch_add(1, Ordering::Relaxed);
     (200, json!({"ok": true}))
 }
 
@@ -1780,6 +1800,7 @@ pub fn rules_toggle(state: &AppState, body: &[u8]) -> (u16, Value) {
     rule.enabled = enabled;
     let result = json!({"ok": true, "data": rule.clone()});
     save_config(&config);
+    state.sms_forward.revision.fetch_add(1, Ordering::Relaxed);
     (200, result)
 }
 
@@ -1834,11 +1855,73 @@ fn clear_log(log: &mut Vec<ForwardLogEntry>) {
     log.retain(|e| keep_entry(e, &held));
 }
 
+
+#[derive(Deserialize)]
+struct RetryIdentity {
+    sms_id: u64,
+    rule_id: u32,
+    timestamp: i64,
+}
+
+fn checked_retry_target(
+    log: &[ForwardLogEntry],
+    index: usize,
+    expected: Option<&RetryIdentity>,
+) -> Result<ForwardLogEntry, (u16, Value)> {
+    let entry = retry_target(log, index)?;
+    if expected.is_some_and(|id| {
+        id.sms_id != entry.sms_id || id.rule_id != entry.rule_id || id.timestamp != entry.timestamp
+    }) {
+        return Err((
+            409,
+            json!({"ok":false,"error":"The forwarding log changed. Review the current entry before retrying."}),
+        ));
+    }
+    Ok(entry)
+}
+
+/// Only non-secret configuration metadata and log previews enter the optional web feed.
+pub(crate) fn dashboard_status(state: &AppState) -> Value {
+    let config = state
+        .sms_forward
+        .config
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let forward_state = state
+        .sms_forward
+        .state
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    dashboard_snapshot(
+        &config,
+        &forward_state.log,
+        state.sms_forward.revision.load(Ordering::Relaxed),
+    )
+}
+
+fn dashboard_snapshot(config: &SmsForwardConfig, log: &[ForwardLogEntry], revision: u64) -> Value {
+    let rules: Vec<_> = config.rules.iter().map(|rule| json!({"id":rule.id,"name":rule.name,"enabled":rule.enabled,"destination_type":destination_type_name(&rule.destination)})).collect();
+    let entries: Vec<_> = log.iter().rev().enumerate().map(|(index, entry)| json!({
+        "index":index,"timestamp":entry.timestamp,"sms_id":entry.sms_id,"rule_id":entry.rule_id,
+        "sender":entry.sender,"content_preview":entry.content_preview,"rule_name":entry.rule_name,
+        "destination_type":entry.destination_type,"success":entry.success,"pending":entry.pending,
+        "error":entry.error.as_ref().map(|_| "Destination did not accept the forward. Check its settings or send a test."),
+    })).collect();
+    json!({"ok":true,"data":{"revision":revision,"config":{
+        "enabled":config.enabled,"poll_interval_secs":config.poll_interval_secs,
+        "mark_read_after_forward":config.mark_read_after_forward,"delete_after_forward":config.delete_after_forward,
+    },"rules":rules,"log":entries}})
+}
+
 /// POST /api/sms/forward/retry — Retry a failed forward log entry
 pub fn retry_forward(state: &AppState, body: &[u8]) -> (u16, Value) {
     #[derive(Deserialize)]
     struct Req {
         index: usize,
+        #[serde(default)]
+        expected: Option<RetryIdentity>,
+        #[serde(default)]
+        expected_rule_revision: Option<u64>,
     }
 
     let req: Req = match serde_json::from_slice(body) {
@@ -1846,7 +1929,7 @@ pub fn retry_forward(state: &AppState, body: &[u8]) -> (u16, Value) {
         Err(e) => return (400, json!({"ok": false, "error": format!("invalid JSON: {e}")})),
     };
 
-    let entry_clone = match retry_target(&state.sms_forward.state.lock().unwrap().log, req.index) {
+    let entry_clone = match checked_retry_target(&state.sms_forward.state.lock().unwrap().log, req.index, req.expected.as_ref()) {
         Ok(entry) => entry,
         Err(response) => return response,
     };
@@ -1854,6 +1937,9 @@ pub fn retry_forward(state: &AppState, body: &[u8]) -> (u16, Value) {
     // Look up rule by id from current config
     let dest = {
         let config = state.sms_forward.config.lock().unwrap();
+        if req.expected_rule_revision.is_some_and(|revision| revision != state.sms_forward.revision.load(Ordering::Relaxed)) {
+            return (409, json!({"ok":false,"error":"Forwarding rules changed. Review the destination before retrying."}));
+        }
         match config.rules.iter().find(|r| r.id == entry_clone.rule_id) {
             Some(rule) => rule.destination.clone(),
             None => return (404, json!({"ok": false, "error": "rule no longer exists"})),
@@ -1889,6 +1975,7 @@ mod tests {
 
     fn forwarder() -> SmsForwarder {
         SmsForwarder {
+            revision: AtomicU64::new(0),
             config: Mutex::new(SmsForwardConfig::default()),
             state: Mutex::new(ForwardState::default()),
             has_service: AtomicBool::new(false),
@@ -1981,6 +2068,64 @@ mod tests {
         drop(tx);
         f.wan_monitor(rx);
         f.wan_connected.load(Ordering::Relaxed)
+    }
+
+    #[test]
+    fn dashboard_snapshot_omits_destination_credentials_raw_errors_and_full_messages() {
+        let mut rule = rule(1, true);
+        rule.destination = ForwardDestination::Telegram {
+            bot_token: "private-bot-token".into(),
+            chat_id: "private-chat".into(),
+            silent: false,
+        };
+        let config = SmsForwardConfig {
+            rules: vec![rule],
+            ..Default::default()
+        };
+        let mut log = entry(1, 1, false, 100);
+        log.content = "private-full-message".into();
+        log.error = Some("https://api.telegram.org/bot/private-bot-token".into());
+        let text = dashboard_snapshot(&config, &[log], 9).to_string();
+        for private in [
+            "private-bot-token",
+            "private-chat",
+            "private-full-message",
+            "https://",
+        ] {
+            assert!(!text.contains(private), "leaked {private}");
+        }
+        assert!(text.contains("content_preview") && text.contains("revision"));
+    }
+
+    #[test]
+    fn retry_identity_rejects_an_index_shift_before_any_forward() {
+        let log = vec![entry(1, 1, false, 100), entry(2, 1, false, 200)];
+        let expected = RetryIdentity {
+            sms_id: 1,
+            rule_id: 1,
+            timestamp: 100,
+        };
+        assert_eq!(
+            checked_retry_target(&log, 0, Some(&expected))
+                .err()
+                .unwrap()
+                .0,
+            409
+        );
+        assert_eq!(
+            checked_retry_target(&log, 1, Some(&expected))
+                .unwrap()
+                .sms_id,
+            1
+        );
+    }
+
+    #[test]
+    fn new_rule_ids_do_not_reuse_destinations_referenced_by_activity() {
+        assert_eq!(
+            next_rule_id(&[rule(1, true)], &[entry(1, 10, true, 100)]),
+            Some(11)
+        );
     }
 
     #[test]

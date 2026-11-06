@@ -97,12 +97,12 @@ async fn turn_on_from_settings_once() {
     for want in [
         "<span>HTTPS</span><span class=\"v\">On \u{b7} not listening</span>",
         "Certificate valid until",
-        "href=\"https://192.168.0.1:9443/ui/\"",
-        "href=\"https://u60.home.arpa:9443/ui/\"",
+        "href=\"https://192.168.0.1:9443/console/\"",
+        "href=\"https://u60.home.arpa:9443/console/\"",
         "href=\"/ui/settings/https\"",
         "Install on Your Devices",
         "href=\"/ui/settings/https/reset\"",
-        "This page is plain http. Once this device trusts the router\u{2019}s certificate authority (Install on Your Devices), open <a href=\"https://192.168.0.1:9443/ui/\" rel=\"noreferrer\">",
+        "This page is plain http. Once this device trusts the router\u{2019}s certificate authority (Install on Your Devices), open <a href=\"https://192.168.0.1:9443/console/\" rel=\"noreferrer\">",
         ">Try Again</span>",
     ] {
         assert!(html.contains(want), "{want} in {html}");
@@ -237,7 +237,7 @@ async fn install_page_shows_the_ca_and_the_steps() {
         "Always Trust",
         "<h2>Windows</h2>",
         "Trusted Root Certification Authorities",
-        "href=\"https://u60.home.arpa:9443/ui/\"",
+        "href=\"https://u60.home.arpa:9443/console/\"",
         "Add to Home Screen",
         "Private DNS",
     ] {
@@ -295,7 +295,7 @@ async fn downloads_are_public_with_their_types() {
 async fn login_page_hint() {
     let w = world("web-hint");
     let c = ctx_with(&w, Some(PW));
-    let hint = "To install this web UI as an app, trust the router\u{2019}s certificate authority on this device (Settings \u{203a} HTTPS &amp; Install as App \u{203a} Install on Your Devices), then open <a href=\"https://192.168.0.1:9443/ui/\" rel=\"noreferrer\">https://192.168.0.1:9443/ui/</a>.";
+    let hint = "To install this web UI as an app, trust the router\u{2019}s certificate authority on this device (Settings \u{203a} HTTPS &amp; Install as App \u{203a} Install on Your Devices), then open <a href=\"https://192.168.0.1:9443/console/\" rel=\"noreferrer\">https://192.168.0.1:9443/console/</a>.";
     assert!(!get(&c, "/ui/login", peer(234, 1)).await.text().contains("To install"));
     c.app.tls.turn_on().unwrap();
     let r = get(&c, "/ui/login", peer(234, 2)).await;
@@ -330,6 +330,6 @@ fn api_status_route() {
     assert_eq!((status, v["data"]["enabled"].as_bool(), v["data"]["port"].as_u64()), (200, Some(false), Some(9443)));
     state.tls.turn_on().unwrap();
     let (_, v) = crate::server::route(&crate::server::Method::Get, "/api/https", &state, b"");
-    assert_eq!(v["data"]["urls"], serde_json::json!(["https://192.168.0.1:9443/ui/", "https://u60.home.arpa:9443/ui/"]));
+    assert_eq!(v["data"]["urls"], serde_json::json!(["https://192.168.0.1:9443/console/", "https://u60.home.arpa:9443/console/"]));
     assert_eq!(crate::server::lane(crate::server::Method::Get, "/api/https"), crate::httpd::gate::Lane::General);
 }

@@ -19,7 +19,7 @@ const PW: &str = "test-password";
 const DAY: i64 = 86_400;
 
 fn now() -> i64 {
-    crate::web::sms::now_unix()
+    crate::calendar::now_unix()
 }
 
 struct Server {
@@ -234,27 +234,6 @@ fn request(io: &mut dyn ReadWrite, head: &str, body: &str) -> Reply {
     Reply { status, headers, body: String::from_utf8_lossy(&body).into_owned() }
 }
 
-/// The value of `name=` in a `Set-Cookie` list.
-fn cookie<'a>(r: &'a Reply, name: &str) -> Option<&'a str> {
-    r.all("set-cookie").into_iter().find_map(|c| c.strip_prefix(name)?.strip_prefix('=')?.split(';').next())
-}
-
-/// Log in through the form on `io` (its origin `origin`, cookie names
-/// `prefix`): the session cookie's value.
-fn login(io: &mut dyn ReadWrite, host: &str, origin: &str, prefix: &str) -> String {
-    let r = request(io, &format!("GET /ui/login HTTP/1.1\r\nHost: {host}"), "");
-    assert_eq!(r.status, 200);
-    let pre = cookie(&r, &format!("{prefix}zte_ui_pre")).expect("pre-login cookie").to_owned();
-    let token = r.body.split("name=\"login_csrf\" value=\"").nth(1).unwrap().split('"').next().unwrap().to_owned();
-    let form = format!("login_csrf={token}&next=%2Fui%2Fsettings&password={PW}");
-    let head = format!(
-        "POST /ui/login HTTP/1.1\r\nHost: {host}\r\nOrigin: {origin}\r\nContent-Type: application/x-www-form-urlencoded\r\nCookie: {prefix}zte_ui_pre={pre}"
-    );
-    let r = request(io, &head, &form);
-    assert_eq!((r.status, r.header("location")), (303, Some("/ui/settings")), "{r:?}");
-    cookie(&r, &format!("{prefix}zte_ui_session")).expect("session cookie").to_owned()
-}
-
 /// The UI over HTTPS with the generated certificate: verified by a client
 /// that trusts only the router's CA, by the local name and by its address,
 /// TLS 1.2 and 1.3, ALPN http/1.1, no HSTS; refused by name for another
@@ -272,12 +251,12 @@ fn https_serves_the_ui_with_the_routers_certificate() {
         // The server certificate, then the issuing CA's.
         let served: Vec<Vec<u8>> = c.conn.peer_certificates().unwrap().iter().map(|c| c.as_ref().to_vec()).collect();
         assert_eq!(served, ["server.crt", "issuing.crt"].map(|f| std::fs::read(s.world.dir().join(f)).unwrap()));
-        let r = request(&mut c, &format!("GET /ui/login HTTP/1.1\r\nHost: {host}"), "");
+        let r = request(&mut c, &format!("GET /console/ HTTP/1.1\r\nHost: {host}"), "");
         assert_eq!(r.status, 200);
         assert!(r.body.contains("Agent password"));
         assert_eq!(r.header("strict-transport-security"), None);
-        let pre = r.all("set-cookie");
-        assert!(pre.len() == 1 && pre[0].starts_with("__Host-zte_ui_pre=") && pre[0].ends_with("; Path=/; Max-Age=900; HttpOnly; SameSite=Strict; Secure"), "{pre:?}");
+        assert!(r.all("set-cookie").is_empty());
+        assert!(r.body.contains("/console/a/dashboard.js"));
         // Keep-alive: a second request on the same connection.
         let r = request(&mut c, &format!("GET /api/lan/ping HTTP/1.1\r\nHost: {host}"), "");
         assert_eq!(r.status, 401);
@@ -292,7 +271,7 @@ fn https_serves_the_ui_with_the_routers_certificate() {
     // The local name is no Host of the plain listener (another network's
     // DNS can answer for it over http), for the UI or the API.
     let mut p = TcpStream::connect(s.plain).unwrap();
-    let r = request(&mut p, &format!("GET /ui/login HTTP/1.1\r\nHost: u60.home.arpa:{}", s.plain.port()), "");
+    let r = request(&mut p, &format!("GET /console/ HTTP/1.1\r\nHost: u60.home.arpa:{}", s.plain.port()), "");
     assert_eq!((r.status, r.body.as_str()), (403, "Host not allowed"));
     let r = request(&mut p, &format!("POST /api/auth/login HTTP/1.1\r\nHost: u60.home.arpa:{}\r\nOrigin: http://u60.home.arpa:{}", s.plain.port(), s.plain.port()), "{}");
     assert_eq!(r.status, 403);
@@ -301,73 +280,27 @@ fn https_serves_the_ui_with_the_routers_certificate() {
     assert_eq!(r.status, 401, "{r:?}");
     // DNS-rebinding protection otherwise, on both.
     let mut c = connect(addr, client(&ca, &[&rustls::version::TLS13]), "u60.home.arpa").unwrap();
-    let r = request(&mut c, &format!("GET /ui/login HTTP/1.1\r\nHost: evil.example:{}", addr.port()), "");
+    let r = request(&mut c, &format!("GET /console/ HTTP/1.1\r\nHost: evil.example:{}", addr.port()), "");
     assert_eq!((r.status, r.body.as_str()), (403, "Host not allowed"));
-    let r = request(&mut p, "GET /ui/login HTTP/1.1\r\nHost: u60.home.arpa.evil.example", "");
+    let r = request(&mut p, "GET /console/ HTTP/1.1\r\nHost: u60.home.arpa.evil.example", "");
     assert_eq!(r.status, 403);
 }
 
-/// Each origin has its own cookies: a session made over HTTPS is a
-/// `__Host-` cookie (Path=/, Secure) the http side never reads; the http
-/// side's cookie, which browsers also send over HTTPS, is never read
-/// there; the theme preference likewise.
+/// Legacy cookies cannot authenticate either listener; HTTPS API changes still reject foreign origins.
 #[test]
-fn cookies_are_per_origin() {
-    let s = start("https-cookies", 16);
-    let addr = on(&s);
-    let ca = s.tls.ca_der().unwrap();
-    let host = format!("u60.home.arpa:{}", addr.port());
-    let origin = format!("https://{host}");
-    let mut c = connect(addr, client(&ca, &[&rustls::version::TLS13]), "u60.home.arpa").unwrap();
-    let tok = login(&mut c, &host, &origin, "__Host-");
-    let settings = |io: &mut dyn ReadWrite, host: &str, cookie: &str| {
-        request(io, &format!("GET /ui/settings HTTP/1.1\r\nHost: {host}\r\nCookie: {cookie}"), "")
-    };
-    let r = settings(&mut c, &host, &format!("__Host-zte_ui_session={tok}"));
-    assert_eq!(r.status, 200);
-    assert!(r.body.contains("HTTPS &amp; Install as App"), "{}", r.body);
-    // The same token under the http name: not read over HTTPS.
-    let r = settings(&mut c, &host, &format!("zte_ui_session={tok}"));
-    assert_eq!((r.status, r.header("location")), (303, Some("/ui/login?next=%2Fui%2Fsettings")));
-    // Over :9090 the __Host- cookie is not read; its own login works there.
-    let phost = format!("192.168.0.1:{}", s.plain.port());
-    let mut p = TcpStream::connect(s.plain).unwrap();
-    let r = settings(&mut p, &phost, &format!("__Host-zte_ui_session={tok}"));
-    assert_eq!(r.status, 303);
-    let ptok = login(&mut p, &phost, &format!("http://{phost}"), "");
-    assert_ne!(ptok, tok);
-    assert_eq!(settings(&mut p, &phost, &format!("zte_ui_session={ptok}")).status, 200);
-    // Both cookies sent over HTTPS (as browsers do): only the __Host- one counts.
-    let r = settings(&mut c, &host, &format!("zte_ui_session={ptok}; __Host-zte_ui_session={tok}"));
-    assert_eq!(r.status, 200);
-    let r = settings(&mut c, &host, &format!("zte_ui_session={ptok}"));
-    assert_eq!(r.status, 303);
-    // A preference set over HTTPS: a __Host- cookie.
-    let csrf = |body: &str| body.split("name=\"csrf\" value=\"").nth(1).unwrap().split('"').next().unwrap().to_owned();
-    let page = settings(&mut c, &host, &format!("__Host-zte_ui_session={tok}"));
-    let post = |io: &mut dyn ReadWrite, origin: &str| {
-        let head = format!(
-            "POST /ui/settings/theme HTTP/1.1\r\nHost: {host}\r\nOrigin: {origin}\r\nContent-Type: application/x-www-form-urlencoded\r\nCookie: __Host-zte_ui_session={tok}"
-        );
-        request(io, &head, &format!("csrf={}&theme=dark", csrf(&page.body)))
-    };
-    let r = post(&mut c, &origin);
-    assert_eq!(r.status, 303);
-    assert_eq!(r.all("set-cookie"), ["__Host-zte_ui_theme=dark; Path=/; Max-Age=31536000; HttpOnly; SameSite=Strict; Secure"]);
-    // The same form from the http origin of the same host and port, or
-    // another site: refused.
-    for bad in [format!("http://{host}"), "https://evil.example".to_owned(), "null".to_owned()] {
-        let r = post(&mut c, &bad);
-        assert_eq!(r.status, 403, "{bad}");
-        assert!(r.all("set-cookie").is_empty());
+fn cookies_do_not_authenticate_the_console_api() {
+    let s=start("https-api-auth",16);let addr=on(&s);let host=format!("u60.home.arpa:{}",addr.port());
+    let mut c=connect(addr,client(&s.tls.ca_der().unwrap(),&[&rustls::version::TLS13]),"u60.home.arpa").unwrap();
+    let login=request(&mut c,&format!("POST /api/auth/login HTTP/1.1\r\nHost: {host}\r\nOrigin: https://{host}\r\nContent-Type: application/json"),&serde_json::json!({"password":PW}).to_string());
+    assert_eq!(login.status,200);let data:serde_json::Value=serde_json::from_str(&login.body).unwrap();let token=data["data"]["token"].as_str().unwrap();
+    for cookie in [format!("zte_ui_session={token}"),format!("__Host-zte_ui_session={token}")] {
+        assert_eq!(request(&mut c,&format!("GET /api/https HTTP/1.1\r\nHost: {host}\r\nCookie: {cookie}"),"").status,401);
     }
-    // A logout clears the __Host- cookie (same name, path and Secure).
-    let head = format!(
-        "POST /ui/logout HTTP/1.1\r\nHost: {host}\r\nOrigin: {origin}\r\nContent-Type: application/x-www-form-urlencoded\r\nCookie: __Host-zte_ui_session={tok}"
-    );
-    let r = request(&mut c, &head, &format!("csrf={}", csrf(&page.body)));
-    assert_eq!(r.status, 303);
-    assert!(r.all("set-cookie").contains(&"__Host-zte_ui_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict; Secure"), "{r:?}");
+    assert_eq!(request(&mut c,&format!("GET /api/https HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer {token}"),"").status,200);
+    for origin in [format!("http://{host}"),"https://evil.example".into(),"null".into()] {
+        assert_eq!(request(&mut c,&format!("POST /api/https/reset HTTP/1.1\r\nHost: {host}\r\nOrigin: {origin}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json"),"{\"confirm\":true}").status,403);
+        assert!(s.tls.is_on());
+    }
 }
 
 trait ReadWrite: Read + Write {}
@@ -407,12 +340,12 @@ fn hot_swap_lazy_renewal_and_reset() {
     // An open connection keeps working across the swap.
     let mut held = connect(addr, Arc::clone(&cfg), "u60.home.arpa").unwrap();
     s.tls.lan_changed(std::net::Ipv4Addr::new(10, 0, 0, 2));
-    let r = request(&mut held, &format!("GET /ui/login HTTP/1.1\r\nHost: u60.home.arpa:{}", addr.port()), "");
+    let r = request(&mut held, &format!("GET /console/ HTTP/1.1\r\nHost: u60.home.arpa:{}", addr.port()), "");
     assert_eq!(r.status, 200);
     // A client that resumes sessions (as browsers do), with one in hand.
     let resumed = resuming(&ca, &[&rustls::version::TLS13]);
     let mut r1 = connect(addr, Arc::clone(&resumed), "u60.home.arpa").unwrap();
-    let _ = request(&mut r1, &format!("GET /ui/login HTTP/1.1\r\nHost: u60.home.arpa:{}", addr.port()), "");
+    let _ = request(&mut r1, &format!("GET /console/ HTTP/1.1\r\nHost: u60.home.arpa:{}", addr.port()), "");
     // Reset: the port closes.
     s.tls.reset().unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -441,7 +374,7 @@ fn connection_caps_are_shared_with_the_plain_listener() {
     let mut held: Vec<TcpStream> = (0..2)
         .map(|_| {
             let mut p = TcpStream::connect(s.plain).unwrap();
-            assert_eq!(request(&mut p, &format!("GET /ui/login HTTP/1.1\r\n{host}"), "").status, 200);
+            assert_eq!(request(&mut p, &format!("GET /console/ HTTP/1.1\r\n{host}"), "").status, 200);
             p
         })
         .collect();
@@ -495,6 +428,7 @@ fn upgraded_tls_socket_keeps_shared_cap_and_ends_immediately_on_reset() {
 }
 
 #[test]
+#[ignore = "the retired maud UI (and its Zashboard bridge) is not served by httpd::app; revive with a console port of Mihomo"]
 fn actual_mihomo_bridge_checks_auth_origin_redacts_configs_and_upgrades_over_tls() {
     use crate::auth::{Kind, PeerKey};
     let core = CoreMock::start();
@@ -639,11 +573,6 @@ fn event_stream_over_tls_flushes() {
     }
 }
 
-/// The value of hidden input `name` in a page.
-fn input(body: &str, name: &str) -> String {
-    body.split(&format!("name=\"{name}\" value=\"")).nth(1).unwrap().split('"').next().unwrap().to_owned()
-}
-
 /// Reset ends what HTTPS has open: a live stream and an idle keep-alive
 /// connection close at once, not at their own limits; the Reset posted
 /// over HTTPS still gets its reply first.
@@ -670,18 +599,12 @@ fn reset_ends_open_connections() {
     }
     // An idle keep-alive connection.
     let mut idle = connect(addr, Arc::clone(&cfg), "u60.home.arpa").unwrap();
-    assert_eq!(request(&mut idle, &format!("GET /ui/login HTTP/1.1\r\nHost: {host}"), "").status, 200);
-    // A signed-in browser resets over HTTPS.
+    assert_eq!(request(&mut idle, &format!("GET /console/ HTTP/1.1\r\nHost: {host}"), "").status, 200);
+    // An authenticated API request resets HTTPS and receives its reply first.
     let mut c = connect(addr, Arc::clone(&cfg), "u60.home.arpa").unwrap();
-    let sess = login(&mut c, &host, &origin, "__Host-");
-    let ck = format!("Cookie: __Host-zte_ui_session={sess}");
-    let q = request(&mut c, &format!("GET /ui/settings/https/reset HTTP/1.1\r\nHost: {host}\r\n{ck}"), "");
-    assert_eq!(q.status, 200);
-    let form = format!("csrf={}&once={}&confirm=1", input(&q.body, "csrf"), input(&q.body, "once"));
-    let head = format!("POST /ui/settings/https/reset HTTP/1.1\r\nHost: {host}\r\nOrigin: {origin}\r\nContent-Type: application/x-www-form-urlencoded\r\n{ck}");
-    let r = request(&mut c, &head, &form);
-    assert_eq!(r.status, 303, "{r:?}");
-    assert!(r.header("location").is_some_and(|l| l.starts_with("/ui/settings?r=")));
+    let head=format!("POST /api/https/reset HTTP/1.1\r\nHost: {host}\r\nOrigin: {origin}\r\nContent-Type: application/json\r\nAuthorization: Bearer {tok}");
+    let r=request(&mut c,&head,"{\"confirm\":true}");
+    assert_eq!(r.status,200,"{r:?}");
     assert!(!s.tls.is_on());
     // The stream and the idle connection end now (not after 30 min / 120 s).
     let t = Instant::now();
@@ -782,5 +705,5 @@ fn the_mobile_side_is_refused_before_the_handshake() {
     assert!(connect(addr, Arc::clone(&cfg), "u60.home.arpa").is_err(), "a mobile-side peer got a handshake");
     *seen_as.lock().unwrap() = "192.168.0.23:40000".parse().unwrap();
     let mut c = connect(addr, cfg, "u60.home.arpa").unwrap();
-    assert_eq!(request(&mut c, &format!("GET /ui/login HTTP/1.1\r\nHost: u60.home.arpa:{}", addr.port()), "").status, 200);
+    assert_eq!(request(&mut c, &format!("GET /console/ HTTP/1.1\r\nHost: u60.home.arpa:{}", addr.port()), "").status, 200);
 }

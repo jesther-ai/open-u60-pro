@@ -74,6 +74,7 @@ impl CspNonce {
     }
 }
 
+#[cfg(test)]
 pub fn router(ctx: &Ctx) -> Router<Ctx> {
     Router::new()
         // Anything but GET/HEAD on `/` is the API's (401/404 JSON as before).

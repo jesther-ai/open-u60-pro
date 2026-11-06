@@ -89,6 +89,10 @@ pub struct Gate {
     rmnet_busy: bool,
 }
 
+impl Gate {
+    pub(crate) fn ready_for_probe(self) -> bool { self.route && !self.rmnet_busy }
+}
+
 #[derive(Debug)]
 pub enum Input {
     /// A `zwrt_card_state_event` payload.
@@ -480,7 +484,7 @@ fn resolv_has_wan_dns(text: &str) -> bool {
     })
 }
 
-fn observe_gate() -> Gate {
+pub(crate) fn observe_gate() -> Gate {
     let read = |p: &str| std::fs::read_to_string(p).unwrap_or_default();
     Gate {
         route: crate::esim::has_default_route(&read("/proc/net/route")) || ipv6_default_route(&read("/proc/net/ipv6_route")),

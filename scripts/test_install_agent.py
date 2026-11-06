@@ -27,6 +27,9 @@ class LauncherHarness:
         self.proc = self.root / "proc"
         self.run = self.root / "run"
         self.binary = self.root / "data" / "zte-agent"
+        self.ota = self.root / "data" / "open-u60" / "update"
+        self.slot = self.ota / "slot-a" / "zte-agent"
+        self.supervisor = self.root / "data" / "local" / "tmp" / "zte-agent-supervisor.sh"
         self.bin = self.root / "bin"
         for path in (self.proc, self.run, self.binary.parent, self.bin):
             path.mkdir()
@@ -58,6 +61,9 @@ mode = sys.argv[2]
 args = sys.argv[3:]
 proc = root / "proc"
 binary = root / "data" / "zte-agent"
+ota = root / "data" / "open-u60" / "update"
+supervisor = root / "data" / "local" / "tmp" / "zte-agent-supervisor.sh"
+slot = ota / "slot-a" / "zte-agent"
 
 def record(message):
     with (root / "calls").open("a") as file:
@@ -121,9 +127,12 @@ elif mode == "readlink":
     except OSError:
         sys.exit(1)
 elif mode == "nohup":
-    assert args == [str(binary)]
+    assert args == [str(supervisor)]
     assert "U60_RELAY_DHCP" not in os.environ
     assert "U60_RELAY_DHCP6" not in os.environ
+    assert os.environ["ZTE_OTA_ROOT"] == str(ota)
+    assert os.environ["ZTE_OTA_SUPERVISOR"] == str(supervisor)
+    assert os.environ["ZTE_OTA_LEGACY_LINK"] == str(binary)
     try:
         os.fstat(9)
     except OSError:
@@ -134,7 +143,7 @@ elif mode == "nohup":
     current = proc / str(pid)
     current.mkdir()
     (current / "exe").symlink_to("/usr/bin/nohup")
-    (current / "cmdline").write_bytes(b"nohup\0" + os.fsencode(binary) + b"\0")
+    (current / "cmdline").write_bytes(b"nohup\0" + os.fsencode(supervisor) + b"\0")
     (current / "environ").write_bytes(b"ZTE_AGENT_PASSWORD=fake-child-secret\0")
     stat(pid, 10000 + pid)
     with (root / "starts").open("a") as file:
@@ -155,8 +164,8 @@ elif mode == "nohup":
         stat(pid, 999999)
     (current / "exe").unlink()
     suffix = " (deleted)" if (root / "delete-child").exists() else ""
-    (current / "exe").symlink_to(str(binary) + suffix)
-    (current / "cmdline").write_bytes(os.fsencode(binary) + b"\0")
+    (current / "exe").symlink_to(str(slot) + suffix)
+    (current / "cmdline").write_bytes(os.fsencode(slot) + b"\0")
     (root / "started").touch()
 ''')
         for command in ("flock", "readlink", "sha256sum"):
@@ -182,6 +191,8 @@ elif mode == "nohup":
             "/tmp/zte-agent.log": str(self.root / "agent.log"),
             "/tmp/u60-panel/agent": str(self.temporary_binary),
             "/data/local/tmp/start_zte_agent.sh": str(self.startup),
+            "/data/local/tmp/zte-agent-supervisor.sh": str(self.supervisor),
+            "/data/open-u60/update": str(self.ota),
             "/data/zte-agent": str(self.binary),
             "/etc/rc.local": str(self.rc_local),
             "/proc/": str(self.proc) + "/",
@@ -215,6 +226,8 @@ done
 
     def prepare_install(self):
         self.stage.joinpath("agent.new").write_text("new installed executable\n")
+        self.agent_sha = hashlib.sha256(self.stage.joinpath("agent.new").read_bytes()).hexdigest()
+        self.stage.joinpath("supervisor.new").write_text("#!/bin/sh\n# new supervisor\n")
         self.stage.joinpath("start.sh").write_text(self.launcher.read_text())
         self.stage.joinpath("rc.local.new").write_text(install.boot_config(self.rc_local.read_text()))
         self.installer = self.stage / "install.sh"
@@ -225,9 +238,18 @@ done
         self.installer.write_text(self.instrument(self.installer.read_text()))
         return self.installer
 
-    def run_install(self):
+    version = "9.9.9-test.1"
+
+    def install_arguments(self, sha=None, version=None):
+        return [
+            str(self.stage), self.expected_rc,
+            self.agent_sha if sha is None else sha,
+            self.version if version is None else version,
+        ]
+
+    def run_install(self, sha=None, version=None):
         return subprocess.run(
-            ["sh", str(self.installer), str(self.stage), self.expected_rc],
+            ["sh", str(self.installer), *self.install_arguments(sha, version)],
             env=self.env, text=True, capture_output=True, timeout=15,
         )
 
@@ -573,7 +595,7 @@ class InstallationTests(unittest.TestCase):
             processes = []
             try:
                 for command in (
-                    ["sh", str(harness.installer), str(harness.stage), harness.expected_rc],
+                    ["sh", str(harness.installer), *harness.install_arguments()],
                     ["sh", str(harness.launcher)],
                 ):
                     processes.append(subprocess.Popen(
@@ -612,6 +634,143 @@ class InstallationTests(unittest.TestCase):
             self.assertEqual(harness.startup.stat().st_mode & 0o777, 0o700)
             self.assertEqual(harness.binary.stat().st_mode & 0o777, 0o700)
             self.assertNotIn("kill -TERM", harness.calls.read_text())
+
+    def test_launcher_exports_the_ota_layout_and_starts_the_supervisor(self):
+        script = install.launcher()
+        self.assertIn("export ZTE_OTA_ROOT=/data/open-u60/update\n", script)
+        self.assertIn("export ZTE_OTA_SUPERVISOR=/data/local/tmp/zte-agent-supervisor.sh\n", script)
+        self.assertIn("export ZTE_OTA_LEGACY_LINK=/data/zte-agent\n", script)
+        self.assertIn("nohup /data/local/tmp/zte-agent-supervisor.sh </dev/null", script)
+        self.assertNotIn("nohup /data/zte-agent", script)
+
+    def test_executables_in_ab_slots_and_the_rescue_copy_are_mains(self):
+        for relative in ("slot-a", "slot-b", "last-stable"):
+            for deleted in (False, True):
+                with self.subTest(relative=relative, deleted=deleted), tempfile.TemporaryDirectory() as root:
+                    harness = LauncherHarness(root)
+                    exe = str(harness.ota / relative / "zte-agent") + (" (deleted)" if deleted else "")
+                    harness.process(77, exe=exe, args=[exe.removesuffix(" (deleted)")])
+                    result = harness.run_launcher()
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout + result.stderr, "")
+                    self.assertEqual(harness.launched(), [])
+
+    def test_other_slot_names_and_helpers_running_a_slot_are_not_mains(self):
+        with tempfile.TemporaryDirectory() as root:
+            harness = LauncherHarness(root)
+            harness.process(77, exe=str(harness.ota / "slot-c" / "zte-agent"))
+            harness.process(78, exe=str(harness.ota / "slot-a" / "zte-agent.new"))
+            harness.process(79, exe=str(harness.slot), args=[str(harness.slot), "ota-helper"])
+            harness.process(80, exe=str(harness.slot), environment=b"U60_RELAY_DHCP6=1\0")
+            result = harness.run_launcher()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(len(harness.launched()), 1)
+
+    def test_install_stops_a_main_running_from_a_slot(self):
+        with tempfile.TemporaryDirectory() as root:
+            harness = LauncherHarness(root)
+            harness.prepare_install()
+            harness.process(77, exe=str(harness.slot), args=[str(harness.slot)])
+            result = harness.run_install()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("kill -TERM 77", harness.calls.read_text())
+            self.assertEqual(len(harness.launched()), 1)
+
+    def test_install_bootstraps_both_slots_the_supervisor_and_the_legacy_link(self):
+        with tempfile.TemporaryDirectory() as root:
+            harness = LauncherHarness(root)
+            harness.prepare_install()
+            # A previous OTA left signed metadata, a trial marker and the
+            # other slot active: all of it describes the old binary.
+            for name in ("slot-a", "slot-b"):
+                (harness.ota / name).mkdir(parents=True)
+                (harness.ota / name / "zte-agent").write_text("old " + name + "\n")
+                (harness.ota / name / "release.json").write_text("{}\n")
+            (harness.ota / "slot-a" / "release.json.download").write_text("partial")
+            (harness.ota / "pending").write_text("b\na\n")
+            (harness.ota / "state.json").write_text("{}\n")
+            (harness.ota / "active").write_text("b\n")
+            (harness.ota / "blocked.json").write_text('{"blocked":["1.0.0"]}\n')
+            result = harness.run_install()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            for name in ("slot-a", "slot-b"):
+                slot = harness.ota / name
+                self.assertEqual(slot.joinpath("zte-agent").read_text(), "new installed executable\n")
+                self.assertEqual(slot.joinpath("zte-agent").stat().st_mode & 0o777, 0o700)
+                self.assertEqual(
+                    slot.joinpath("bootstrap.sha256").read_text(), harness.agent_sha + "\n" + harness.version + "\n",
+                )
+                self.assertEqual(slot.joinpath("bootstrap.sha256").stat().st_mode & 0o777, 0o600)
+                self.assertFalse(slot.joinpath("release.json").exists())
+                self.assertFalse(slot.joinpath("zte-agent.new").exists())
+            self.assertFalse(harness.ota.joinpath("slot-a", "release.json.download").exists())
+            self.assertFalse(harness.ota.joinpath("pending").exists())
+            self.assertFalse(harness.ota.joinpath("state.json").exists())
+            self.assertEqual(harness.ota.joinpath("active").read_text(), "a\n")
+            self.assertEqual(harness.ota.joinpath("active").stat().st_mode & 0o777, 0o600)
+            self.assertTrue(harness.ota.joinpath("last-stable").is_dir())
+            self.assertEqual(harness.ota.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(harness.ota.joinpath("blocked.json").read_text(), '{"blocked":["1.0.0"]}\n')
+            self.assertTrue(harness.binary.is_symlink())
+            self.assertEqual(os.readlink(harness.binary), str(harness.slot))
+            self.assertFalse(harness.binary.parent.joinpath("zte-agent.next").exists())
+            self.assertEqual(harness.supervisor.read_text(), "#!/bin/sh\n# new supervisor\n")
+            self.assertEqual(harness.supervisor.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(harness.startup.read_text(), harness.launcher.read_text())
+            self.assertEqual(len(harness.launched()), 1)
+
+    def test_install_replaces_an_existing_supervisor_and_keeps_its_backup(self):
+        with tempfile.TemporaryDirectory() as root:
+            harness = LauncherHarness(root)
+            harness.prepare_install()
+            harness.supervisor.write_text("# previous supervisor\n")
+            result = harness.run_install()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(harness.stage.joinpath("supervisor.before.sh").read_text(), "# previous supervisor\n")
+            self.assertEqual(harness.supervisor.read_text(), "#!/bin/sh\n# new supervisor\n")
+
+    def test_install_refuses_a_wrong_digest_or_version_before_stopping_anything(self):
+        cases = {
+            "wrong digest": {"sha": "0" * 64},
+            "short digest": {"sha": "abc"},
+            "uppercase digest": {"sha": "A" * 64},
+            "empty version": {"version": ""},
+            "version with shell syntax": {"version": "1.0;reboot"},
+        }
+        for name, arguments in cases.items():
+            with self.subTest(name), tempfile.TemporaryDirectory() as root:
+                harness = LauncherHarness(root)
+                harness.prepare_install()
+                harness.process(77)
+                result = harness.run_install(**arguments)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn("kill -TERM", harness.calls.read_text())
+                self.assertEqual(harness.binary.read_text(), "old installed executable\n")
+                self.assertFalse(harness.binary.is_symlink())
+                self.assertFalse(harness.ota.exists())
+                self.assertEqual(harness.launched(), [])
+
+    def test_install_refuses_a_missing_or_invalid_supervisor_before_stopping_anything(self):
+        for failure in ("missing", "invalid"):
+            with self.subTest(failure), tempfile.TemporaryDirectory() as root:
+                harness = LauncherHarness(root)
+                harness.prepare_install()
+                harness.process(77)
+                if failure == "missing":
+                    harness.stage.joinpath("supervisor.new").unlink()
+                else:
+                    harness.stage.joinpath("supervisor.new").write_text("if\n")
+                result = harness.run_install()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn("kill -TERM", harness.calls.read_text())
+                self.assertFalse(harness.ota.exists())
+
+    def test_setup_script_is_valid_bash_and_ships_the_supervisor(self):
+        root = Path(__file__).resolve().parents[1]
+        subprocess.run(["bash", "-n", str(root / "setup.sh")], check=True)
+        self.assertTrue(root.joinpath("scripts", "router", "zte-agent-supervisor.sh").is_file())
+        subprocess.run(["sh", "-n", str(root / "scripts" / "router" / "zte-agent-supervisor.sh")], check=True)
+        self.assertNotIn("<<<<<<<", root.joinpath("setup.sh").read_text())
 
     def test_old_adbd_exit_zero_does_not_hide_remote_failure_or_trim_output(self):
         setup = Path(__file__).resolve().parents[1].joinpath("setup.sh").read_text()

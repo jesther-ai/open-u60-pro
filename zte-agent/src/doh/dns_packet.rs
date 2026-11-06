@@ -12,6 +12,41 @@ pub fn is_valid_query(buf: &[u8]) -> bool {
     qdcount >= 1
 }
 
+/// Build one recursive IN query without EDNS. The small packet works over
+/// UDP, DoH and DoT and is used by the guarded resolver preflight.
+pub fn build_query(id: u16, name: &str, qtype: u16) -> Result<Vec<u8>, String> {
+    let name = name.trim_end_matches('.');
+    if name.is_empty() || name.len() > 253 {
+        return Err("invalid DNS test name".to_string());
+    }
+    let mut query = Vec::with_capacity(12 + name.len() + 6);
+    query.extend_from_slice(&id.to_be_bytes());
+    query.extend_from_slice(&[0x01, 0x00]);
+    query.extend_from_slice(&1u16.to_be_bytes());
+    query.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+    for label in name.split('.') {
+        if label.is_empty() || label.len() > 63 || !label.is_ascii() {
+            return Err("invalid DNS test name".to_string());
+        }
+        query.push(label.len() as u8);
+        query.extend_from_slice(label.as_bytes());
+    }
+    query.push(0);
+    query.extend_from_slice(&qtype.to_be_bytes());
+    query.extend_from_slice(&1u16.to_be_bytes());
+    Ok(query)
+}
+
+/// Confirm a response belongs to `id`, is a response rather than a query,
+/// completed successfully and contains at least one answer.
+pub fn successful_response(buf: &[u8], id: u16) -> bool {
+    buf.len() >= 12
+        && u16::from_be_bytes([buf[0], buf[1]]) == id
+        && buf[2] & 0x80 != 0
+        && buf[3] & 0x0f == 0
+        && u16::from_be_bytes([buf[6], buf[7]]) > 0
+}
+
 /// Parse the first question from a DNS packet.
 /// Returns (qname_lowercase, qtype, offset_after_question).
 pub fn parse_question(buf: &[u8]) -> Option<(String, u16, usize)> {
@@ -140,3 +175,27 @@ fn skip_name(buf: &[u8], mut pos: usize) -> Option<usize> {
     None
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builds_a_recursive_query_and_parses_it() {
+        let query = build_query(0x1234, "Example.COM.", 1).unwrap();
+        assert_eq!(
+            parse_question(&query),
+            Some(("example.com".to_string(), 1, query.len()))
+        );
+    }
+
+    #[test]
+    fn successful_response_requires_matching_answer() {
+        let mut response = build_query(0x1234, "example.com", 1).unwrap();
+        response[2] |= 0x80;
+        response[7] = 1;
+        assert!(successful_response(&response, 0x1234));
+        assert!(!successful_response(&response, 0x4321));
+        response[3] = 2;
+        assert!(!successful_response(&response, 0x1234));
+    }
+}

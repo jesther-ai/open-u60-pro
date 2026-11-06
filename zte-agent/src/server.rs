@@ -6,6 +6,7 @@ use crate::at_terminal;
 use crate::auth::{AuthState, Kind, PeerKey, SessionId};
 use crate::cell;
 use crate::conn_watchdog;
+use crate::data_usage;
 use crate::device_ext;
 use crate::esim;
 use crate::httpd::gate::Lane;
@@ -16,6 +17,7 @@ use crate::handlers::{self, AppState};
 use crate::modem_ext;
 use crate::network_ext;
 use crate::oos_policy;
+use crate::ota;
 use crate::router;
 use crate::sim;
 use crate::sms;
@@ -23,6 +25,7 @@ use crate::sms_forward;
 use crate::speedtest;
 use crate::tailscale;
 use crate::telephony;
+use crate::ttl;
 use crate::usb;
 use crate::wifi;
 
@@ -86,8 +89,11 @@ pub enum Pre {
     Login,
     LanDownload { size: usize },
     LanUpload,
+    /// Authenticated JPEG/PNG upload for the bounded eSIM QR decoder.
+    EsimQr,
     /// `GET /api/events`: a stream for this bearer token.
     Events { owner: SessionId },
+    Dashboard,
     /// Read at most `body_limit` bytes, then `route()`.
     Dispatch { body_limit: usize },
 }
@@ -135,8 +141,18 @@ pub fn precheck(req: &ReqInfo, env: &PreEnv) -> Pre {
             return Pre::LanDownload { size: size.min(LAN_DOWNLOAD_MAX) };
         }
         (Method::Post, "/api/lan/upload") => return Pre::LanUpload,
+        (Method::Post, "/api/esim/qr") => {
+            return if principal.is_some() {
+                Pre::EsimQr
+            } else {
+                refuse(403, "agent password required")
+            };
+        }
         // Streams belong to a token (their expiry and per-token cap), so
         // they need a password.
+        (Method::Get, "/api/dashboard/events") => {
+            return if principal.is_some() { Pre::Dashboard } else { refuse(403,"agent password required") };
+        }
         (Method::Get, "/api/events") => {
             return match principal {
                 Some(p) if p.is_local() => refuse(403, "event streams need a login token"),
@@ -194,19 +210,23 @@ pub fn encode((status, body): (u16, Value)) -> Encoded {
 /// STK worker's memory) and call control (one short AT command each, and a
 /// hang-up must not wait behind a Tailscale setup) stay General.
 pub fn lane(method: Method, path: &str) -> Lane {
-    use Method::{Delete, Get, Post};
+    use Method::{Delete, Get, Post, Put};
     let slow = match (method, path) {
         (Post, "/api/router/reservations") => true,
         (Get, "/api/mihomo/status" | "/api/mihomo/profiles" | "/api/wifi-relay/status") => false,
         (_, p) if p.starts_with("/api/mihomo/") || p.starts_with("/api/wifi-relay/") => true,
+        (Get, "/api/network/client-details") => true,
         (Get, "/api/esim/switch")
         | (Get | Delete, "/api/esim/download")
         | (Post, "/api/esim/download/confirm" | "/api/esim/download/cancel")
         | (Get, "/api/tailscale/status")
         | (Get, "/api/stk/menu" | "/api/stk/session") => false,
-        (_, p) if p.starts_with("/api/esim/") || p.starts_with("/api/tailscale/") => true,
+        (_, p) if p.starts_with("/api/esim/") || p.starts_with("/api/tailscale/") || p.starts_with("/api/https/") => true,
+        (Put | Post, p) if p.starts_with("/api/vpn/wireguard") => true,
         (_, p) if p.starts_with("/api/ussd/") || p.starts_with("/api/stk/") => true,
         (Post, p) if p.starts_with("/api/sim/") || p.starts_with("/api/cell/") => true,
+        (_, p) if p.starts_with("/api/dns/") => true,
+        (_, p) if p.starts_with("/api/update/") && p != "/api/update/status" => true,
         (
             Post,
             "/api/at/send"
@@ -241,7 +261,7 @@ pub fn parse_query_usize(query: Option<&str>, key: &str) -> Option<usize> {
     None
 }
 
-pub fn route(method: &Method, path: &str, state: &AppState, body: &[u8]) -> (u16, Value) {
+fn route_inner(method: &Method, path: &str, state: &AppState, body: &[u8]) -> (u16, Value) {
     crate::httpd::gate::debug_assert_may_block();
     if *method != Method::Get {
         crate::httpd::gate::debug_assert_may_change(path);
@@ -264,10 +284,17 @@ pub fn route(method: &Method, path: &str, state: &AppState, body: &[u8]) -> (u16
         (&Method::Post, "/api/auth/login") => handlers::login(state, body, PeerKey::UNKNOWN),
         // Device info (sysfs)
         (&Method::Get, "/api/device") => handlers::device(state),
+        (&Method::Get, "/api/update/status") => ota::status_api(state),
+        (&Method::Put, "/api/update/settings") => ota::settings_api(state, body),
+        (&Method::Post, "/api/update/check") => ota::check_api(state),
+        (&Method::Post, "/api/update/download") => ota::download_api(state),
+        (&Method::Post, "/api/update/install") => ota::install_api(state, body),
+        (&Method::Post, "/api/update/rollback") => ota::rollback_api(state, body),
         (&Method::Get, "/api/battery") => handlers::battery(state),
         (&Method::Get, "/api/cpu") => handlers::cpu(state),
         (&Method::Get, "/api/memory") => handlers::memory(state),
         // Network
+        (&Method::Get, "/api/network/client-details") => { let reading=state.client_details.snapshot(); (if reading["ok"]==true {200} else {503},reading) },
         (&Method::Get, "/api/network/signal") => handlers::network_signal(state),
         (&Method::Get, "/api/network/traffic") => handlers::network_traffic(state),
         (&Method::Get, "/api/network/speed") => handlers::network_speed(state),
@@ -301,7 +328,9 @@ pub fn route(method: &Method, path: &str, state: &AppState, body: &[u8]) -> (u16
         (&Method::Get, "/api/wifi/guest") => wifi::guest_status(state),
         (&Method::Put, "/api/wifi/guest") => wifi::guest_set(state, body),
         // Modem
-        (&Method::Get, "/api/data-usage") => handlers::data_usage(state),
+        (&Method::Get, "/api/data-usage") => data_usage::get(state),
+        (&Method::Put, "/api/data-usage/limit") => data_usage::set_limit(state, body),
+        (&Method::Put, "/api/data-usage/cycle") => data_usage::set_cycle(state, body),
         (&Method::Get, "/api/modem/status") => handlers::modem_status(state),
         (&Method::Post, "/api/modem/online") => modem_ext::modem_online_user(state),
         (&Method::Get, "/api/modem/data") => modem_ext::modem_data_get(state),
@@ -369,6 +398,11 @@ pub fn route(method: &Method, path: &str, state: &AppState, body: &[u8]) -> (u16
         // Router
         (&Method::Get, "/api/router/dns") => router::router_dns_get(state),
         (&Method::Put, "/api/router/dns") => router::router_dns_set(state, body),
+        (&Method::Get, "/api/dns/status") => crate::dns_control::status(state),
+        (&Method::Post, "/api/dns/test") => crate::dns_control::test(state, body),
+        (&Method::Put, "/api/dns/apply") => crate::dns_control::apply(state, body),
+        (&Method::Get, "/api/dns/cache") => crate::dns_control::cache(state),
+        (&Method::Post, "/api/dns/cache/clear") => crate::dns_control::clear_cache(state),
         (&Method::Get, "/api/router/lan") => router::router_lan_get(state),
         (&Method::Put, "/api/router/lan") => router::router_lan_set(state, body),
         (&Method::Get, "/api/router/firewall") => router::router_firewall_get(state),
@@ -386,6 +420,12 @@ pub fn route(method: &Method, path: &str, state: &AppState, body: &[u8]) -> (u16
         (&Method::Put, "/api/router/vpn") => router::router_vpn_set(state, body),
         (&Method::Get, "/api/router/qos") => router::router_qos_get(state),
         (&Method::Put, "/api/router/qos") => router::router_qos_set(state, body),
+        (&Method::Get, "/api/router/ttl") => ttl::config_get(&state.ttl),
+        (&Method::Put, "/api/router/ttl") => ttl::config_set(&state.ttl, body),
+        (&Method::Get, "/api/vpn/wireguard") => crate::wireguard::status(&state.wireguard),
+        (&Method::Put, "/api/vpn/wireguard") => crate::wireguard::import(&state.wireguard, body),
+        (&Method::Post, "/api/vpn/wireguard/enable") => crate::wireguard::enable(&state.wireguard),
+        (&Method::Post, "/api/vpn/wireguard/disable") => crate::wireguard::disable(&state.wireguard),
         (&Method::Get, "/api/router/domain-filter") => router::router_domain_filter_get(state),
         (&Method::Put, "/api/router/domain-filter") => router::router_domain_filter_set(state, body),
         (&Method::Get, "/api/router/apn/mode") => router::router_apn_mode_get(state),
@@ -429,9 +469,9 @@ pub fn route(method: &Method, path: &str, state: &AppState, body: &[u8]) -> (u16
         (&Method::Post, "/api/esim/delete") => esim::delete(state, body),
         (&Method::Post, "/api/esim/download") => esim::download_start(state, body),
         (&Method::Get, "/api/esim/download") => esim::download_status(state),
-        (&Method::Delete, "/api/esim/download") => esim::download_dismiss(state),
+        (&Method::Delete, "/api/esim/download") => esim::download_dismiss_for(state, body),
         (&Method::Post, "/api/esim/download/confirm") => esim::download_confirm(state, body),
-        (&Method::Post, "/api/esim/download/cancel") => esim::download_cancel(state),
+        (&Method::Post, "/api/esim/download/cancel") => esim::download_cancel_for(state, body),
         // DoH
         (&Method::Get, "/api/doh/status") => doh_status(state),
         (&Method::Put, "/api/doh/config") => doh_config_set(state, body),
@@ -458,6 +498,7 @@ pub fn route(method: &Method, path: &str, state: &AppState, body: &[u8]) -> (u16
         (&Method::Get, "/api/tailscale/status") => tailscale::status(state),
         // LAN HTTPS (docs/web-ui.md, "LAN HTTPS"): read-only for the apps.
         (&Method::Get, "/api/https") => state.tls.status_json(),
+        (&Method::Post, path @ ("/api/https/on" | "/api/https/renew" | "/api/https/reset")) => https_change(state, path, body),
         (&Method::Post, "/api/tailscale/setup") => tailscale::setup(state, body),
         (&Method::Post, "/api/tailscale/login-url") => tailscale::login_url(state),
         (&Method::Post, "/api/tailscale/enable") => tailscale::enable(state),
@@ -493,32 +534,15 @@ fn doh_status(state: &AppState) -> (u16, Value) {
 }
 
 fn doh_config_set(state: &AppState, body: &[u8]) -> (u16, Value) {
-    match state.doh.update_config(body) {
-        Ok(()) => (200, json!({"ok": true})),
-        Err(e) => (400, json!({"ok": false, "error": e})),
-    }
+    crate::dns_control::legacy_doh_config(state, body)
 }
 
 fn doh_enable(state: &AppState) -> (u16, Value) {
-    if let Err(e) = state.doh.start() {
-        return (500, json!({"ok": false, "error": e}));
-    }
-    // Write DoH forwarding config to dnsmasq.d drop-in
-    // (UCI `set` creates a plain option, but dnsmasq init only reads `server` as a list — drop-in is reliable)
-    let _ = std::fs::write("/tmp/dnsmasq.d/doh.conf", "server=127.0.0.1#5353\nno-resolv\n");
-    let _ = std::process::Command::new("sh")
-        .args(["-c", "/etc/init.d/dnsmasq restart"])
-        .output();
-    // Save config
-    state.doh.set_enabled(true);
-    (200, json!({"ok": true, "data": {"status": "enabled"}}))
+    crate::dns_control::legacy_doh_enable(state)
 }
 
 fn doh_disable(state: &AppState) -> (u16, Value) {
-    state.doh.stop();
-    dnsmasq_restore_defaults();
-    state.doh.set_enabled(false);
-    (200, json!({"ok": true, "data": {"status": "disabled"}}))
+    crate::dns_control::legacy_doh_disable(state)
 }
 
 /// Restore dnsmasq to default DNS resolution (remove DoH forwarding).
@@ -538,8 +562,42 @@ fn doh_cache_list(state: &AppState) -> (u16, Value) {
 }
 
 fn doh_cache_clear(state: &AppState) -> (u16, Value) {
-    state.doh.clear_cache();
-    (200, json!({"ok": true}))
+    crate::dns_control::clear_cache(state)
+}
+
+
+pub fn route(method: &Method, path: &str, state: &AppState, body: &[u8]) -> (u16, Value) {
+    let reply = route_inner(method,path,state,body);
+    if reply.0 < 300 && matches!(method,Method::Put|Method::Post|Method::Delete) && path != "/api/auth/login" {
+        state.dashboard.request_refresh();
+    }
+    reply
+}
+
+/// HTTPS changes use the existing authenticated API, never legacy browser cookies.
+fn https_change(state: &AppState, path: &str, body: &[u8]) -> (u16, Value) {
+    if !state.auth.has_password() {
+        return (403, json!({"ok":false,"error":"agent password required"}));
+    }
+    let Ok(value) = serde_json::from_slice::<Value>(body) else {
+        return (400, json!({"ok":false,"error":"invalid JSON"}));
+    };
+    if value["confirm"] != true {
+        return (
+            400,
+            json!({"ok":false,"error":"explicit confirmation required"}),
+        );
+    }
+    let result = match path {
+        "/api/https/on" => state.tls.turn_on(),
+        "/api/https/renew" => state.tls.renew(),
+        "/api/https/reset" => state.tls.reset(),
+        _ => return (404, json!({"ok":false,"error":"not found"})),
+    };
+    match result {
+        Ok(()) => state.tls.status_json(),
+        Err(error) => (503, json!({"ok":false,"error":error})),
+    }
 }
 
 #[cfg(test)]
@@ -625,6 +683,7 @@ mod tests {
         );
         assert_eq!(run(&auth, &info(Method::Get, "/api/lan/ping", None, t, h)), Pre::Reply(200, json!({"ok": true})));
         assert_eq!(run(&auth, &info(Method::Post, "/api/lan/upload", None, t, h)), Pre::LanUpload);
+        assert_eq!(run(&auth, &info(Method::Post, "/api/esim/qr", None, t, h)), Pre::EsimQr);
         assert_eq!(run(&auth, &info(Method::Other, "/", None, t, h)), DISPATCH);
         // Event streams carry the token's session.
         assert_eq!(
@@ -690,6 +749,10 @@ mod tests {
     fn precheck_without_password() {
         let auth = AuthState::new();
         let h = host("192.168.0.1:9090");
+        assert_eq!(
+            run(&auth, &info(Method::Post, "/api/esim/qr", None, None, h)),
+            reply(403, "agent password required")
+        );
         // Open, but Host-checked.
         assert_eq!(run(&auth, &info(Method::Get, "/api/device", None, None, h)), DISPATCH);
         assert_eq!(run(&auth, &info(Method::Get, "/api/device", None, None, host("u60-pro:9090"))), DISPATCH);
@@ -754,5 +817,11 @@ mod tests {
         assert_eq!(Method::from(&M::HEAD), Method::Other);
         assert_eq!(Method::from(&M::PATCH), Method::Other);
         assert_eq!(Method::from(&M::from_bytes(b"get").unwrap()), Method::Other);
+    }
+
+    #[test]
+    fn ota_download_uses_the_slow_lane_without_blocking_status() {
+        assert_eq!(lane(Method::Post, "/api/update/download"), Lane::Slow);
+        assert_eq!(lane(Method::Get, "/api/update/status"), Lane::General);
     }
 }

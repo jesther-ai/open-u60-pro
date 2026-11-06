@@ -30,6 +30,19 @@ pub fn call(object: &str, method: &str, params: Option<&str>) -> Result<Value, S
     serde_json::from_str(trimmed).map_err(|e| format!("ubus JSON parse: {e}"))
 }
 
+/// A deadline-limited call for a bounded handover transaction.
+pub(crate) fn call_bounded(object: &str, method: &str, params: Option<&str>, seconds: u8) -> Result<Value, String> {
+    crate::httpd::gate::debug_assert_may_block();
+    let mut cmd = Command::new("ubus");
+    cmd.args(["-t", &seconds.max(1).to_string(), "call", object, method]);
+    if let Some(params) = params { cmd.arg(params); }
+    let output = cmd.output().map_err(|e| format!("ubus exec: {e}"))?;
+    if !output.status.success() { return Err(format!("bounded ubus {object} {method} failed")); }
+    let text = String::from_utf8_lossy(&output.stdout);
+    if text.trim().is_empty() { Ok(Value::Null) }
+    else { serde_json::from_str(text.trim()).map_err(|e| format!("ubus JSON parse: {e}")) }
+}
+
 /// `ubus send <event> <payload>`: broadcasts an agent event to other processes on the router.
 pub fn send(event: &str, payload: &Value) -> Result<(), String> {
     crate::httpd::gate::debug_assert_may_block();

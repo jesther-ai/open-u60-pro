@@ -1,5 +1,5 @@
 //! LAN HTTPS with the router's own certificate authority (owner decision
-//! 59): the web UI at `https://<LAN address>:9443/ui/` and at a local name
+//! 59): the web UI at `https://<LAN address>:9443/console/` and at a local name
 //! (`u60.home.arpa`), so browsers can install it as an app. Each device
 //! trusts the CA once (Settings offers the iPhone profile, the `.crt` and
 //! the fingerprint). Offline, no accounts; plain http on :9090 stays.
@@ -310,7 +310,7 @@ impl Tls {
             hosts: hosts::Hosts::router(),
             lan_ip: Box::new(lan_ip),
             verified: Box::new(move || live.verified_utc().and_then(|t| i64::try_from(t).ok())),
-            wall: Box::new(crate::web::sms::now_unix),
+            wall: Box::new(crate::calendar::now_unix),
             boot: Arc::new(BootClock),
         })
     }
@@ -430,7 +430,7 @@ impl Tls {
 
     /// What the CA cannot cover at LAN address `lan` (Settings' line).
     fn scope_error(&self, ca: &Ca, lan: Ipv4Addr) -> Option<String> {
-        let name_url = format!("https://{}:{}/ui/", self.p.name, self.port);
+        let name_url = format!("https://{}:{}/console/", self.p.name, self.port);
         if !ca.scope.covers_name(&self.p.name) {
             Some(format!(
                 "The certificate authority was made for {}, not {} ({NAME_ENV}). To use the new name, Reset HTTPS and turn it on again (each device must then trust the new authority).",
@@ -719,10 +719,10 @@ impl Tls {
         }
     }
 
-    /// `GET /api/https` (docs/web-ui.md).
+    /// `GET /api/https`: console status without private key material.
     pub fn status_json(&self) -> (u16, Value) {
         let s = self.status();
-        let data = if s.on {
+        let mut data = if s.on {
             json!({
                 "enabled": true,
                 "listening": s.listening.is_some(),
@@ -742,6 +742,10 @@ impl Tls {
         } else {
             json!({"enabled": false, "port": s.port, "name": s.name, "error": s.error})
         };
+        data["clock_utc"] = json!(s.clock.secs());
+        data["clock_verified"] = json!(matches!(s.clock, Utc::Verified(_)));
+        data["kept_ca"] = json!(s.kept);
+        data["ca_sha1"] = json!(s.sha1);
         (200, json!({"ok": true, "data": data}))
     }
 }
@@ -773,10 +777,10 @@ pub struct Status {
 }
 
 impl Status {
-    /// `https://<ip>:<port>/ui/`, then the name's.
+    /// `https://<ip>:<port>/console/`, then the name's.
     pub fn urls(&self) -> Vec<String> {
         let port = if self.port == 443 { String::new() } else { format!(":{}", self.port) };
-        self.ip.iter().map(|ip| ip.to_string()).chain([self.name.clone()]).map(|h| format!("https://{h}{port}/ui/")).collect()
+        self.ip.iter().map(|ip| ip.to_string()).chain([self.name.clone()]).map(|h| format!("https://{h}{port}/console/")).collect()
     }
 }
 

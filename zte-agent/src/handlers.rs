@@ -12,6 +12,8 @@ use crate::system::{self, CpuTracker, ProcessTracker, SpeedTracker};
 use crate::ubus;
 
 pub struct AppState {
+    pub client_details: crate::client_details::ClientMonitor,
+    pub dashboard: Arc<crate::dashboard::Dashboard>,
     pub live_activity: Arc<crate::live_activity::LiveActivity>,
     pub auth: Arc<AuthState>,
     pub cpu: CpuTracker,
@@ -30,6 +32,9 @@ pub struct AppState {
     pub cellular_control: crate::modem_ext::CellularControl,
     pub mihomo: Arc<crate::mihomo::Mihomo>,
     pub wifi_relay: Arc<crate::wifi_relay::WifiRelay>,
+    pub ttl: Arc<crate::ttl::TtlManager>,
+    pub wireguard: Arc<crate::wireguard::WireGuardManager>,
+    pub ota: Arc<crate::ota::OtaManager>,
     /// Single-flight TTL cache in front of the `ubus` CLI (see cache.rs).
     pub cache: Arc<UbusCache>,
     pub oos_policy: Arc<crate::oos_policy::OosPolicy>,
@@ -52,11 +57,15 @@ impl AppState {
         let live_activity = Arc::new(crate::live_activity::LiveActivity::new());
         let network_lock = Arc::new(std::sync::Mutex::new(()));
         let mihomo = Arc::new(crate::mihomo::Mihomo::new(Arc::clone(&network_lock)));
+        let dashboard = Arc::new(crate::dashboard::Dashboard::default());
+        let ota = crate::ota::OtaManager::system(Arc::downgrade(&dashboard));
         Self {
             wifi_relay: Arc::new(crate::wifi_relay::WifiRelay::with_core(Arc::clone(&network_lock), Arc::clone(&mihomo))),
             mihomo,
             network_lock,
             cellular_control: crate::modem_ext::CellularControl::default(),
+            client_details: crate::client_details::ClientMonitor::default(),
+            dashboard,
             tls: Arc::new(crate::tls::Tls::router(Arc::clone(&live_activity))),
             live_activity,
             auth: Arc::new(AuthState::new()),
@@ -72,6 +81,9 @@ impl AppState {
             charge_limit: Arc::new(ChargeLimitEnforcer::new()),
             sms_forward: Arc::new(SmsForwarder::new()),
             tailscale: Arc::new(crate::tailscale::TailscaleManager::new()),
+            ttl: Arc::new(crate::ttl::TtlManager::new()),
+            wireguard: Arc::new(crate::wireguard::WireGuardManager::new()),
+            ota,
             cache: Arc::new(UbusCache::new()),
             oos_policy: Arc::new(crate::oos_policy::OosPolicy::new()),
             conn_watchdog: Arc::new(crate::conn_watchdog::ConnWatchdog::new()),
@@ -279,40 +291,6 @@ fn uci_unquote(raw: &str) -> String {
     } else {
         raw.to_string()
     }
-}
-
-/// GET /api/data-usage
-pub fn data_usage(_state: &AppState) -> (u16, Value) {
-    let section = "zwrt_data_commit.wwancid1dst";
-
-    let read_period = |prefix: &str| -> Value {
-        let get = |suffix: &str| -> Value {
-            let key = format!("{section}.{prefix}_{suffix}");
-            match ubus::uci_get(&key) {
-                Ok(v) => v.parse::<u64>().map(Value::from).unwrap_or(Value::from(v)),
-                Err(_) => Value::Null,
-            }
-        };
-        json!({
-            "tx_bytes": get("tx_bytes"),
-            "rx_bytes": get("rx_bytes"),
-            "time_secs": get("time"),
-            "tx_packets": get("tx_packets"),
-            "rx_packets": get("rx_packets"),
-        })
-    };
-
-    (
-        200,
-        json!({
-            "ok": true,
-            "data": {
-                "day": read_period("day"),
-                "month": read_period("month"),
-                "total": read_period("total"),
-            }
-        }),
-    )
 }
 
 /// POST /api/modem/online

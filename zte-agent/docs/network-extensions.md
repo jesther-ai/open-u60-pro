@@ -6,6 +6,14 @@ not a released or fully device-accepted firmware. Dated validation below and in
 change. The iOS/Android interfaces and the Next.js public site are unchanged.
 Do not assume successful unit tests prove B31 forwarding works.
 
+> **Browser pages (2026-11-07):** after merging `origin/main`, production serves
+> only the responsive console (`src/console.rs`). The maud pages described under
+> "Web layout" and "Routes" (`/ui/relay`, `/ui/router/mihomo`, the Zashboard
+> dashboard and its `/ui/mihomo/api` bridge) remain in the tree as test-only
+> fixtures (`#[cfg(test)] mod web`) and are not reachable on a device. Relay and
+> Mihomo are driven through `/api/wifi-relay/*` and `/api/mihomo/*` until the
+> console gets pages for them. Everything else in this document is unchanged.
+
 ## Web layout
 
 - **Router -> Mihomo / Clash** has a start/stop switch. **Open Zashboard** is

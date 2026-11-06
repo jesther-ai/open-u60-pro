@@ -95,7 +95,7 @@ fn key_ptr(t: &Tls) -> usize {
 
 #[test]
 fn constants_follow_the_design() {
-    assert_eq!(CLOCK_FLOOR, crate::web::sms::days_from_civil(2026, 10, 1) * DAY);
+    assert_eq!(CLOCK_FLOOR, crate::calendar::days_from_civil(2026, 10, 1) * DAY);
     assert_eq!((SERVER_DAYS, RENEW_BEFORE, BACKDATE), (397, 30 * DAY, 2 * DAY));
     for ok in ["10.0.0.1", "10.255.255.255", "172.16.0.1", "172.31.255.255", "192.168.0.1"] {
         assert!(private(ok.parse().unwrap()), "{ok}");
@@ -172,7 +172,7 @@ fn turn_on_creates_everything_once() {
     let st = t.status();
     assert!(st.on && st.ca_name.starts_with("U60 Pro local CA ") && st.ca_name.len() == 25);
     assert_eq!(st.sha256, x509::sha256_fingerprint(&ca));
-    assert_eq!(st.urls(), ["https://192.168.0.1:0/ui/", "https://u60.home.arpa:0/ui/"]);
+    assert_eq!(st.urls(), ["https://192.168.0.1:0/console/", "https://u60.home.arpa:0/console/"]);
     assert!(!st.renew_due);
     // Again: nothing changes.
     let before = key_ptr(&t);
@@ -224,7 +224,7 @@ fn a_public_lan_address_is_left_out() {
     assert!(server_cert(&w).ips.is_empty());
     assert!(t.status().error.unwrap().contains("100.64.0.1 is not a private address"));
     assert_eq!(w.hosts_file().as_deref(), Some("100.64.0.1 u60.home.arpa\n"));
-    assert_eq!(t.status().urls(), ["https://u60.home.arpa:0/ui/"]);
+    assert_eq!(t.status().urls(), ["https://u60.home.arpa:0/console/"]);
     assert_eq!(t.status().covers, ["u60.home.arpa"]);
     let (ca, issuing) = (t.ca_der().unwrap(), std::fs::read(w.dir().join(ISSUING_CRT)).unwrap());
     let stored = x509::KeyCert { key: std::fs::read(w.dir().join(ISSUING_KEY)).unwrap(), cert: issuing.clone() };
@@ -418,7 +418,7 @@ fn a_new_lan_address_keeps_the_name_working() {
     assert_eq!((s.not_before, s.not_after), (first.not_before, first.not_after));
     assert_eq!(w.hosts_file().as_deref(), Some("192.168.8.1 u60.home.arpa\n"));
     let st = t.status();
-    assert_eq!(st.urls(), ["https://u60.home.arpa:0/ui/"]);
+    assert_eq!(st.urls(), ["https://u60.home.arpa:0/console/"]);
     let e = st.error.unwrap();
     assert!(e.contains("now 192.168.8.1, but its certificate authority was made for 192.168.0.1") && e.contains("Reset HTTPS"), "{e}");
     let ca = t.ca_der().unwrap();
@@ -487,7 +487,7 @@ fn reset_deletes_everything() {
     assert!(t.keys().read().unwrap().is_none());
     assert!(!t.status().on && t.ca_der().is_none() && t.mobileconfig().is_none());
     assert_eq!(*w.signals.lock().unwrap(), [123, 123]);
-    assert_eq!(t.status_json().1["data"], serde_json::json!({"enabled": false, "port": 0, "name": "u60.home.arpa", "error": null}));
+    assert_eq!(t.status_json().1["data"], serde_json::json!({"enabled": false, "port": 0, "name": "u60.home.arpa", "error": null, "clock_utc": w.wall.load(Ordering::SeqCst), "clock_verified": false, "kept_ca": null, "ca_sha1": ""}));
     t.reset().unwrap();
     t.turn_on().unwrap();
     assert_ne!(t.ca_der().unwrap(), old);
@@ -503,7 +503,7 @@ fn status_json_for_the_apps() {
     let d = &v["data"];
     assert_eq!(status, 200);
     assert_eq!((d["enabled"].as_bool(), d["listening"].as_bool(), d["ip"].as_str()), (Some(true), Some(true), Some("192.168.0.1")));
-    assert_eq!(d["urls"], serde_json::json!(["https://192.168.0.1:0/ui/", "https://u60.home.arpa:0/ui/"]));
+    assert_eq!(d["urls"], serde_json::json!(["https://192.168.0.1:0/console/", "https://u60.home.arpa:0/console/"]));
     assert_eq!(d["not_after"].as_i64(), Some(NOW - 2 * DAY + 397 * DAY));
     assert_eq!(d["ca_sha256"].as_str().map(str::len), Some(95));
     assert_eq!(d["ca_covers"], serde_json::json!(["192.168.0.1", "u60.home.arpa"]));

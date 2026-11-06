@@ -40,6 +40,10 @@ use crate::esim_download::DownloadCtl;
 use crate::events::watched::Watched;
 use crate::events::Topic;
 use crate::handlers::AppState;
+#[cfg(not(test))]
+use crate::qr_decode;
+#[cfg(test)]
+use crate::web::qr_decode;
 
 /// Every card-only command observed on the router finished in under 4 s.
 const CARD_LIMIT: Duration = Duration::from_secs(30);
@@ -80,6 +84,10 @@ const RECEIPT_MAX_ATTEMPTS: u32 = 10;
 const RECEIPT_MAX_ROUNDS: u32 = 24;
 /// SGP.22 profileNickname is a UTF8String of at most 64 bytes.
 const NICKNAME_MAX_BYTES: usize = 64;
+/// Largest JPEG or PNG accepted by the responsive console's QR upload.
+pub const QR_IMAGE_MAX: usize = qr_decode::MAX_BYTES;
+/// A crafted finder-pattern image must not occupy the QR decoder indefinitely.
+const QR_DECODE_LIMIT: Duration = Duration::from_secs(15);
 /// Shared with `zte-agent esim-native` runs by hand.
 const DEFAULT_LOCK_PATH: &str = "/tmp/esim.lock";
 
@@ -92,6 +100,8 @@ struct Inner {
     busy: AtomicBool,
     /// `mono_secs()` of the last successful profile switch (0 = none).
     switched_at: AtomicU64,
+    user_modem_revision: AtomicU64,
+    modem_commands: Mutex<()>,
     download: Watched<Download>,
     /// The running download's decisions (preview answer, cancel).
     control: DownloadControl,
@@ -298,6 +308,9 @@ struct Switch {
     /// Why the switch didn't complete, when known: `roaming_off` or `data_off` (no data), or
     /// `card_busy` (not applied: the eSIM kept refusing).
     reason: Option<&'static str>,
+    network_policy: crate::esim_network::Policy,
+    network_check: &'static str,
+    data_recovery_attempted: bool,
 }
 
 impl Switch {
@@ -319,6 +332,8 @@ impl Switch {
             "finished_at": self.finished_at,
             "note": self.note,
             "reason": self.reason,
+            "network_check": self.network_check,
+            "data_recovery_attempted": self.data_recovery_attempted,
         })
     }
 }
@@ -435,6 +450,8 @@ impl Esim {
             inner: Arc::new(Inner {
                 busy: AtomicBool::new(false),
                 switched_at: AtomicU64::new(0),
+                user_modem_revision: AtomicU64::new(0),
+                modem_commands: Mutex::new(()),
                 download: Watched::new(Download::default(), Topic::EsimDownload),
                 control: DownloadControl::default(),
                 inventory: Mutex::new(Inventory::default()),
@@ -444,6 +461,13 @@ impl Esim {
                 lock_path,
             }),
         }
+    }
+
+    /// A newer explicit modem command takes priority over handover recovery.
+    pub(crate) fn note_user_modem_change(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.inner.user_modem_revision.fetch_add(1, Ordering::AcqRel);
+        let guard = self.inner.modem_commands.lock().unwrap_or_else(|e| e.into_inner());
+        guard
     }
 
     fn acquire(&self) -> Option<BusyGuard> {
@@ -588,6 +612,7 @@ struct SwitchCheck {
     /// The enabled manual APN (name, APN) when the router is in manual APN mode.
     manual_apn: Option<(String, String)>,
     roaming_off: bool,
+    data_off: bool,
     loaded_iccid: Option<String>,
     sim_mcc: Option<String>,
     net_mcc: Option<String>,
@@ -605,7 +630,9 @@ impl SwitchCheck {
             .then(|| crate::ubus::call("zwrt_apn_object", "get_manu_apn_list", Some("{}")).ok())
             .flatten()
             .and_then(|list| enabled_manual_apn(&list));
-        let roaming_off = crate::modem_ext::wwan(state).ok().and_then(|w| int(&w["roam_enable"])) == Some(0);
+        let wwan = crate::modem_ext::wwan(state).ok();
+        let roaming_off = wwan.as_ref().and_then(|w| int(&w["roam_enable"])) == Some(0);
+        let data_off = wwan.as_ref().and_then(|w| int(&w["enable"])) == Some(0);
         let sim = crate::sim::info(state).unwrap_or_default();
         let text = |v: &Value| match v {
             Value::String(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
@@ -615,6 +642,7 @@ impl SwitchCheck {
         SwitchCheck {
             manual_apn,
             roaming_off,
+            data_off,
             loaded_iccid: text(&sim["sim_iccid"]),
             sim_mcc: text(&sim["mdm_mcc"]),
             // Unregistered, the firmware reports MCC 0: no network country to compare with.
@@ -643,6 +671,7 @@ impl SwitchCheck {
         if self.roaming_off && roams == Some(true) {
             codes.push("roaming_off");
         }
+        if self.data_off { codes.push("data_off"); }
         codes
     }
 
@@ -739,6 +768,22 @@ pub fn switch_status(state: &AppState) -> (u16, Value) {
     (200, json!({"ok": true, "data": view}))
 }
 
+/// The web stream reads saved state only: it never opens a card channel or sends receipts.
+pub(crate) fn dashboard_status(state: &AppState) -> Value {
+    let inner = &state.esim.inner;
+    let inventory = inner.inventory.lock().unwrap();
+    let loaded = inventory.profiles.is_some();
+    let view = inventory.view(inner.instance, inner.busy.load(Ordering::Acquire));
+    drop(inventory);
+    json!({"ok":true,"data":{
+        "agent_instance":inner.instance,"inventory_loaded":loaded,"inventory":view,
+        "switch":switch_status(state).1["data"],
+        "download":download_status(state).1["data"],
+        "receipts":inner.receipts.lock().unwrap().view(true),
+        "password_required":!state.auth.has_password(),
+    }})
+}
+
 /// GET /api/esim/chip — card identity and capacity.
 pub fn chip(state: &AppState) -> (u16, Value) {
     let inner = &state.esim.inner;
@@ -822,6 +867,9 @@ pub fn enable(state: &AppState, body: &[u8]) -> (u16, Value) {
     if let Err((status, message)) = check_enable_target(&list, &iccid) {
         return error(status, message);
     }
+    let revision = state.esim.inner.user_modem_revision.load(Ordering::Acquire);
+    let before_data = crate::modem_ext::wwan(state).unwrap_or(Value::Null);
+    let network_policy = crate::esim_network::Policy::capture(&before_data, revision);
     state.sim_identity.agent_switch_arm();
     let result = card(&["profile", "enable", &iccid, "1"], CARD_LIMIT);
     drop(guard);
@@ -832,7 +880,7 @@ pub fn enable(state: &AppState, body: &[u8]) -> (u16, Value) {
     if let Err(e) = &result {
         if card_busy(&e.message()) {
             state.sim_identity.agent_switch_disarm();
-            return retry_while_busy(state, iccid, previous, list, e.message());
+            return retry_while_busy(state, iccid, previous, list, e.message(), network_policy);
         }
     }
     let inner = &state.esim.inner;
@@ -853,6 +901,8 @@ pub fn enable(state: &AppState, body: &[u8]) -> (u16, Value) {
         generation,
         started_at: now,
         note: result.as_ref().err().map(|e| format!("enable error: {}", e.message())),
+        network_policy,
+        network_check: "waiting",
         ..Switch::default()
     };
     inner.switched_at.store(mono_secs(), Ordering::Relaxed);
@@ -910,6 +960,7 @@ fn retry_while_busy(
     previous: Option<String>,
     list: Vec<Value>,
     message: String,
+    network_policy: crate::esim_network::Policy,
 ) -> (u16, Value) {
     let inner = &state.esim.inner;
     let now = unix_now();
@@ -926,6 +977,8 @@ fn retry_while_busy(
         generation,
         started_at: now,
         note: Some(format!("the eSIM refused while busy ({message}); retrying")),
+        network_policy,
+        network_check: "waiting",
         ..Switch::default()
     };
     eprintln!("[esim] enable {} refused while busy ({message}); retrying", mask(&iccid));
@@ -1095,10 +1148,32 @@ fn verify_switch(inner: Arc<Inner>, target: String, generation: u64) {
             eprintln!("[esim] switch check: card unreadable, but the modem loaded {}", mask(&target));
         }
     }
+    let policy = inner.switch.lock().unwrap().network_policy;
+    let mut handover = crate::esim_network::Handover::default();
+    let recovery_enabled = std::env::var("ZTE_AGENT_ESIM_RECOVERY").as_deref() != Ok("0");
     let connected = loop {
-        // Ask the firmware first, then publish under the lock.
+        use crate::esim_network::{Decision, Reachability};
+        if !current(&inner, generation) { return; }
         let modem_ok = modem_has_target();
-        let data_ok = data_connected();
+        let data = read_data_connection().unwrap_or(Value::Null);
+        let data_ok = crate::esim_network::bearer_connected(&data);
+        let configured = crate::sim_identity::observe_gate().ready_for_probe();
+        let health = if modem_ok && data_ok && configured && started.elapsed() < SWITCH_VERIFY_LIMIT {
+            if recovery_enabled { crate::esim_network::probe(&data) } else { Reachability::Unsupported }
+        } else { handover.reset(); Reachability::Down };
+        let allowed = recovery_enabled && policy.allows(inner.user_modem_revision.load(Ordering::Acquire), &data)
+            && SWITCH_VERIFY_LIMIT.saturating_sub(started.elapsed()) >= Duration::from_secs(45);
+        let decision = if modem_ok && data_ok && configured {
+            handover.observe(health, allowed, Instant::now())
+        } else { Decision::Wait };
+        if decision == Decision::Recover && try_data_recovery(&inner, generation, policy, &target) {
+            handover.recovery_started();
+            continue;
+        }
+
+        let ready_now = decision == Decision::Ready && modem_has_target()
+            && read_data_connection().is_some_and(|v| crate::esim_network::bearer_connected(&v))
+            && crate::sim_identity::observe_gate().ready_for_probe();
         let out_of_time = started.elapsed() >= SWITCH_VERIFY_LIMIT;
         let blocker = if out_of_time { data_blocker() } else { None };
         let now = unix_now();
@@ -1110,16 +1185,22 @@ fn verify_switch(inner: Arc<Inner>, target: String, generation: u64) {
             sw.modem_confirmed_at = now;
             sw.state = "modem_confirmed";
         }
-        if sw.modem_confirmed_at != 0 && data_ok {
+        sw.network_check = match health {
+            Reachability::Ready => if decision == Decision::Ready { "ready" } else { "settling" },
+            Reachability::Unsupported => "unverified",
+            Reachability::Down => "checking",
+        };
+        if ready_now {
             sw.connected_at = now;
             sw.finish("connected", now);
             eprintln!("[esim] switch to {} verified: card, modem, data", mask(&target));
             break true;
         }
         if out_of_time {
-            let outcome = if sw.modem_confirmed_at != 0 { "no_data" } else { "modem_unconfirmed" };
+            let outcome = if modem_ok { "no_data" } else { "modem_unconfirmed" };
             if outcome == "no_data" {
-                sw.reason = blocker;
+                sw.reason = blocker.or(Some("network_unavailable"));
+                sw.network_check = "failed";
             }
             sw.finish(outcome, now);
             eprintln!("[esim] switch to {} ended as {outcome}", mask(&target));
@@ -1210,15 +1291,57 @@ fn modem_iccid() -> Option<String> {
     info["sim_iccid"].as_str().filter(|s| !s.is_empty()).map(str::to_string)
 }
 
+fn read_data_connection() -> Option<Value> {
+    crate::ubus::call_bounded("zwrt_data", "get_wwaniface", Some(r#"{"source_module":"zte_topsw_data","cid":1}"#), 2).ok()
+}
+
 fn data_connected() -> bool {
-    crate::ubus::call(
-        "zwrt_data",
-        "get_wwaniface",
-        Some(r#"{"source_module":"zte_topsw_data","cid":1}"#),
-    )
-    .ok()
-    .and_then(|v| v["connect_status"].as_str().map(str::to_string))
-    .is_some_and(|s| s.contains("connected") && !s.contains("disconnected"))
+    // Download and receipt delivery need a usable IP bearer, not the firmware's
+    // sometimes-stale `enable` preference. Keep the stricter enabled check in
+    // profile handover, where it prevents automatic recovery from overriding
+    // a deliberate mobile-data-off choice.
+    read_data_connection().is_some_and(|data| crate::esim_network::bearer_reported_connected(&data))
+}
+
+fn recovery_current(inner: &Arc<Inner>, generation: u64, revision: u64, target: &str) -> bool {
+    current(inner, generation)
+        && inner.user_modem_revision.load(Ordering::Acquire) == revision
+        && recovery_identity_matches(target)
+        && crate::ubus::uci_get("zte_nwinfo.sys_info.operate_mode")
+            .is_ok_and(|mode| mode.trim().eq_ignore_ascii_case("ONLINE"))
+}
+
+fn recovery_identity_matches(target: &str) -> bool {
+    crate::ubus::call_bounded("zwrt_zte_mdm.api", "get_sim_info", Some("{}"), 1)
+        .ok().and_then(|v| v["sim_iccid"].as_str().map(str::to_owned))
+        .is_some_and(|id| same_iccid(&id, target))
+}
+
+fn recovery_restore_allowed(inner: &Arc<Inner>, generation: u64, target: &str) -> bool {
+    current(inner, generation) && recovery_identity_matches(target)
+        && crate::ubus::uci_get("zte_nwinfo.sys_info.operate_mode")
+            .is_ok_and(|mode| mode.trim().eq_ignore_ascii_case("ONLINE"))
+}
+
+fn try_data_recovery(inner: &Arc<Inner>, generation: u64, policy: crate::esim_network::Policy, target: &str) -> bool {
+    let Some(_card_guard) = acquire(inner) else { return false };
+    let Ok(_command_guard) = inner.modem_commands.try_lock() else { return false };
+    if !recovery_current(inner, generation, policy.revision, target) { return false; }
+    {
+        let mut sw = inner.switch.lock().unwrap();
+        if sw.generation != generation { return false; }
+        sw.network_check = "recovering";
+        sw.data_recovery_attempted = true;
+    }
+    let result = crate::esim_network::reconnect(
+        || recovery_current(inner, generation, policy.revision, target),
+        || recovery_restore_allowed(inner, generation, target),
+        read_data_connection,
+        |body| crate::ubus::call_bounded("zwrt_data", "set_wwaniface", Some(&body.to_string()), 3).is_ok(),
+        || std::thread::sleep(Duration::from_secs(1)),
+    );
+    eprintln!("[esim] handover data refresh: {result:?}");
+    true
 }
 
 /// Why data is down when the firmware says so: a profile from another country (SIM and network
@@ -1433,6 +1556,9 @@ pub fn download_confirm(state: &AppState, body: &[u8]) -> (u16, Value) {
     };
     let inner = &state.esim.inner;
     let mut d = inner.download.lock().unwrap();
+    if let Err(reply) = check_download_selection(inner.instance, &d, &parsed) {
+        return reply;
+    }
     if d.state != "confirm" {
         return error(409, "no download is waiting for confirmation");
     }
@@ -1456,9 +1582,16 @@ fn installing_step(step: &str) -> bool {
 /// POST /api/esim/download/cancel — stops a running download at its next step; an ES9+ request
 /// already running ends within its timeout. At the preview it postpones, so the QR code stays
 /// usable.
-pub fn download_cancel(state: &AppState) -> (u16, Value) {
+pub fn download_cancel_for(state: &AppState, body: &[u8]) -> (u16, Value) {
+    let parsed = match download_selection(body) {
+        Ok(value) => value,
+        Err(reply) => return reply,
+    };
     let inner = &state.esim.inner;
     let mut d = inner.download.lock().unwrap();
+    if let Err(reply) = check_download_selection(inner.instance, &d, &parsed) {
+        return reply;
+    }
     if d.state == "running" && installing_step(&d.step) {
         return error(409, "the profile is being installed and can't be cancelled now");
     }
@@ -1495,13 +1628,42 @@ pub fn download_status(state: &AppState) -> (u16, Value) {
 }
 
 /// DELETE /api/esim/download — dismisses a finished result (the app's "close" on the result card).
-pub fn download_dismiss(state: &AppState) -> (u16, Value) {
-    let mut d = state.esim.inner.download.lock().unwrap();
+pub fn download_dismiss_for(state: &AppState, body: &[u8]) -> (u16, Value) {
+    let parsed = match download_selection(body) {
+        Ok(value) => value,
+        Err(reply) => return reply,
+    };
+    let inner = &state.esim.inner;
+    let mut d = inner.download.lock().unwrap();
+    if let Err(reply) = check_download_selection(inner.instance, &d, &parsed) {
+        return reply;
+    }
     if !d.is_finished() && !d.state.is_empty() && d.state != "idle" {
         return error(409, "a download is still in progress");
     }
     *d = Download::default();
     (200, json!({"ok": true, "data": d.view()}))
+}
+
+fn download_selection(body: &[u8]) -> Result<Value, (u16, Value)> {
+    // Older clients send no body for cancel/dismiss.
+    if body.is_empty() {
+        return Ok(json!({}));
+    }
+    serde_json::from_slice(body).map_err(|_| error(400, "invalid JSON"))
+}
+
+fn check_download_selection(instance: u64, download: &Download, body: &Value) -> Result<(), (u16, Value)> {
+    let Some(expected) = body.get("expected") else {
+        return Ok(());
+    };
+    let (Some(agent), Some(started)) = (expected["agent_instance"].as_u64(), expected["started_at"].as_u64()) else {
+        return Err(error(400, "expected download must include agent_instance and started_at"));
+    };
+    if agent != instance || started != download.started_at {
+        return Err(error(409, "the download changed; review its current status before continuing"));
+    }
+    Ok(())
 }
 
 /// Lists the receipts waiting on the card (guard held) and merges them into the saved state.
@@ -1779,6 +1941,66 @@ fn check_activation_code(code: &str) -> Result<bool, &'static str> {
     Ok(parts.get(4) == Some(&"1"))
 }
 
+/// POST `/api/esim/qr` after the async listener has bounded and read the image.
+/// The decoder runs in its isolated child process; neither the image nor the
+/// activation code is stored or logged.
+pub fn decode_qr_image(state: &AppState, image: Vec<u8>) -> (u16, Value) {
+    crate::httpd::gate::debug_assert_may_block();
+    if !state.auth.has_password() {
+        return error(403, "agent password required");
+    }
+    let payloads = match qr_decode::codes(image, QR_DECODE_LIMIT) {
+        Ok(payloads) => payloads,
+        Err(qr_decode::Fail::NotImage) => {
+            return error(415, "choose a JPEG or PNG QR image")
+        }
+        Err(qr_decode::Fail::TooLarge) => {
+            return error(413, "the QR image is too large; choose a smaller image")
+        }
+        Err(qr_decode::Fail::Busy) => {
+            return error(503, "the router is already reading another QR image")
+        }
+        Err(qr_decode::Fail::TimedOut) => {
+            return error(504, "QR reading timed out; crop closer to the code and try again")
+        }
+        Err(qr_decode::Fail::Unreadable) => {
+            return error(422, "the QR image could not be read; choose a clearer image")
+        }
+    };
+    match activation_from_payloads(&payloads) {
+        Ok((activation_code, confirmation_code_required)) => (
+            200,
+            json!({
+                "ok": true,
+                "data": {
+                    "activation_code": activation_code,
+                    "confirmation_code_required": confirmation_code_required,
+                }
+            }),
+        ),
+        Err(message) => error(422, message),
+    }
+}
+
+fn activation_from_payloads(payloads: &[String]) -> Result<(String, bool), &'static str> {
+    let mut found = Vec::new();
+    for payload in payloads {
+        let code = payload.trim();
+        let Ok(needs_confirmation) = check_activation_code(code) else {
+            continue;
+        };
+        let normalized = format!("LPA:{}", &code[4..]);
+        if !found.iter().any(|(known, _)| known == &normalized) {
+            found.push((normalized, needs_confirmation));
+        }
+    }
+    match found.len() {
+        0 => Err("no eSIM activation code was found in this QR image"),
+        1 => Ok(found.pop().expect("one checked activation code")),
+        _ => Err("multiple eSIM activation codes were found; choose an image with one code"),
+    }
+}
+
 /// The card's form of an ICCID: digits only. The modem pads an odd-length ICCID with `F`, which
 /// is accepted and dropped (a 20-digit ICCID never has one).
 fn normalize_iccid(s: &str) -> Option<String> {
@@ -1988,6 +2210,29 @@ fn card(args: &[&str], limit: Duration) -> Result<Value, CardError> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn download_selection_rejects_another_job_or_agent_before_acting() {
+        let download = Download { started_at: 123, ..Download::default() };
+        assert!(check_download_selection(10, &download, &json!({"expected":{"agent_instance":10,"started_at":123}})).is_ok());
+        assert_eq!(check_download_selection(10, &download, &json!({"expected":{"agent_instance":10,"started_at":124}})).unwrap_err().0, 409);
+        assert_eq!(check_download_selection(10, &download, &json!({"expected":{"agent_instance":11,"started_at":123}})).unwrap_err().0, 409);
+        assert_eq!(check_download_selection(10, &download, &json!({"expected":{}})).unwrap_err().0, 400);
+        assert!(check_download_selection(10, &download, &download_selection(b"").unwrap()).is_ok());
+    }
+
+    #[test]
+    fn dashboard_status_reads_saved_state_while_card_is_busy() {
+        let state = AppState::new();
+        state.esim.inner.busy.store(true, Ordering::Release);
+        state.esim.inner.inventory.lock().unwrap().record(list(), 123);
+        let status = dashboard_status(&state);
+        assert_eq!(status["data"]["inventory_loaded"], true);
+        assert_eq!(status["data"]["inventory"]["profiles"].as_array().unwrap().len(), 3);
+        assert_eq!(status["data"]["inventory"]["updating"], true);
+        assert_eq!(status["data"]["password_required"], true);
+        assert!(state.esim.inner.receipts.lock().unwrap().pending.is_none());
+    }
+
     const LIST: &str = r#"{"type":"lpa","payload":{"code":0,"message":"success","data":[{"iccid":"8963000000000000001","isdpAid":"A0000005591010FFFFFFFF8900001000","profileState":"enabled","profileNickname":"Smart","serviceProviderName":"SMART","profileName":"Operational","iconType":"png","icon":"iVBORw0KGgo=","profileClass":"operational"},{"iccid":"8963000000000000002","isdpAid":"A0000005591010FFFFFFFF8900001100","profileState":"disabled","profileNickname":null,"serviceProviderName":"GOMO","profileName":"Globe Philippines ODC","iconType":"none","icon":null,"profileClass":"operational"},{"iccid":"8963000000000000003","isdpAid":"A0000005591010FFFFFFFF8900001200","profileState":"disabled","profileNickname":null,"serviceProviderName":"Test","profileName":"Test","iconType":"none","icon":null,"profileClass":"test"}]}}"#;
 
     /// The data of a result line in lpac's format, which `esim_native` reproduces.
@@ -2044,6 +2289,43 @@ mod tests {
         assert!(check_activation_code("LPA:1$sm dp$ABC").is_err());
         assert!(check_activation_code("LPA:1$;reboot$ABC").is_err());
         assert!(check_activation_code("").is_err());
+    }
+
+    #[test]
+    fn qr_payloads_select_one_esim_code_without_exposing_other_codes() {
+        let payloads = vec![
+            "https://example.com/not-an-esim".to_string(),
+            "lpa:1$smdp.example.com$FAKE-123".to_string(),
+            "lpa:1$smdp.example.com$FAKE-123".to_string(),
+        ];
+        assert_eq!(
+            activation_from_payloads(&payloads),
+            Ok(("LPA:1$smdp.example.com$FAKE-123".to_string(), false))
+        );
+    }
+
+    #[test]
+    fn qr_payloads_report_missing_multiple_and_confirmation_codes() {
+        assert_eq!(
+            activation_from_payloads(&["WIFI:T:WPA;S:Router;P:secret;;".to_string()]),
+            Err("no eSIM activation code was found in this QR image")
+        );
+        assert_eq!(
+            activation_from_payloads(&[
+                "LPA:1$one.example$FAKE-1".to_string(),
+                "LPA:1$two.example$FAKE-2".to_string(),
+            ]),
+            Err("multiple eSIM activation codes were found; choose an image with one code")
+        );
+        assert_eq!(
+            activation_from_payloads(&[
+                "LPA:1$smdp.example.com$FAKE-3$1.3.6.1$1".to_string(),
+            ]),
+            Ok((
+                "LPA:1$smdp.example.com$FAKE-3$1.3.6.1$1".to_string(),
+                true,
+            ))
+        );
     }
 
     #[test]
@@ -2434,6 +2716,7 @@ mod tests {
         let check = SwitchCheck {
             manual_apn: Some(("GOMO".into(), "gomo.ph".into())),
             roaming_off: true,
+            data_off: false,
             loaded_iccid: Some(ph.into()),
             sim_mcc: Some("515".into()),
             net_mcc: Some("515".into()),
@@ -2482,4 +2765,26 @@ mod tests {
         assert_eq!(view["manual_apn"], Value::Null);
         assert_eq!(view["profiles"][1]["switch_warnings"], json!([]));
     }
+    #[test]
+    fn a_manual_data_command_queued_during_recovery_wins_after_the_refresh() {
+        use std::sync::mpsc;
+        let esim = Arc::new(Esim::with_lock_path(PathBuf::from("/unused-esim-network-test")));
+        let value = Arc::new(AtomicU64::new(1));
+        let recovery = esim.inner.modem_commands.lock().unwrap();
+        value.store(0, Ordering::Release);
+        let (tx,rx) = mpsc::channel();
+        let user = Arc::clone(&esim); let user_value = Arc::clone(&value);
+        let worker = std::thread::spawn(move || {
+            tx.send(()).unwrap();
+            let _command = user.note_user_modem_change();
+            user_value.store(0, Ordering::Release);
+        });
+        rx.recv().unwrap();
+        value.store(1, Ordering::Release);
+        drop(recovery);
+        worker.join().unwrap();
+        assert_eq!(value.load(Ordering::Acquire), 0);
+        assert_eq!(esim.inner.user_modem_revision.load(Ordering::Acquire), 1);
+    }
+
 }

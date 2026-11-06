@@ -2,17 +2,26 @@ mod at_cmd;
 mod at_terminal;
 mod auth;
 mod bearer;
+mod battery_details;
 mod boottime;
+mod build_info;
 mod cache;
 mod cell;
 mod charge_policy;
 mod conn_watchdog;
+mod client_details;
+mod console;
+mod dashboard;
+mod dashboard_extra;
+mod data_usage;
 mod device_ext;
 mod dhcp_reservations;
+mod dns_control;
 pub mod doh;
 mod esim;
 mod esim_download;
 mod esim_native;
+mod esim_network;
 mod event_bus;
 mod events;
 mod handlers;
@@ -25,6 +34,7 @@ mod mihomo;
 mod net_tools;
 mod network_ext;
 mod oos_policy;
+mod ota;
 mod qrtr_uim;
 mod router;
 mod scheduler;
@@ -40,13 +50,21 @@ mod system;
 mod tailscale;
 mod telephony;
 mod tls;
+mod ttl;
 mod ubus;
 mod usb;
+// Retired renderer fixtures; production serves only the responsive console.
+#[cfg(test)]
 mod web;
+mod calendar;
+#[cfg(not(test))]
+#[path = "web/qr_decode.rs"]
+mod qr_decode;
 mod wifi;
 mod wifi_relay;
 mod network_clock;
 mod wifi_watchdog;
+mod wireguard;
 
 use std::sync::Arc;
 
@@ -61,6 +79,16 @@ const DEFAULT_THREADS: usize = 4;
 fn main() {
     // Diagnostics: `zte-agent esim-native chip info` runs one native eSIM command and exits.
     let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("--version") {
+        println!("zte-agent {}", build_info::display());
+        return;
+    }
+    if args.get(1).map(String::as_str) == Some("ota-probe") {
+        std::process::exit(ota::probe_cli(args.get(2).map(String::as_str)));
+    }
+    if args.get(1).map(String::as_str) == Some("ota-helper") {
+        std::process::exit(ota::helper_cli(&args[2..]));
+    }
     if args.get(1).map(String::as_str) == Some("mihomo-script-child") {
         std::process::exit(mihomo::transform::child());
     }
@@ -82,7 +110,15 @@ fn main() {
     }
     // `zte-agent qr-decode photo.jpg` times one QR decode of the web UI's eSIM upload.
     if args.get(1).map(String::as_str) == Some("qr-decode") {
+        #[cfg(test)]
         std::process::exit(web::qr_decode::cli(&args[2..]));
+        #[cfg(not(test))]
+        std::process::exit(qr_decode::cli(&args[2..]));
+    }
+    // `zte-agent wireguard-smoke` verifies native netlink support without
+    // starting the HTTP service or installing routes.
+    if args.get(1).map(String::as_str) == Some("wireguard-smoke") {
+        std::process::exit(wireguard::cli_smoke());
     }
 
     let bind = std::env::var("ZTE_AGENT_BIND").unwrap_or_else(|_| DEFAULT_BIND.to_string());
@@ -138,6 +174,9 @@ fn main() {
         .collect();
     let oos_service_rx = event_bus.subscribe("zwrt_servicestatus");
     let connwd_wan_rx = event_bus.subscribe("router_event_wan_connect_status");
+    let ttl_wan_rx = event_bus.subscribe("router_event_wan_connect_status");
+    let wireguard_wan_rx = event_bus.subscribe("router_event_wan_connect_status");
+    let dns_network_rx = dns_control::subscribe_network_changes(&event_bus);
     let identity_events = sim_identity::FIRMWARE_EVENTS
         .iter()
         .map(|&name| (name, event_bus.subscribe(name)))
@@ -145,13 +184,18 @@ fn main() {
     // Power-state events for the standby Wi-Fi guard (unless opted out).
     let standby_rx = standby_guard::subscribe(&event_bus);
     events::start(&state, &event_bus);
+    state.dashboard.start(Arc::clone(&state),Arc::clone(&event_bus));
     event_bus.start();
 
     Arc::clone(&state.cache).start_event_invalidation(cache_events);
     state.sim_identity.start(Arc::clone(&event_bus), Arc::clone(&state.cache), identity_events);
 
     state.live_activity.start(Arc::clone(&state), apns_events);
+    if let Err(error) = dns_control::prepare_startup(&state) {
+        eprintln!("[dns] startup synchronization failed: {error}");
+    }
     state.doh.auto_start();
+    dns_control::start_network_watch(Arc::clone(&state), dns_network_rx);
     state.scheduler.start(Arc::clone(&state));
     state
         .charge_limit
@@ -163,6 +207,9 @@ fn main() {
     state.wifi_relay.start();
     restore_network(&state);
     state.tailscale.start_wan_watch(ts_wan_rx);
+    state.ttl.start(ttl_wan_rx);
+    state.wireguard.start(wireguard_wan_rx);
+    state.ota.start();
     state.oos_policy.start(
         Box::new(oos_policy::DeviceEffects::new(Arc::clone(&state))),
         busy_check(&state),

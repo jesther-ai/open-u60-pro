@@ -1,12 +1,13 @@
 mod cache;
 pub mod config;
-mod dns_packet;
+pub(crate) mod dns_packet;
 mod upstream;
 
-pub use config::DohConfig;
+pub use config::{DohConfig, EncryptedTransport};
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{sync_channel, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -18,6 +19,19 @@ use serde_json::{json, Value};
 const STOP_WAKE_ATTEMPTS: u32 = 50;
 /// Pause between two nudges in `stop()`.
 const STOP_WAKE_INTERVAL: Duration = Duration::from_millis(20);
+/// Blocking encrypted lookups run outside the UDP receive loop. Eight workers
+/// keep a multi-device router responsive without allowing a query burst to
+/// create an unbounded number of threads.
+const QUERY_WORKERS: usize = 8;
+const QUERY_QUEUE_CAPACITY: usize = 256;
+
+struct QueryJob {
+    query: Vec<u8>,
+    qname: String,
+    qtype: u16,
+    client_id: u16,
+    source: SocketAddr,
+}
 
 pub struct DohProxy {
     config: Mutex<DohConfig>,
@@ -30,9 +44,21 @@ pub struct DohProxy {
     bound_addr: Mutex<Option<SocketAddr>>,
     /// Upstream HTTP agent shared across queries; see `upstream::SharedAgent`.
     agent: Mutex<upstream::SharedAgent>,
+    /// One reusable certificate-verified DNS-over-TLS connection.
+    dot: Mutex<Option<upstream::DotClient>>,
+    /// Incremented whenever the WAN or SIM identity changes. An upstream
+    /// answer started on an older bearer is discarded instead of entering the
+    /// new bearer's cache after a slow request completes.
+    network_generation: AtomicU64,
     queries_total: Mutex<u64>,
     cache_hits: Mutex<u64>,
     cache_misses: Mutex<u64>,
+}
+
+impl Default for DohProxy {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DohProxy {
@@ -50,6 +76,8 @@ impl DohProxy {
             handle: Mutex::new(None),
             bound_addr: Mutex::new(None),
             agent: Mutex::new(upstream::SharedAgent::new(timeout_ms)),
+            dot: Mutex::new(upstream::DotClient::new(timeout_ms).ok()),
+            network_generation: AtomicU64::new(0),
             queries_total: Mutex::new(0),
             cache_hits: Mutex::new(0),
             cache_misses: Mutex::new(0),
@@ -139,12 +167,28 @@ impl DohProxy {
         cfg.apply_patch(patch);
         self.cache.lock().unwrap().prune();
         self.agent.lock().unwrap().set_timeout(cfg.timeout_ms);
+        if let Some(dot) = self.dot.lock().unwrap().as_mut() {
+            dot.set_timeout(cfg.timeout_ms);
+            dot.reset();
+        }
         config::save(&cfg)?;
         Ok(())
     }
 
     pub fn clear_cache(&self) {
         self.cache.lock().unwrap().clear();
+    }
+
+    /// Forget everything tied to the previous mobile bearer. The UDP listener
+    /// remains available to LAN clients, but cached answers and pooled DoH/DoT
+    /// sessions cannot cross a WAN or SIM identity boundary.
+    pub fn network_changed(&self) {
+        self.network_generation.fetch_add(1, Ordering::AcqRel);
+        self.clear_cache();
+        self.agent.lock().unwrap().reset();
+        if let Some(client) = self.dot.lock().unwrap().as_mut() {
+            client.reset();
+        }
     }
 
     pub fn cache_entries(&self) -> Value {
@@ -162,10 +206,55 @@ impl DohProxy {
         self.config.lock().unwrap().clone()
     }
 
-    pub fn set_enabled(&self, enabled: bool) {
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::Relaxed)
+    }
+
+    pub fn set_enabled(&self, enabled: bool) -> Result<(), String> {
         let mut cfg = self.config.lock().unwrap();
         cfg.enabled = enabled;
-        let _ = config::save(&cfg);
+        config::save(&cfg)
+    }
+
+    /// Persist the plain bootstrap resolvers that the encrypted endpoint name
+    /// depends on. This does not restart the proxy because it does not change
+    /// the encrypted transport itself.
+    pub fn remember_bootstrap(&self, primary: &str, secondary: &str) -> Result<(), String> {
+        let mut cfg = self.config.lock().unwrap();
+        if cfg.bootstrap_primary == primary && cfg.bootstrap_secondary == secondary {
+            return Ok(());
+        }
+        cfg.bootstrap_primary = primary.to_string();
+        cfg.bootstrap_secondary = secondary.to_string();
+        config::save(&cfg)
+    }
+
+    /// Replace the encrypted resolver configuration and leave the proxy in the
+    /// requested state. Callers own any dnsmasq changes around this operation.
+    pub fn install_config(
+        self: &Arc<Self>,
+        mut next: DohConfig,
+        enabled: bool,
+    ) -> Result<(), String> {
+        self.stop();
+        next.enabled = enabled;
+        let timeout_ms = next.timeout_ms;
+        *self.config.lock().unwrap() = next.clone();
+        self.cache.lock().unwrap().clear();
+        self.agent.lock().unwrap().set_timeout(timeout_ms);
+        {
+            let mut dot = self.dot.lock().unwrap();
+            if let Some(client) = dot.as_mut() {
+                client.set_timeout(timeout_ms);
+                client.reset();
+            } else {
+                *dot = Some(upstream::DotClient::new(timeout_ms)?);
+            }
+        }
+        if enabled {
+            self.start()?;
+        }
+        config::save(&next)
     }
 
     /// Called on startup — reads config and starts if enabled.
@@ -241,6 +330,30 @@ fn qtype_name(qtype: u16) -> &'static str {
 }
 
 fn listener_loop(socket: UdpSocket, proxy: Arc<DohProxy>) {
+    let socket = Arc::new(socket);
+    let (sender, receiver) = sync_channel::<QueryJob>(QUERY_QUEUE_CAPACITY);
+    let receiver = Arc::new(Mutex::new(receiver));
+    let mut workers = Vec::with_capacity(QUERY_WORKERS);
+    for index in 0..QUERY_WORKERS {
+        let worker_receiver = Arc::clone(&receiver);
+        let worker_socket = Arc::clone(&socket);
+        let worker_proxy = Arc::clone(&proxy);
+        match crate::system::try_spawn_named(&format!("doh-query-{index}"), move || loop {
+            let job = worker_receiver
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .recv();
+            match job {
+                Ok(job) => process_query(&worker_socket, &worker_proxy, job),
+                Err(_) => break,
+            }
+        }) {
+            Ok(worker) => workers.push(worker),
+            Err(error) => eprintln!("[doh] could not start query worker {index}: {error}"),
+        }
+    }
+    drop(receiver);
+
     let mut buf = [0u8; 512];
     loop {
         if !proxy.running.load(Ordering::Relaxed) {
@@ -271,33 +384,110 @@ fn listener_loop(socket: UdpSocket, proxy: Arc<DohProxy>) {
                 continue;
             }
         }
-        *proxy.cache_misses.lock().unwrap() += 1;
         *proxy.queries_total.lock().unwrap() += 1;
-
-        // Query upstream (agent cloned out of the lock so the lock is not held
-        // for the duration of the request)
-        let config = proxy.config.lock().unwrap().clone();
-        let agent = proxy.agent.lock().unwrap().checkout();
-        match upstream::query_doh(&agent, query, &config.upstream_url) {
-            Ok(response) => {
-                if config.cache_enabled {
-                    let ttl = dns_packet::extract_min_ttl(&response);
-                    let mut cache = proxy.cache.lock().unwrap();
-                    cache.insert(qname, qtype, &response, ttl);
-                }
-                let _ = socket.send_to(&response, src);
-            }
-            Err(_) => {
-                // Return SERVFAIL
-                let mut fail = query.to_vec();
-                if fail.len() >= 4 {
-                    fail[2] = 0x81; // QR=1, RD=1
-                    fail[3] = 0x82; // RA=1, RCODE=2 (SERVFAIL)
-                }
-                let _ = socket.send_to(&fail, src);
+        let job = QueryJob {
+            query: query.to_vec(),
+            qname,
+            qtype,
+            client_id,
+            source: src,
+        };
+        match sender.try_send(job) {
+            Ok(()) => {}
+            Err(TrySendError::Full(job) | TrySendError::Disconnected(job)) => {
+                *proxy.cache_misses.lock().unwrap() += 1;
+                send_servfail(&socket, &job.query, job.source);
             }
         }
     }
+    drop(sender);
+    for worker in workers {
+        drop(worker.join());
+    }
+}
+
+fn process_query(socket: &UdpSocket, proxy: &DohProxy, job: QueryJob) {
+    // A different worker may have populated this key while the job waited in
+    // the bounded queue. Reuse that answer instead of issuing a duplicate
+    // encrypted request.
+    if let Some(cached) = proxy
+        .cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&job.qname, job.qtype, job.client_id)
+    {
+        *proxy.cache_hits.lock().unwrap() += 1;
+        let _ = socket.send_to(&cached, job.source);
+        return;
+    }
+
+    // Clone the HTTP client out of its lock so HTTPS I/O never blocks the UDP
+    // receiver or another DoH worker.
+    *proxy.cache_misses.lock().unwrap() += 1;
+    let network_generation = proxy.network_generation.load(Ordering::Acquire);
+    let config = proxy.config.lock().unwrap().clone();
+    let upstream = match config.transport {
+        EncryptedTransport::Doh => proxy
+            .agent
+            .lock()
+            .unwrap()
+            .checkout()
+            .and_then(|agent| upstream::query_doh(&agent, &job.query, &config.upstream_url)),
+        EncryptedTransport::Dot => {
+            let mut client = proxy.dot.lock().unwrap();
+            match client.as_mut() {
+                Some(client) => {
+                    client.query(&job.query, &config.dot_endpoint, &config.dot_server_name)
+                }
+                None => Err("DoT TLS client is unavailable".to_string()),
+            }
+        }
+    };
+    match upstream {
+        Ok(response) if proxy.network_generation.load(Ordering::Acquire) == network_generation => {
+            if config.cache_enabled {
+                let ttl = dns_packet::extract_min_ttl(&response);
+                proxy
+                    .cache
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(job.qname, job.qtype, &response, ttl);
+            }
+            let _ = socket.send_to(&response, job.source);
+        }
+        Ok(_) | Err(_) => send_servfail(socket, &job.query, job.source),
+    }
+}
+
+fn send_servfail(socket: &UdpSocket, query: &[u8], source: SocketAddr) {
+    let mut fail = query.to_vec();
+    if fail.len() >= 4 {
+        fail[2] = 0x81; // QR=1, RD=1
+        fail[3] = 0x82; // RA=1, RCODE=2 (SERVFAIL)
+    }
+    let _ = socket.send_to(&fail, source);
+}
+
+/// Send a real A query to an encrypted candidate without changing proxy or
+/// dnsmasq state. A successful TLS/HTTPS exchange with an answer is required.
+pub fn probe_upstream(config: &DohConfig) -> Result<u128, String> {
+    const ID: u16 = 0x6050;
+    let query = dns_packet::build_query(ID, "example.com", 1)?;
+    let started = std::time::Instant::now();
+    let response = match config.transport {
+        EncryptedTransport::Doh => {
+            let agent = upstream::build_agent(config.timeout_ms)?;
+            upstream::query_doh(&agent, &query, &config.upstream_url)?
+        }
+        EncryptedTransport::Dot => {
+            let mut client = upstream::DotClient::new(config.timeout_ms)?;
+            client.query(&query, &config.dot_endpoint, &config.dot_server_name)?
+        }
+    };
+    if !dns_packet::successful_response(&response, ID) {
+        return Err("encrypted resolver returned no usable answer".to_string());
+    }
+    Ok(started.elapsed().as_millis())
 }
 
 #[cfg(test)]
@@ -449,11 +639,26 @@ mod listener_tests {
         // config and the agent must already be updated by then.
         let _ = proxy.update_config(br#"{"timeout_ms": 1234}"#);
         assert_eq!(proxy.config().timeout_ms, 1234);
-        let agent = proxy.agent.lock().unwrap().checkout();
-        assert_eq!(
-            agent.config().timeouts().global,
-            Some(Duration::from_millis(1234))
-        );
+        let mut agent = proxy.agent.lock().unwrap();
+        assert_eq!(agent.configured_timeout_ms(), 1234);
+        assert!(agent.checkout().is_ok());
         proxy.stop();
+    }
+
+    #[test]
+    fn network_change_removes_cached_answers() {
+        let proxy = proxy_on("127.0.0.1:0");
+        let query = build_query(0x1234, "old-carrier.example", 1);
+        let answer = build_answer(&query);
+        proxy
+            .cache
+            .lock()
+            .unwrap()
+            .insert("old-carrier.example".to_string(), 1, &answer, 300);
+        assert_eq!(proxy.cache.lock().unwrap().len(), 1);
+        let before = proxy.network_generation.load(Ordering::Acquire);
+        proxy.network_changed();
+        assert_eq!(proxy.cache.lock().unwrap().len(), 0);
+        assert_eq!(proxy.network_generation.load(Ordering::Acquire), before + 1);
     }
 }

@@ -32,7 +32,7 @@ use p256::ecdsa::signature::Signer;
 use ring::rand::{SecureRandom, SystemRandom};
 use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
 
-use crate::web::sms::{civil, days_from_civil};
+use crate::calendar::{civil, days_from_civil};
 
 // Object identifiers (content octets only).
 const OID_EC_PUBLIC_KEY: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01];

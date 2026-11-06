@@ -98,20 +98,28 @@ pub struct Ctx {
     /// `BODY_WAIT` (tests shorten it).
     pub body_wait: Duration,
     /// Web UI operations in progress (`/ui/op/{id}`).
+    #[cfg(test)]
     pub ops: Arc<crate::web::ops::OpTable>,
     /// Web UI action results (`?r={id}`).
+    #[cfg(test)]
     pub flash: Arc<crate::web::store::Flash>,
     /// Web UI dismissals (the dashboard's USB-C card).
+    #[cfg(test)]
     pub dismissed: Arc<crate::web::store::Dismissed>,
     /// Web UI single-use form tokens (SMS send, forwarding rule forms).
+    #[cfg(test)]
     pub once: Arc<crate::web::store::Once>,
     /// Secrets typed into a forwarding rule form shown again, by its token.
+    #[cfg(test)]
     pub drafts: Arc<crate::web::store::Drafts>,
     /// AT Terminal history per session.
+    #[cfg(test)]
     pub at: Arc<crate::web::store::AtLog>,
     /// USSD answers per session (SIM Services).
+    #[cfg(test)]
     pub ussd: Arc<crate::web::store::UssdLog>,
     /// eSIM profile names last read (a switch's live card names its target).
+    #[cfg(test)]
     pub esim_names: Arc<crate::web::pages::esim::Names>,
 }
 
@@ -125,13 +133,21 @@ impl Ctx {
             hosts: Arc::new(HostPolicy::from_env_with(app.tls.name())),
             ts: Arc::new(TsNames::new(Arc::clone(&app.tailscale))),
             body_wait: BODY_WAIT,
+            #[cfg(test)]
             ops: Arc::default(),
+            #[cfg(test)]
             flash: Arc::default(),
+            #[cfg(test)]
             dismissed: Arc::default(),
+            #[cfg(test)]
             once: Arc::default(),
+            #[cfg(test)]
             drafts: Arc::default(),
+            #[cfg(test)]
             at: Arc::default(),
+            #[cfg(test)]
             ussd: Arc::default(),
+            #[cfg(test)]
             esim_names: Arc::default(),
             app,
         }
@@ -443,7 +459,7 @@ impl Drop for PeerSlot {
 /// API fallback (no per-route registration, so there is no automatic 405
 /// and no HEAD-to-GET routing for `/api`).
 pub fn app(ctx: Ctx) -> Router {
-    let router = Router::new().merge(crate::web::router(&ctx)).fallback(api::api_entry).with_state(ctx);
+    let router = Router::new().merge(crate::console::router()).fallback(api::api_entry).with_state(ctx);
     #[cfg(test)]
     let router = router.route("/test-upgrade", axum::routing::get(test_upgrade));
     router
@@ -812,7 +828,7 @@ mod wire_tests {
         assert_eq!(r.header("server"), None);
         // `/` redirects to the web UI; the connection stays usable.
         let r = c.request("HEAD / HTTP/1.1\r\nHost: 127.0.0.1", b"");
-        assert_eq!((r.status, r.header("location"), r.header("content-length")), (303, Some("/ui/"), Some("0")));
+        assert_eq!((r.status, r.header("location"), r.header("content-length")), (303, Some("/console/"), Some("0")));
         // Content-Length framing: the next reply starts right after.
         c.ping(None).assert_json(200, json!({"ok": true}));
         let r = c.request("GET /nope HTTP/1.1\r\nHost: 127.0.0.1", b"");
@@ -830,7 +846,7 @@ mod wire_tests {
         // The apps' reachability probe (`HEAD <base>`, any reply counts) now
         // gets the web UI's redirect.
         let r = c.request("HEAD / HTTP/1.1\r\nHost: 127.0.0.1", b"");
-        assert_eq!((r.status, r.header("location")), (303, Some("/ui/")));
+        assert_eq!((r.status, r.header("location")), (303, Some("/console/")));
         assert!(!r.closes());
         c.ping(Some(&token(&ctx))).assert_json(200, json!({"ok": true}));
     }

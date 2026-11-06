@@ -1,0 +1,1071 @@
+//! Shared dashboard sampling and an authenticated, bounded SSE fan-out.
+//!
+//! Browsers receive a complete snapshot on every connection, followed by changed readings.
+//! Slow readers retain only their previous snapshot; no unbounded per-browser queue is used.
+
+use std::collections::BTreeMap;
+#[cfg(test)]
+use std::io::{self, Write};
+
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
+
+use serde_json::{json, Value};
+
+use crate::handlers::{self, AppState};
+use crate::{device_ext, modem_ext, network_ext, sms, wifi};
+
+const MAX_STREAMS: usize = 8;
+const HEARTBEAT: Duration = Duration::from_secs(10);
+/// Firmware notifications accelerate sampling; periodic reads cover values with no event.
+pub const EVENTS: &[&str] = &[
+    "router_event_wan_connect_status",
+    "network.interface",
+    "BSP_CHARGER_EVENT",
+    "BSP_POWERBANK_EVENT",
+    "zwrt_card_state_event",
+    "zwrt_servicestatus",
+    "zwrt_wms_status_event",
+    crate::sim_identity::EVENT,
+];
+const READINGS: &[(&str, u64)] = &[
+    ("device", 15),
+    ("wan", 10),
+    ("wan6", 10),
+    ("signal", 2),
+    ("modem", 5),
+    ("mobile", 5),
+    ("charging", 10),
+    ("thermal", 10),
+    // `get_wwandst` publishes a fresh one-second rate; sampling at the same
+    // cadence avoids skipped peaks and keeps the animated values responsive.
+    ("speed", 1),
+    ("battery", 10),
+    ("wifi", 10),
+    ("guest", 10),
+    ("clients", 5),
+    ("sms", 30),
+    ("sms_capacity", 30),
+];
+type Readings = BTreeMap<String, Value>;
+
+const TOPICS: &[&str] = &[
+    "operators",
+    "forwarding",
+    "health",
+    "radio",
+    "speedtest",
+    "terminal",
+    "routing",
+    "clients",
+    "esim",
+    "power",
+    "https",
+    "dns",
+    "ota",
+];
+const ESIM_TOPIC: usize = 8;
+const DNS_TOPIC: usize = TOPICS.len() - 2;
+const OTA_TOPIC: usize = TOPICS.len() - 1;
+const EXTRA_READINGS: &[(&str, u64, usize)] = &[
+    ("operators", 2, 0),
+    ("forwarding", 2, 1),
+    ("resources", 5, 2),
+    ("neighbors", 5, 3),
+    ("sweep", 2, 3),
+    ("speedtest", 1, 4),
+    ("at_port", 5, 5),
+    ("lan_config", 10, 6),
+    ("firewall_config", 10, 6),
+    ("upnp_config", 10, 6),
+    ("port_rules", 10, 6),
+    ("qos_config", 10, 6),
+    ("client_details", 2, 7),
+    ("esim_status", 0, ESIM_TOPIC),
+    ("battery_details", 5, 9),
+    ("https_status", 5, 10),
+    ("ota_status", 5, OTA_TOPIC),
+];
+
+#[derive(Clone, Copy, Default)]
+struct Interests {
+    sms: bool,
+    extras: u16,
+}
+
+impl From<bool> for Interests {
+    fn from(sms: bool) -> Self {
+        Self { sms, extras: 0 }
+    }
+}
+
+impl Interests {
+    fn from_url(url: &str) -> Self {
+        let mut interests = Self::default();
+        for part in url
+            .split_once('?')
+            .map_or("", |(_, query)| query)
+            .split('&')
+        {
+            if part == "sms=1" {
+                interests.sms = true;
+            }
+            if let Some(topics) = part.strip_prefix("topics=") {
+                for topic in topics.split(',') {
+                    if let Some(index) = TOPICS.iter().position(|name| *name == topic) {
+                        interests.extras |= 1 << index;
+                    }
+                }
+            }
+        }
+        interests
+    }
+    fn includes(self, name: &str) -> bool {
+        (!is_sms(name) || self.sms)
+            && extra_topic(name).is_none_or(|index| self.extras & (1 << index) != 0)
+    }
+}
+
+fn extra_topic(name: &str) -> Option<usize> {
+    if name == "dns_cache" {
+        return Some(DNS_TOPIC);
+    }
+    EXTRA_READINGS
+        .iter()
+        .find(|(key, _, _)| *key == name)
+        .map(|(_, _, topic)| *topic)
+}
+
+#[derive(Default)]
+struct FeedState {
+    clients: usize,
+    sms_clients: usize,
+    extra_clients: [usize; TOPICS.len()],
+    refresh_version: u64,
+    generation: u64,
+    refresh_requested: bool,
+    readings: Readings,
+}
+
+#[derive(Default)]
+pub struct Dashboard {
+    state: Mutex<FeedState>,
+    changed: Condvar,
+    live: tokio::sync::Notify,
+}
+
+struct Subscription {
+    interests: Interests,
+    feed: Arc<Dashboard>,
+}
+
+impl Drop for Subscription {
+    fn drop(&mut self) {
+        let mut state = self.feed.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.clients -= 1;
+        if self.interests.sms {
+            state.sms_clients -= 1;
+            if state.sms_clients == 0 {
+                state.readings.retain(|key, _| !is_sms(key));
+            }
+        }
+        for index in 0..TOPICS.len() {
+            if self.interests.extras & (1 << index) != 0 {
+                state.extra_clients[index] -= 1;
+                if state.extra_clients[index] == 0 {
+                    state
+                        .readings
+                        .retain(|key, _| extra_topic(key) != Some(index));
+                }
+            }
+        }
+        if state.clients == 0 {
+            // The next viewer must not receive values sampled before an idle period.
+            state.readings.clear();
+        }
+        self.feed.changed.notify_all();
+    }
+}
+
+impl Dashboard {
+    /// Local writes accelerate the shared feed without adding browser polling.
+    pub fn request_refresh(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.refresh_requested = true;
+        state.refresh_version = state.refresh_version.wrapping_add(1);
+        self.changed.notify_all();
+        self.live.notify_waiters();
+    }
+
+    fn subscribe(self: &Arc<Self>, interests: impl Into<Interests>) -> Option<Subscription> {
+        let interests = interests.into();
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if state.clients >= MAX_STREAMS {
+            return None;
+        }
+        state.clients += 1;
+        if interests.sms {
+            state.sms_clients += 1;
+        }
+        for index in 0..TOPICS.len() {
+            if interests.extras & (1 << index) != 0 {
+                state.extra_clients[index] += 1;
+            }
+        }
+        self.changed.notify_all();
+        self.live.notify_waiters();
+        Some(Subscription {
+            interests,
+            feed: Arc::clone(self),
+        })
+    }
+
+    fn publish(&self, readings: Readings) {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if state.clients == 0 {
+            return;
+        }
+        let mut updated = false;
+        for (key, value) in readings {
+            if (is_sms(&key) && state.sms_clients == 0)
+                || extra_topic(&key).is_some_and(|index| state.extra_clients[index] == 0)
+            {
+                continue;
+            }
+            if state.readings.get(&key) != Some(&value) {
+                state.readings.insert(key, value);
+                updated = true;
+            }
+        }
+        if updated {
+            state.generation = state.generation.wrapping_add(1);
+            self.changed.notify_all();
+            self.live.notify_waiters();
+        }
+    }
+
+    #[cfg(test)]
+    fn next(&self, generation: u64, interests: impl Into<Interests>) -> (u64, Readings) {
+        let interests = interests.into();
+        let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let (state, _) = self
+            .changed
+            .wait_timeout_while(state, HEARTBEAT, |state| {
+                state.generation == generation || state.readings.is_empty()
+            })
+            .unwrap_or_else(|p| p.into_inner());
+        let readings = state
+            .readings
+            .iter()
+            .filter(|(key, _)| interests.includes(key))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        (state.generation, readings)
+    }
+
+    fn start_extra_collectors(self: &Arc<Self>, app: Arc<AppState>) {
+        for (index, topic_name) in TOPICS.iter().enumerate() {
+            if index == ESIM_TOPIC || index == DNS_TOPIC {
+                continue;
+            }
+            let feed = Arc::clone(self);
+            let app = Arc::clone(&app);
+            crate::system::spawn_named(&format!("dashboard-{topic_name}"), move || {
+                let mut sampled = BTreeMap::<&str, Instant>::new();
+                let mut version = 0;
+                loop {
+                    let (active, refresh, missing) = {
+                        let guard = feed.state.lock().unwrap_or_else(|p| p.into_inner());
+                        (
+                            guard.extra_clients[index] > 0,
+                            guard.refresh_version,
+                            EXTRA_READINGS.iter().any(|(name, _, topic)| {
+                                *topic == index && !guard.readings.contains_key(*name)
+                            }),
+                        )
+                    };
+                    if refresh != version || missing {
+                        sampled.clear();
+                        version = refresh;
+                    }
+                    if active {
+                        let mut updates = Readings::new();
+                        for &(name, seconds, topic) in EXTRA_READINGS {
+                            if topic != index
+                                || sampled
+                                    .get(name)
+                                    .is_some_and(|at| at.elapsed() < Duration::from_secs(seconds))
+                            {
+                                continue;
+                            }
+                            updates.insert(name.into(), crate::dashboard_extra::read(&app, name));
+                            sampled.insert(name, Instant::now());
+                        }
+                        feed.publish(updates);
+                    } else {
+                        sampled.clear();
+                    }
+                    let guard = feed.state.lock().unwrap_or_else(|p| p.into_inner());
+                    if guard.extra_clients[index] == 0 {
+                        drop(
+                            feed.changed
+                                .wait_while(guard, |state| state.extra_clients[index] == 0),
+                        );
+                    } else {
+                        drop(feed.changed.wait_timeout(guard, Duration::from_secs(1)));
+                    }
+                }
+            });
+        }
+    }
+
+    /// eSIM progress is a composite of watched switch/download state and the
+    /// saved inventory. Publish it only after an eSIM touch, an API mutation,
+    /// or a fresh subscription; never poll the card or its API from the UI.
+    fn start_esim_collector(self: &Arc<Self>, app: Arc<AppState>) {
+        let changes = crate::events::subscribe_touches(&[
+            crate::events::Topic::EsimSwitch,
+            crate::events::Topic::EsimDownload,
+        ]);
+        let feed = Arc::clone(self);
+        crate::system::spawn_named("dashboard-esim", move || {
+            let mut pending = true;
+            let mut version = 0;
+            loop {
+                let (active, refresh, missing) = {
+                    let guard = feed.state.lock().unwrap_or_else(|p| p.into_inner());
+                    (
+                        guard.extra_clients[ESIM_TOPIC] > 0,
+                        guard.refresh_version,
+                        !guard.readings.contains_key("esim_status"),
+                    )
+                };
+                if active && (pending || missing || refresh != version) {
+                    let mut updates = Readings::new();
+                    updates.insert("esim_status".into(), esim_reading(&app));
+                    feed.publish(updates);
+                    pending = false;
+                }
+                version = refresh;
+                match changes.recv_timeout(Duration::from_secs(1)) {
+                    Ok(()) => pending = true,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                }
+            }
+        });
+    }
+
+    /// The cache is already in memory, so this collector never makes an HTTP
+    /// request. It runs only while a `topics=dns` dashboard viewer exists and
+    /// publishes a fresh reading when cache keys or query statistics change.
+    /// TTL-only changes stay local to the browser countdown; the one-second
+    /// inspection also detects entries that have reached expiry.
+    fn start_dns_collector(self: &Arc<Self>, app: Arc<AppState>) {
+        let feed = Arc::clone(self);
+        crate::system::spawn_named("dashboard-dns", move || {
+            let mut previous = None;
+            loop {
+                let active = feed
+                    .state
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .extra_clients[DNS_TOPIC]
+                    > 0;
+                if active {
+                    let reading = crate::dns_control::cache(&app).1;
+                    let signature = dns_signature(&reading);
+                    if previous.as_ref() != Some(&signature) {
+                        let mut updates = Readings::new();
+                        updates.insert("dns_cache".into(), reading);
+                        feed.publish(updates);
+                        previous = Some(signature);
+                    }
+                } else {
+                    previous = None;
+                }
+                let guard = feed.state.lock().unwrap_or_else(|p| p.into_inner());
+                if guard.extra_clients[DNS_TOPIC] == 0 {
+                    drop(
+                        feed.changed
+                            .wait_while(guard, |state| state.extra_clients[DNS_TOPIC] == 0),
+                    );
+                } else {
+                    drop(feed.changed.wait_timeout(guard, Duration::from_secs(1)));
+                }
+            }
+        });
+    }
+
+    pub fn start(self: &Arc<Self>, state: Arc<AppState>, events: Arc<crate::event_bus::EventBus>) {
+        let weak = Arc::downgrade(self);
+        let cache = Arc::clone(&state.cache);
+        events.subscribe_fn(
+            EVENTS,
+            Arc::new(move |name, payload| {
+                cache.on_event(name, payload);
+                if let Some(feed) = weak.upgrade() {
+                    feed.request_refresh();
+                }
+            }),
+        );
+        self.start_esim_collector(Arc::clone(&state));
+        self.start_extra_collectors(Arc::clone(&state));
+        self.start_dns_collector(Arc::clone(&state));
+        let feed = Arc::clone(self);
+        crate::system::spawn_named("dashboard-feed", move || {
+            let mut sampled = BTreeMap::<&str, Instant>::new();
+            loop {
+                let (active, sms_active, sms_missing, refresh_requested) = {
+                    let mut guard = feed.state.lock().unwrap_or_else(|p| p.into_inner());
+                    (
+                        guard.clients > 0,
+                        guard.sms_clients > 0,
+                        !guard.readings.contains_key("sms"),
+                        std::mem::take(&mut guard.refresh_requested),
+                    )
+                };
+                if active {
+                    let fresh_connection = feed
+                        .state
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .readings
+                        .is_empty();
+                    if fresh_connection || refresh_requested {
+                        sampled.clear();
+                    }
+                    let mut updates = Readings::new();
+                    for &(name, seconds) in READINGS {
+                        if is_sms(name) {
+                            if !sms_active {
+                                sampled.remove(name);
+                                continue;
+                            }
+                            if sms_missing {
+                                sampled.remove(name);
+                            }
+                        }
+                        if sampled
+                            .get(name)
+                            .is_some_and(|at| at.elapsed() < Duration::from_secs(seconds))
+                        {
+                            continue;
+                        }
+                        updates.insert(name.to_string(), read(&state, name));
+                        sampled.insert(name, Instant::now());
+                    }
+                    feed.publish(updates);
+                } else {
+                    sampled.clear();
+                }
+                let guard = feed.state.lock().unwrap_or_else(|p| p.into_inner());
+                if guard.clients == 0 {
+                    drop(feed.changed.wait_while(guard, |state| state.clients == 0));
+                } else {
+                    drop(feed.changed.wait_timeout(guard, Duration::from_secs(1)));
+                }
+            }
+        });
+    }
+}
+
+fn dns_signature(reading: &Value) -> Value {
+    let mut keys = reading["data"]["entries"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|entry| {
+            (
+                entry["domain"].as_str().unwrap_or_default().to_string(),
+                entry["type_id"].as_u64().unwrap_or_default(),
+            )
+        })
+        .collect::<Vec<_>>();
+    keys.sort();
+    json!({"keys":keys,"stats":reading["data"]["stats"]})
+}
+
+fn is_sms(name: &str) -> bool {
+    matches!(name, "sms" | "sms_capacity")
+}
+
+fn esim_reading(state: &AppState) -> Value {
+    crate::events::readers::without_touch_notifications(|| crate::esim::dashboard_status(state))
+}
+
+/// Prefer the firmware's traffic accounting: IPA offload can bypass the
+/// kernel counters behind `/api/network/speed`. The legacy endpoint remains a
+/// compatibility fallback when this firmware does not return a complete
+/// sample.
+fn speed_reading(state: &AppState) -> (u16, Value) {
+    let modem = network_ext::network_speeds(state);
+    if modem.0 == 200 && complete_modem_speed(&modem.1["data"]) {
+        modem
+    } else {
+        handlers::network_speed(state)
+    }
+}
+
+fn complete_modem_speed(data: &Value) -> bool {
+    let counter = |key: &str| {
+        data[key].as_u64().is_some()
+            || data[key]
+                .as_str()
+                .is_some_and(|value| value.trim().parse::<u64>().is_ok())
+    };
+    [
+        "real_rx_speed",
+        "real_tx_speed",
+        "real_rx_bytes",
+        "real_tx_bytes",
+    ]
+    .into_iter()
+    .all(counter)
+}
+
+fn read(state: &AppState, name: &str) -> Value {
+    let (_, mut result) = match name {
+        "device" => handlers::device(state),
+        "wan" => network_ext::network_wan(state),
+        "wan6" => network_ext::network_wan6(state),
+        "signal" => handlers::network_signal(state),
+        "modem" => handlers::modem_status(state),
+        "mobile" => modem_ext::modem_data_get(state),
+        "charging" => device_ext::charge_control_get(state),
+        "thermal" => device_ext::device_thermal(state),
+        "speed" => speed_reading(state),
+        "battery" => handlers::battery(state),
+        "wifi" => wifi::wifi_status(state),
+        "guest" => wifi::guest_status(state),
+        "clients" => network_ext::network_clients(state),
+        "sms" => sms::sms_list(state, br#"{"page":0,"data_per_page":500,"mem_store":2,"tags":10,"order_by":"order by id desc"}"#),
+        "sms_capacity" => sms::sms_capacity(state),
+        _ => return json!({"ok": false}),
+    };
+    // Wi-Fi's configuration API includes keys; the monitoring feed never needs passwords.
+    sanitize_reading(name, &mut result);
+    result
+}
+
+fn sanitize_reading(name: &str, result: &mut Value) {
+    if name == "guest" {
+        if let Some(data) = result["data"].as_object_mut() {
+            data.retain(|key, _| {
+                matches!(
+                    key.as_str(),
+                    "ssid"
+                        | "encryption"
+                        | "disabled_2g"
+                        | "disabled_5g"
+                        | "hidden"
+                        | "isolate"
+                        | "guest_active_time"
+                        | "remaining_seconds"
+                )
+            });
+        }
+    }
+    if name == "mobile" {
+        if let Some(data) = result["data"].as_object_mut() {
+            data.retain(|key, _| {
+                matches!(
+                    key.as_str(),
+                    "enable" | "roam_enable" | "connect_mode" | "connect_status"
+                )
+            });
+        }
+    }
+    if name == "wifi" {
+        if let Some(data) = result["data"].as_object_mut() {
+            data.retain(|key, _| {
+                matches!(
+                    key.as_str(),
+                    "wifi_onoff"
+                        | "wifi6_switch"
+                        | "encryption_2g"
+                        | "encryption_5g"
+                        | "hidden_2g"
+                        | "hidden_5g"
+                        | "htmode_2g"
+                        | "htmode_5g"
+                        | "txpower_2g"
+                        | "txpower_5g"
+                        | "radio2_disabled"
+                        | "radio5_disabled"
+                        | "ssid_2g"
+                        | "ssid_5g"
+                        | "channel_2g"
+                        | "channel_5g"
+                )
+            });
+        }
+    }
+}
+
+fn delta(previous: &Readings, current: &Readings) -> Readings {
+    current
+        .iter()
+        .filter(|(key, value)| previous.get(*key) != Some(*value))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
+#[cfg(test)]
+fn frame(
+    writer: &mut impl Write,
+    event: &str,
+    generation: u64,
+    readings: &Readings,
+) -> io::Result<()> {
+    writeln!(
+        writer,
+        "id: {generation}\nevent: {event}\ndata: {}\n",
+        json!({"readings": readings})
+    )?;
+    writer.flush()
+}
+
+/// A console stream on the same axum listener and bearer precheck as the JSON API.
+pub fn response(app: Arc<AppState>, url: String, token: String) -> axum::response::Response {
+    let interests = Interests::from_url(&url);
+    let Some(subscription) = app.dashboard.subscribe(interests) else {
+        return crate::httpd::api::json_reply(
+            503,
+            &json!({"ok":false,"error":"too many live dashboards"}),
+        );
+    };
+    struct Viewer {
+        app: Arc<AppState>,
+        token: String,
+        interests: Interests,
+        _subscription: Subscription,
+        previous: Readings,
+        generation: u64,
+        initial: bool,
+        started: Instant,
+    }
+    let viewer = Viewer {
+        app,
+        token,
+        interests,
+        _subscription: subscription,
+        previous: Readings::new(),
+        generation: 0,
+        initial: true,
+        started: Instant::now(),
+    };
+    let stream = futures_util::stream::unfold(Some(viewer), |viewer| async move {
+        let mut viewer = viewer?;
+        loop {
+            if viewer.started.elapsed() >= Duration::from_secs(30 * 60) {
+                return None;
+            }
+            if viewer
+                .app
+                .auth
+                .authenticate(crate::auth::Kind::Bearer, &viewer.token)
+                .is_none()
+            {
+                return Some((
+                    Ok::<_, std::convert::Infallible>("event: auth\ndata: {}\n\n".to_string()),
+                    None,
+                ));
+            }
+            let feed = Arc::clone(&viewer.app.dashboard);
+            let notified = feed.live.notified();
+            let (generation, current) = {
+                let state = feed.state.lock().unwrap_or_else(|p| p.into_inner());
+                (
+                    state.generation,
+                    state
+                        .readings
+                        .iter()
+                        .filter(|(name, _)| viewer.interests.includes(name))
+                        .map(|(name, value)| (name.clone(), value.clone()))
+                        .collect::<Readings>(),
+                )
+            };
+            let changes = delta(&viewer.previous, &current);
+            if !changes.is_empty() {
+                let name = if viewer.initial { "snapshot" } else { "patch" };
+                let frame = format!(
+                    "id: {generation}\nevent: {name}\ndata: {}\n\n",
+                    json!({"readings":changes})
+                );
+                viewer.previous = current;
+                viewer.generation = generation;
+                viewer.initial = false;
+                return Some((Ok(frame), Some(viewer)));
+            }
+            if tokio::time::timeout(HEARTBEAT, notified).await.is_err() {
+                return Some((Ok(": heartbeat\n\n".to_string()), Some(viewer)));
+            }
+        }
+    });
+    crate::events::sse::response(stream)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn esim_dashboard_projection_does_not_wake_its_collector() {
+        crate::events::test_sink::take();
+        let _ = esim_reading(&AppState::new());
+        assert!(crate::events::test_sink::take().is_empty());
+    }
+
+    #[test]
+    fn speed_sampling_matches_the_modems_one_second_rate() {
+        assert_eq!(
+            READINGS.iter().find(|(name, _)| *name == "speed"),
+            Some(&("speed", 1))
+        );
+    }
+
+    #[test]
+    fn modem_speed_accepts_complete_idle_sample() {
+        assert!(complete_modem_speed(&json!({
+            "real_rx_speed": 0,
+            "real_tx_speed": "0",
+            "real_rx_bytes": 2_039_609_516u64,
+            "real_tx_bytes": "312816092",
+        })));
+    }
+
+    #[test]
+    fn modem_speed_rejects_incomplete_sample() {
+        let complete = json!({
+            "real_rx_speed": 0,
+            "real_tx_speed": 0,
+            "real_rx_bytes": 2_039_609_516u64,
+            "real_tx_bytes": 312_816_092u64,
+        });
+        for missing in [
+            "real_rx_speed",
+            "real_tx_speed",
+            "real_rx_bytes",
+            "real_tx_bytes",
+        ] {
+            let mut incomplete = complete.clone();
+            incomplete.as_object_mut().unwrap().remove(missing);
+            assert!(!complete_modem_speed(&incomplete), "missing {missing}");
+        }
+    }
+
+    #[test]
+    fn modem_speed_rejects_invalid_counter() {
+        assert!(!complete_modem_speed(&json!({
+            "real_rx_speed": "1.5",
+            "real_tx_speed": 0,
+            "real_rx_bytes": 1,
+            "real_tx_bytes": 1,
+        })));
+    }
+
+    #[test]
+    fn dns_topic_is_private_and_ttl_only_changes_do_not_emit() {
+        let interests = Interests::from_url("/api/dashboard/events?topics=dns");
+        assert!(interests.includes("dns_cache"));
+        assert!(!Interests::default().includes("dns_cache"));
+        let first = json!({"ok":true,"data":{
+            "entries":[{"domain":"example.com","type_id":1,"ttl":60}],
+            "stats":{"cache_hits":2,"cache_misses":1}
+        }});
+        let tick = json!({"ok":true,"data":{
+            "entries":[{"domain":"example.com","type_id":1,"ttl":59}],
+            "stats":{"cache_hits":2,"cache_misses":1}
+        }});
+        assert_eq!(dns_signature(&first), dns_signature(&tick));
+        let hit = json!({"ok":true,"data":{
+            "entries":[{"domain":"example.com","type_id":1,"ttl":58}],
+            "stats":{"cache_hits":3,"cache_misses":1}
+        }});
+        assert_ne!(dns_signature(&first), dns_signature(&hit));
+
+        let feed = Arc::new(Dashboard::default());
+        let _ordinary = feed.subscribe(false).unwrap();
+        let viewer = feed.subscribe(interests).unwrap();
+        feed.publish(BTreeMap::from([("dns_cache".into(), first)]));
+        assert!(!feed.next(0, false).1.contains_key("dns_cache"));
+        assert!(feed.next(0, interests).1.contains_key("dns_cache"));
+        drop(viewer);
+        assert!(!feed
+            .state
+            .lock()
+            .unwrap()
+            .readings
+            .contains_key("dns_cache"));
+    }
+
+    #[test]
+    fn esim_topic_uses_ninth_bit_and_is_private_to_its_subscribers() {
+        let interests = Interests::from_url("/api/dashboard/events?topics=esim");
+        assert!(interests.includes("esim_status"));
+        assert!(!interests.includes("client_details"));
+        assert!(!Interests::default().includes("esim_status"));
+        assert!(Interests::default().includes("wan6"));
+        let feed = Arc::new(Dashboard::default());
+        let viewer = feed.subscribe(interests).unwrap();
+        feed.publish(BTreeMap::from([(
+            "esim_status".into(),
+            json!({"ok":true,"data":{"iccid":"private"}}),
+        )]));
+        assert!(!feed.next(0, false).1.contains_key("esim_status"));
+        assert!(feed.next(0, interests).1.contains_key("esim_status"));
+        drop(viewer);
+        assert!(!feed
+            .state
+            .lock()
+            .unwrap()
+            .readings
+            .contains_key("esim_status"));
+    }
+
+    #[test]
+    fn optional_topics_are_whitelisted_and_never_leak_to_ordinary_streams() {
+        let interests = Interests::from_url(
+            "/api/dashboard/events?sms=1&topics=operators,forwarding,unknown,terminal",
+        );
+        assert!(
+            interests.sms
+                && interests.includes("operators")
+                && interests.includes("forwarding")
+                && interests.includes("at_port")
+        );
+        assert!(!interests.includes("resources"));
+        let feed = Arc::new(Dashboard::default());
+        let _ordinary = feed.subscribe(false).unwrap();
+        let viewer = feed.subscribe(interests).unwrap();
+        feed.publish(BTreeMap::from([
+            ("signal".into(), json!({"ok":true})),
+            (
+                "forwarding".into(),
+                json!({"ok":true,"data":{"log":["private preview"]}}),
+            ),
+        ]));
+        assert!(!feed.next(0, false).1.contains_key("forwarding"));
+        assert!(feed.next(0, interests).1.contains_key("forwarding"));
+        drop(viewer);
+        assert!(!feed
+            .state
+            .lock()
+            .unwrap()
+            .readings
+            .contains_key("forwarding"));
+    }
+
+    #[test]
+    fn routing_settings_only_reach_subscribed_viewers_and_expire_after_leaving() {
+        let feed = Arc::new(Dashboard::default());
+        let _ordinary = feed.subscribe(false).unwrap();
+        let interests = Interests::from_url("/api/dashboard/events?topics=routing");
+        let viewer = feed.subscribe(interests).unwrap();
+        feed.publish(BTreeMap::from([
+            ("signal".into(), json!({"ok":true})),
+            (
+                "lan_config".into(),
+                json!({"ok":true,"data":{"lan_ipaddr":"192.168.0.1"}}),
+            ),
+            (
+                "port_rules".into(),
+                json!({"ok":true,"data":{"rule_list":[]}}),
+            ),
+        ]));
+        assert!(!feed.next(0, false).1.contains_key("lan_config"));
+        assert!(feed.next(0, interests).1.contains_key("port_rules"));
+        drop(viewer);
+        assert!(!feed
+            .state
+            .lock()
+            .unwrap()
+            .readings
+            .contains_key("port_rules"));
+    }
+
+    #[test]
+    fn client_details_use_the_eighth_topic_without_leaking_into_basic_streams() {
+        let feed = Arc::new(Dashboard::default());
+        let _ordinary = feed.subscribe(false).unwrap();
+        let interests = Interests::from_url("/api/dashboard/events?topics=clients");
+        let viewer = feed.subscribe(interests).unwrap();
+        feed.publish(BTreeMap::from([
+            ("clients".into(), json!({"ok":true,"data":{"hosts":{}}})),
+            (
+                "client_details".into(),
+                json!({"ok":true,"data":{"devices":[]}}),
+            ),
+        ]));
+        assert!(feed.next(0, interests).1.contains_key("client_details"));
+        assert!(!feed.next(0, false).1.contains_key("client_details"));
+        drop(viewer);
+        assert!(!feed
+            .state
+            .lock()
+            .unwrap()
+            .readings
+            .contains_key("client_details"));
+    }
+
+    #[test]
+    fn changes_include_failed_readings_but_not_unchanged_dependencies() {
+        let previous = BTreeMap::from([
+            ("signal".into(), json!({"ok": true, "data": {"rsrp": -90}})),
+            (
+                "battery".into(),
+                json!({"ok": true, "data": {"capacity": 80}}),
+            ),
+        ]);
+        let mut current = previous.clone();
+        current.insert(
+            "signal".into(),
+            json!({"ok": false, "error": "unavailable"}),
+        );
+        assert_eq!(
+            delta(&previous, &current),
+            BTreeMap::from([("signal".into(), current["signal"].clone())])
+        );
+    }
+
+    #[test]
+    fn configuration_readings_exclude_passwords_and_unknown_private_fields() {
+        for (name, data, expected) in [
+            (
+                "wifi",
+                json!({"ssid_2g":"Home","key_2g":"secret","key_5g":"secret","future_password":"secret","txpower_2g":"80"}),
+                json!({"ssid_2g":"Home","txpower_2g":"80"}),
+            ),
+            (
+                "guest",
+                json!({"ssid":"Guest","key":"secret","future_password":"secret","remaining_seconds":30}),
+                json!({"ssid":"Guest","remaining_seconds":30}),
+            ),
+            (
+                "mobile",
+                json!({"enable":1,"roam_enable":0,"username":"secret","password":"secret"}),
+                json!({"enable":1,"roam_enable":0}),
+            ),
+        ] {
+            let mut envelope = json!({"ok":true,"data":data});
+            sanitize_reading(name, &mut envelope);
+            assert_eq!(envelope["data"], expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn admission_is_bounded_and_released_on_disconnect() {
+        let feed = Arc::new(Dashboard::default());
+        let mut subscriptions: Vec<_> = (0..MAX_STREAMS)
+            .map(|_| feed.subscribe(false).unwrap())
+            .collect();
+        assert!(feed.subscribe(false).is_none());
+        subscriptions.pop();
+        assert!(feed.subscribe(false).is_some());
+    }
+
+    #[test]
+    fn idle_feed_discards_old_readings_and_does_not_collect_a_backlog() {
+        let feed = Arc::new(Dashboard::default());
+        let subscription = feed.subscribe(false).unwrap();
+        feed.publish(BTreeMap::from([("battery".into(), json!({"ok": true}))]));
+        drop(subscription);
+        feed.publish(BTreeMap::from([("signal".into(), json!({"ok": true}))]));
+        assert!(feed.state.lock().unwrap().readings.is_empty());
+    }
+
+    #[test]
+    fn wire_frame_is_one_complete_sse_message_even_with_newlines_in_values() {
+        let mut bytes = Vec::new();
+        frame(
+            &mut bytes,
+            "patch",
+            7,
+            &BTreeMap::from([("wifi".into(), json!({"ssid": "hello\nworld"}))]),
+        )
+        .unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.starts_with("id: 7\nevent: patch\ndata: "));
+        assert_eq!(text.matches("\n\n").count(), 1);
+        assert!(text.contains("hello\\nworld"));
+    }
+    #[tokio::test]
+    async fn axum_stream_emits_snapshots_patches_and_auth_and_releases_subscription() {
+        use futures_util::StreamExt;
+        let app = Arc::new(AppState::new());
+        app.auth.set_password("test-only");
+        let issued = app
+            .auth
+            .login(
+                "test-only",
+                crate::auth::Kind::Bearer,
+                crate::auth::PeerKey::UNKNOWN,
+                &[],
+            )
+            .unwrap();
+        let token = issued.token.expose().to_owned();
+        let response = response(
+            Arc::clone(&app),
+            "/api/dashboard/events".into(),
+            token.clone(),
+        );
+        assert_eq!(response.status(), 200);
+        let mut body = response.into_body().into_data_stream();
+        app.dashboard.publish(BTreeMap::from([(
+            "battery".into(),
+            json!({"ok":true,"data":{"capacity":80}}),
+        )]));
+        let snapshot = body.next().await.unwrap().unwrap();
+        assert!(String::from_utf8_lossy(&snapshot).contains("event: snapshot"));
+        app.dashboard.publish(BTreeMap::from([(
+            "battery".into(),
+            json!({"ok":true,"data":{"capacity":79}}),
+        )]));
+        assert!(
+            String::from_utf8_lossy(&body.next().await.unwrap().unwrap()).contains("event: patch")
+        );
+        app.auth.logout(crate::auth::Kind::Bearer, &token);
+        assert!(
+            String::from_utf8_lossy(&body.next().await.unwrap().unwrap()).contains("event: auth")
+        );
+        drop(body);
+        assert_eq!(app.dashboard.state.lock().unwrap().clients, 0);
+    }
+    #[test]
+    fn messages_are_discarded_when_the_last_message_viewer_leaves() {
+        let feed = Arc::new(Dashboard::default());
+        let _ordinary = feed.subscribe(false).unwrap();
+        feed.publish(BTreeMap::from([(
+            "sms".into(),
+            json!({"ok": true, "data": {"messages": []}}),
+        )]));
+        assert!(!feed.state.lock().unwrap().readings.contains_key("sms"));
+        let inbox = feed.subscribe(true).unwrap();
+        feed.publish(BTreeMap::from([(
+            "sms".into(),
+            json!({"ok": true, "data": {"messages": []}}),
+        )]));
+        assert!(feed.state.lock().unwrap().readings.contains_key("sms"));
+        assert!(
+            !feed.next(0, false).1.contains_key("sms"),
+            "ordinary viewers never receive message bodies"
+        );
+        assert!(feed.next(0, true).1.contains_key("sms"));
+        drop(inbox);
+        assert!(!feed.state.lock().unwrap().readings.contains_key("sms"));
+    }
+    #[test]
+    fn battery_details_are_collected_only_for_power_viewers_and_discarded_after_leaving() {
+        let feed = Arc::new(Dashboard::default());
+        let _ordinary = feed.subscribe(false).unwrap();
+        let power = Interests::from_url("/api/dashboard/events?topics=power");
+        let viewer = feed.subscribe(power).unwrap();
+        feed.publish(BTreeMap::from([("battery_details".into(), json!({"ok":true,"data":{}}))]));
+        assert!(feed.next(0, power).1.contains_key("battery_details"));
+        assert!(!feed.next(0, false).1.contains_key("battery_details"));
+        drop(viewer);
+        assert!(!feed.state.lock().unwrap().readings.contains_key("battery_details"));
+    }
+
+}

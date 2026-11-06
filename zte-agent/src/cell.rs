@@ -8,7 +8,7 @@ pub fn cell_lock_nr(state: &AppState, body: &[u8]) -> (u16, Value) {
         Ok(v) => v,
         Err(_) => return (400, json!({"ok": false, "error": "invalid JSON"})),
     };
-    crate::modem_ext::note_user_modem_change(state);
+    let _command = crate::modem_ext::note_user_modem_change(state);
     match ubus::call("zte_nwinfo_api", "nwinfo_lock_nr_cell", Some(&parsed.to_string())) {
         Ok(data) => (200, json!({"ok": true, "data": data})),
         Err(e) => (503, json!({"ok": false, "error": e})),
@@ -20,7 +20,7 @@ pub fn cell_lock_lte(state: &AppState, body: &[u8]) -> (u16, Value) {
         Ok(v) => v,
         Err(_) => return (400, json!({"ok": false, "error": "invalid JSON"})),
     };
-    crate::modem_ext::note_user_modem_change(state);
+    let _command = crate::modem_ext::note_user_modem_change(state);
     match ubus::call("zte_nwinfo_api", "nwinfo_lock_lte_cell", Some(&parsed.to_string())) {
         Ok(data) => (200, json!({"ok": true, "data": data})),
         Err(e) => (503, json!({"ok": false, "error": e})),
@@ -28,7 +28,7 @@ pub fn cell_lock_lte(state: &AppState, body: &[u8]) -> (u16, Value) {
 }
 
 pub fn cell_lock_reset(state: &AppState) -> (u16, Value) {
-    crate::modem_ext::note_user_modem_change(state);
+    let _command = crate::modem_ext::note_user_modem_change(state);
     match ubus::call("zte_nwinfo_api", "nwinfo_reset_band_cell_setting", Some("{}")) {
         Ok(data) => (200, json!({"ok": true, "data": data})),
         Err(e) => (503, json!({"ok": false, "error": e})),

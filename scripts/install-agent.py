@@ -9,6 +9,14 @@ from pathlib import Path
 
 STARTUP = "/data/local/tmp/start_zte_agent.sh"
 BOOT_LINE = f"sh {STARTUP}"
+LEGACY = "/data/zte-agent"
+OTA_ROOT = "/data/open-u60/update"
+SUPERVISOR = "/data/local/tmp/zte-agent-supervisor.sh"
+
+OTA_ENVIRONMENT = f"""export ZTE_OTA_ROOT={OTA_ROOT}
+export ZTE_OTA_SUPERVISOR={SUPERVISOR}
+export ZTE_OTA_LEGACY_LINK={LEGACY}
+"""
 
 SHELL_HEADER = """#!/bin/sh
 # Managed by open-u60-pro setup.sh.
@@ -21,6 +29,13 @@ ulimit -c 0
 
 def process_identity(include_temporary=False):
     temporary = "|/tmp/u60-panel/agent|'/tmp/u60-panel/agent (deleted)'" if include_temporary else ""
+    # The boot supervisor execs the active slot (or the retained last Stable
+    # rescue copy), so a running main's executable is that file, not the
+    # /data/zte-agent link. Pre-OTA installs still run /data/zte-agent itself.
+    slots = (
+        f"|{OTA_ROOT}/slot-[ab]/zte-agent|{OTA_ROOT}/slot-[ab]/zte-agent' (deleted)'"
+        f"|{OTA_ROOT}/last-stable/zte-agent|{OTA_ROOT}/last-stable/zte-agent' (deleted)'"
+    )
     return r"""# /proc stat field 22 is stable across exec, unlike a PID alone. Strip the
 # parenthesized comm first (it can contain spaces and closing parentheses).
 process_start() {
@@ -33,7 +48,7 @@ is_main() {
     [ "$#" -lt 2 ] || [ "$start" = "$2" ] || return 1
     exe=$(readlink "$1/exe" 2>/dev/null) || return 1
     case "$exe" in
-        /data/zte-agent|'/data/zte-agent (deleted)'__TEMPORARY__) ;;
+        /data/zte-agent|'/data/zte-agent (deleted)'__SLOTS____TEMPORARY__) ;;
         *) return 1 ;;
     esac
     # Both old and new launchers run the service without CLI arguments.
@@ -52,7 +67,7 @@ is_main() {
     [ "$(readlink "$1/exe" 2>/dev/null)" = "$exe" ] || return 1
     [ "$(process_start "$1")" = "$start" ]
 }
-""".replace("__TEMPORARY__", temporary)
+""".replace("__SLOTS__", slots).replace("__TEMPORARY__", temporary)
 
 
 START_LOCK = """mkdir -p /tmp/zte-agent-run
@@ -66,7 +81,7 @@ def launcher(password=None):
     auth = "unset ZTE_AGENT_PASSWORD" if password is None else (
         "export ZTE_AGENT_PASSWORD=" + shlex.quote(password)
     )
-    return SHELL_HEADER + auth + "\nexport ZTE_AGENT_BIND=0.0.0.0:9090\n" + process_identity() + START_LOCK + r"""# Do not trust a stale pid file, nor compare against the new binary's inode:
+    return SHELL_HEADER + auth + "\nexport ZTE_AGENT_BIND=0.0.0.0:9090\n" + OTA_ENVIRONMENT + process_identity() + START_LOCK + r"""# Do not trust a stale pid file, nor compare against the new binary's inode:
 # a still-running main may predate an update and have a deleted executable.
 for process in /proc/[0-9]*; do
     if is_main "$process"; then
@@ -75,17 +90,19 @@ for process in /proc/[0-9]*; do
 done
 # Inherited callback selectors must not turn our new service into a helper.
 unset U60_RELAY_DHCP U60_RELAY_DHCP6
-nohup /data/zte-agent </dev/null >/tmp/zte-agent.log 2>&1 9>&- &
+# The supervisor picks the verified A/B slot and execs it, keeping this PID.
+nohup /data/local/tmp/zte-agent-supervisor.sh </dev/null >/tmp/zte-agent.log 2>&1 9>&- &
 pid=$!
 started=$(process_start /proc/$pid)
 [ -n "$started" ] || exit 1
-# Keep the lock until this same child has exec'd into the main service.
+# Keep the lock until this same child has exec'd into the main service. The
+# supervisor hashes and probes the slot first, so allow it 10 s.
 count=0
 until is_main /proc/$pid "$started"; do
     [ "$(process_start /proc/$pid)" = "$started" ] || exit 1
     kill -0 "$pid" 2>/dev/null || exit 1
     count=$((count + 1))
-    [ "$count" -lt 50 ] || exit 1
+    [ "$count" -lt 100 ] || exit 1
     sleep 0.1
 done
 echo "$pid" >/tmp/zte-agent-run/pid
@@ -127,9 +144,18 @@ stop_verified() {
 }
 stage=$1
 expected_rc=$2
+agent_sha=${3:-}
+agent_version=${4:-}
 """ + START_LOCK + r"""[ "$(sha256sum /etc/rc.local | awk '{print $1}')" = "$expected_rc" ]
 [ -s "$stage/agent.new" ]
+[ -s "$stage/supervisor.new" ]
 sh -n "$stage/start.sh"
+sh -n "$stage/supervisor.new"
+# Everything the supervisor will trust is checked before anything is stopped.
+case "$agent_sha" in *[!0-9a-f]*) exit 1 ;; esac
+[ "${#agent_sha}" -eq 64 ]
+case "$agent_version" in ''|*[!0-9A-Za-z.+-]*) exit 1 ;; esac
+[ "$(sha256sum "$stage/agent.new" | awk '{print $1}')" = "$agent_sha" ]
 # Keep the original rollback inputs even if this same stage is retried after
 # a partial install. The marker also records an originally absent launcher.
 if [ ! -f "$stage/backups.ready" ]; then
@@ -141,11 +167,17 @@ if [ ! -f "$stage/backups.ready" ]; then
         cp -p /data/local/tmp/start_zte_agent.sh "$stage/start.before.sh"
         chmod 600 "$stage/start.before.sh"
     fi
+    if [ -f /data/local/tmp/zte-agent-supervisor.sh ]; then
+        cp -p /data/local/tmp/zte-agent-supervisor.sh "$stage/supervisor.before.sh"
+        chmod 600 "$stage/supervisor.before.sh"
+    fi
     : >"$stage/backups.ready"
 fi
-# A retry is a no-op only when both artifacts match and the recorded live
+# A retry is a no-op only when every artifact matches and the recorded live
 # main is executing this inode, not a deleted older binary or a callback.
 if cmp -s "$stage/agent.new" /data/zte-agent && \
+        cmp -s "$stage/agent.new" /data/open-u60/update/slot-b/zte-agent && \
+        cmp -s "$stage/supervisor.new" /data/local/tmp/zte-agent-supervisor.sh && \
         cmp -s "$stage/start.sh" /data/local/tmp/start_zte_agent.sh; then
     installed_pid=$(cat /tmp/zte-agent-run/pid 2>/dev/null || true)
     case "$installed_pid" in
@@ -158,8 +190,9 @@ fi
 # Prepare both replacements before stopping anything. Keep upload payloads
 # until host verification succeeds so the same stage can be retried safely.
 cp "$stage/agent.new" "$stage/agent.ready"
+cp "$stage/supervisor.new" "$stage/supervisor.ready"
 cp "$stage/start.sh" "$stage/start.ready"
-chmod 700 "$stage/agent.ready" "$stage/start.ready"
+chmod 700 "$stage/agent.ready" "$stage/supervisor.ready" "$stage/start.ready"
 for process in /proc/[0-9]*; do
     main_start=$(process_start "$process") || continue
     is_main "$process" "$main_start" || continue
@@ -190,7 +223,30 @@ for process in /proc/[0-9]*; do
         exit 1
     fi
 done
-mv "$stage/agent.ready" /data/zte-agent
+# Bootstrap the A/B layout like the OTA design expects: two verified copies
+# with a recorded digest each, slot A active, no stale signed metadata or
+# trial marker. Nothing runs from here on, so the order only matters for a
+# power cut: the boot launcher is replaced last, after the supervisor and the
+# /data/zte-agent link it relies on exist.
+ota=/data/open-u60/update
+mkdir -p "$ota/slot-a" "$ota/slot-b" "$ota/last-stable"
+chmod 700 "$ota" "$ota/slot-a" "$ota/slot-b" "$ota/last-stable"
+for slot in a b; do
+    cp "$stage/agent.ready" "$ota/slot-$slot/zte-agent.new"
+    chmod 700 "$ota/slot-$slot/zte-agent.new"
+    rm -f "$ota/slot-$slot/release.json" "$ota/slot-$slot/release.json.download"
+    printf '%s\n%s\n' "$agent_sha" "$agent_version" >"$ota/slot-$slot/bootstrap.sha256"
+    chmod 600 "$ota/slot-$slot/bootstrap.sha256"
+    mv -f "$ota/slot-$slot/zte-agent.new" "$ota/slot-$slot/zte-agent"
+done
+rm -f "$ota/pending" "$ota/state.json"
+printf 'a\n' >"$ota/active.new"
+chmod 600 "$ota/active.new"
+mv -f "$ota/active.new" "$ota/active"
+mv "$stage/supervisor.ready" /data/local/tmp/zte-agent-supervisor.sh
+ln -sfn "$ota/slot-a/zte-agent" /data/zte-agent.next
+mv -f /data/zte-agent.next /data/zte-agent
+rm -f "$stage/agent.ready"
 mv "$stage/start.ready" /data/local/tmp/start_zte_agent.sh
 flock -u 9
 exec 9>&-

@@ -1,5 +1,5 @@
-//! `/`, `/ui` and `/ui/**` through the whole router (`httpd::app`), as the
-//! listener runs it. Every test that logs in builds its own state (its own
+//! Archived renderer/security fixtures using their test-only router.
+//! Production routing retirement is verified in `console::tests`. Every test that logs in builds its own state (its own
 //! limiter) and uses its own peer addresses (`10.1.<test>.<n>`).
 
 use std::io::Read;
@@ -19,7 +19,11 @@ use crate::auth::{AuthConfig, AuthState, FailRng, Kind, PeerKey, SeqRng};
 use crate::boottime::FakeClock;
 use crate::handlers::AppState;
 use crate::httpd::gate::Gate;
-use crate::httpd::{app, Ctx, Peer};
+use crate::httpd::{Ctx, Peer};
+
+fn app(ctx: Ctx) -> axum::Router {
+    axum::Router::new().merge(super::router(&ctx)).fallback(crate::httpd::api::api_entry).with_state(ctx)
+}
 
 const PW: &str = "test-password";
 const HOST: &str = "192.168.0.1:9090";

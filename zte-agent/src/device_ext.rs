@@ -14,10 +14,24 @@ pub fn device_thermal(_state: &AppState) -> (u16, Value) {
                 .filter(|s| s["name"].as_str().is_some_and(|n| n.starts_with("cpuss-")))
                 .filter_map(|s| s["temperature_c"].as_f64())
                 .reduce(f64::max);
-            (200, json!({"ok": true, "data": {"cpuss_temp": cpu, "sensors": sensors}}))
+            // A single device reading should represent the hottest valid physical zone,
+            // rather than implying that one CPU sensor describes the whole router.
+            let device = hottest_temperature(&sensors);
+            (200, json!({"ok": true, "data": {
+                "device_temp": device,
+                "cpuss_temp": cpu,
+                "sensors": sensors,
+            }}))
         }
         Err(e) => (503, json!({"ok": false, "error": e.to_string()})),
     }
+}
+
+fn hottest_temperature(sensors: &[Value]) -> Option<f64> {
+    sensors
+        .iter()
+        .filter_map(|sensor| sensor["temperature_c"].as_f64())
+        .reduce(f64::max)
 }
 
 fn read_thermal_zones(base: &std::path::Path) -> std::io::Result<Vec<Value>> {
@@ -456,8 +470,11 @@ mod thermal_tests {
         assert!(first[0]["temperature_c"].is_null());
         assert_eq!(first[1]["temperature_c"], 36.8);
         assert!(first[2]["temperature_c"].is_null());
+        assert_eq!(hottest_temperature(&first), Some(36.8));
         fs::write(base.join("thermal_zone16/temp"), "42100").unwrap();
-        assert_eq!(read_thermal_zones(&base).unwrap()[1]["temperature_c"], 42.1);
+        let second = read_thermal_zones(&base).unwrap();
+        assert_eq!(second[1]["temperature_c"], 42.1);
+        assert_eq!(hottest_temperature(&second), Some(42.1));
         fs::remove_dir_all(base).unwrap();
     }
 }

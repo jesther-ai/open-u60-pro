@@ -1,5 +1,6 @@
 <div align="center">
 
+<p><strong>iOS companion app</strong></p>
 <p>
 <img src="mobile/ios/screenshots/dashboard.png" alt="Dashboard" width="250">&nbsp;&nbsp;<img src="mobile/ios/screenshots/connection-signal.png" alt="Connection and signal" width="250">&nbsp;&nbsp;<img src="mobile/ios/screenshots/esim-profiles.png" alt="eSIM profiles" width="250">
 </p>
@@ -19,7 +20,7 @@ customization, and more.
 [![Website](https://img.shields.io/badge/website-open--u60--pro.vercel.app-blue.svg)](https://open-u60-pro.vercel.app)
 [![Release](https://img.shields.io/github/v/release/jesther-ai/open-u60-pro)](https://github.com/jesther-ai/open-u60-pro/releases/latest)
 
-**Download:** [latest release](https://github.com/jesther-ai/open-u60-pro/releases/latest) · **What's new:** [CHANGELOG.md](CHANGELOG.md) · **Screenshots:** [by feature](#screenshots) · **Web UI:** [in your browser](#web-ui)
+**Download:** [latest release](https://github.com/jesther-ai/open-u60-pro/releases/latest) · **What's new:** [CHANGELOG.md](CHANGELOG.md) · **Screenshots:** [by feature](#screenshots) · **Web UI:** [responsive console](#responsive-web-console)
 
 </div>
 
@@ -68,7 +69,7 @@ A lightweight Rust HTTP server that runs directly on the router (port 9090, on t
 cargo build --release --target aarch64-unknown-linux-musl -p zte-agent
 ```
 
-**183 endpoints across 22 categories:**
+**189 endpoints across 23 categories:**
 
 | Category | # | Capabilities |
 |---|---|---|
@@ -92,12 +93,19 @@ cargo build --release --target aarch64-unknown-linux-musl -p zte-agent
 | Scheduler | 5 | Scheduled/recurring jobs for any API action |
 | Live updates | 1 | `GET /api/events`: Server-Sent Events of signal, traffic, battery, SIM, eSIM progress and more |
 | Live Activity | 3 | Register/unregister the iOS Live Activity, status |
+| Agent Update | 6 | Signed Stable/Beta checks, inactive-slot download, guarded install and rollback |
 | Tailscale | 8 | Remote management: setup, login URL, enable/disable, config, logout, update |
 | AT Terminal | 2 | Send AT commands, port info |
 
 ### Web UI (built into the agent)
 
 Open `http://192.168.0.1:9090/` on the router's Wi-Fi for a dashboard, connection & signal, and the most-used settings, with nothing to install. See [Web UI](#web-ui).
+
+### Responsive Web Console
+
+Open **`http://192.168.0.1:9090/console/`** on the router’s network. The console is embedded in the agent binary, with no separate frontend server or cloud service. When LAN HTTPS is enabled, use `/console/` on that same HTTPS address. It uses the current agent’s rate-limited bearer sign-in, Host/Origin checks and elapsed-time session expiry; `/` opens this console, and old `/ui/` bookmarks redirect to it. HTTPS and certificate-install controls are in Settings → HTTPS & Install.
+
+The five sections cover Dashboard, Network, SMS, Tools and Settings. They include LTE/NR carrier aggregation and SA/NSA, WAN IPv4/IPv6, offline statistics, Wi-Fi/mobile/APN settings, connected-device traffic and observed peaks, eSIM management, SMS actions/forwarding, operator scanning, diagnostics, LAN/DHCP, firewall, port forwarding, UPnP, DMZ and QoS. Only fields reported by the firmware are presented as measurements or limits. See the [screenshots](#new-responsive-web-ui) and [developer guide](zte-agent/docs/responsive-console.md).
 
 ### Mobile Companion Apps
 
@@ -114,9 +122,34 @@ Native apps that connect directly over WiFi -- no computer needed.
 
 ## Screenshots
 
+### New responsive Web UI
+
+The Rust agent serves one responsive browser console at **`http://192.168.0.1:9090/`** (also `/console/`). Old `/ui/` bookmarks open the new console. The console has phone, tablet and desktop layouts, Light/Dark/System themes, streamed SSE updates, animated measurements and smooth page/dialog transitions. Phones keep all five main tabs available in the bottom bar, including short landscape layouts and keyboard changes.
+
+**Desktop · Light**
+
+<img src="zte-agent/ui/screenshots/dashboard-desktop-light.png" alt="Responsive Web UI on desktop in light mode, showing both WAN IP versions, live traffic, battery and carrier aggregation" width="1100">
+
+| Phone · Light | Tablet · Dark |
+|:---:|:---:|
+| <img src="zte-agent/ui/screenshots/dashboard-mobile-light.png" alt="Phone Web UI with WAN IPv4 and IPv6, live rates and fixed five-tab bottom navigation" width="250"> | <img src="zte-agent/ui/screenshots/signal-tablet-dark.png" alt="Tablet Web UI in dark mode with expandable navigation, 5G NSA status and carrier measurements" width="500"> |
+
+<details>
+<summary>More Web UI previews: dark dashboard, connected devices and eSIM management</summary>
+
+<p><img src="zte-agent/ui/screenshots/dashboard-desktop-dark.png" alt="Desktop Web UI dashboard in dark mode" width="1100"></p>
+<p><img src="zte-agent/ui/screenshots/devices-desktop-light.png" alt="Connected Devices with sample MAC/IP addresses, current traffic, observed peaks and separately reported limits" width="1100"></p>
+<p><img src="zte-agent/ui/screenshots/esim-desktop-dark.png" alt="eSIM management in dark mode with active and inactive sample profiles and masked identifiers" width="1100"></p>
+
+</details>
+
+These Web UI captures use **fictional demonstration data** and documentation address ranges. They contain no live router captures, passwords, messages or personal device identifiers. Per-device limits remain “Not reported” when firmware does not supply them. See [Responsive web console](#responsive-web-console) for setup and developer notes.
+
+### iOS companion app
+
 From the iOS app on iPhone. Personal identifiers (ICCID digits, cell IDs) are masked in these images.
 
-### Dashboard and signal
+#### Dashboard and signal
 
 The Dashboard shows the operator, network type, live traffic, battery, CPU temperature and connected devices. Tap **Connection & signal** for 5G NR and LTE readings (RSRP, RSRQ, SINR, RSSI), band, channel, bandwidth, the operator's speed cap, and a signal history chart.
 
@@ -124,7 +157,7 @@ The Dashboard shows the operator, network type, live traffic, battery, CPU tempe
 |:---:|:---:|
 | <img src="mobile/ios/screenshots/dashboard.png" alt="Dashboard with operator, 5G NSA, live traffic, battery, CPU temperature, and connected devices" width="220"> | <img src="mobile/ios/screenshots/connection-signal.png" alt="Connection and signal screen with 5G NR and LTE anchor readings, data session, and signal history chart" width="220"> |
 
-### eSIM profiles
+#### eSIM profiles
 
 With an eSIM card such as the [9eSIM B1](docs/9esim-b1.md) in the SIM slot, **Router → eSIM Profiles** lists the operator profiles on the card. Swipe right on a profile to switch to it; the app shows each step until mobile data is back. Setup: [eSIM profiles](#esim-profiles-optional).
 
@@ -132,7 +165,7 @@ With an eSIM card such as the [9eSIM B1](docs/9esim-b1.md) in the SIM slot, **Ro
 |:---:|:---:|
 | <img src="mobile/ios/screenshots/esim-profiles.png" alt="eSIM Profiles screen listing four operator profiles with the active one marked" width="220"> | <img src="mobile/ios/screenshots/esim-switching.png" alt="Profile switch in progress: switch profile and reload SIM done, connecting to network" width="220"> |
 
-### Battery and power
+#### Battery and power
 
 Battery details, USB-C mode (charge your phone from the router's battery), and device controls: charge limit, power-save mode, fast boot and auto sleep.
 
@@ -140,7 +173,7 @@ Battery details, USB-C mode (charge your phone from the router's battery), and d
 |:---:|:---:|:---:|
 | <img src="mobile/ios/screenshots/battery-details.png" alt="Battery details: capacity, charging status, voltage, current, power, temperature, time to full" width="220"> | <img src="mobile/ios/screenshots/usb-mode.png" alt="USB Mode sheet showing USB-C connected with a Fast Charging button" width="220"> | <img src="mobile/ios/screenshots/device-controls.png" alt="Device controls: charge limit at 85 percent, power-save mode, fast boot, auto sleep" width="220"> |
 
-### Lock Screen
+#### Lock Screen
 
 Live modem signal on the Lock Screen and in the Dynamic Island: see [iOS Live Activities](#ios-live-activities).
 
@@ -272,9 +305,14 @@ and use the official admin password without entering or storing it:
 # Add --serial SERIAL when more than one ADB device is connected.
 ```
 
-This installs `/data/zte-agent` and the private launcher
-`/data/local/tmp/start_zte_agent.sh`, verifies the login page and API authentication
-requirement, and adds one boot entry before `exit 0` in `/etc/rc.local`. Other boot
+This stages and verifies the build on the router first (checksum, `--version`,
+on-device `ota-probe`), then installs the [OTA](docs/ota-updates.md) A/B layout:
+the agent in both slots under `/data/open-u60/update`, the boot supervisor
+`/data/local/tmp/zte-agent-supervisor.sh`, the compatibility link `/data/zte-agent`
+and the private launcher `/data/local/tmp/start_zte_agent.sh`. It verifies that the
+console loads, that the API rejects unauthenticated requests and that the
+responding process is the supervisor-started slot A, and adds one boot entry
+before `exit 0` in `/etc/rc.local`. Other boot
 commands are preserved, repeated launcher calls do not create duplicate agents,
 and the script keeps an installation-specific rollback directory under `/data`.
 It does not reboot the router, set up SSH with `--no-ssh` or enable mobile data.
@@ -285,6 +323,10 @@ Switching Clash off or disconnecting Relay clears the respective resume choice.
 An older installation without these markers cannot supply missing intent; saved
 profiles or Wi-Fi credentials alone do not enable either extension. See
 [restart policy](zte-agent/docs/network-extensions.md#after-a-restart).
+Relay and Mihomo are currently controlled through their JSON API
+(`/api/wifi-relay/*`, `/api/mihomo/*`); the responsive console does not have
+pages for them yet, and the former `/ui/relay` and `/ui/router/mihomo` pages
+(including the Zashboard bridge) are no longer served.
 In factory-password mode, successful login with the actual password is a manual
 check; setup verifies that the factory verifier loaded without reading plaintext.
 
@@ -295,6 +337,12 @@ check; setup verifies that the factory verifier loaded without reading plaintext
 ```
 
 This builds, deploys the binary to the device via SSH (port 2222), updates the boot password, and restarts the agent.
+
+After this one-time bootstrap, **Settings → Agent Update** can check signed
+Stable or Beta releases, stage them in the inactive A/B slot, and restart only
+the agent. A failed 60-second health trial automatically returns to the previous
+slot. Automatic installation remains disabled until the recovery path has been
+validated on physical U60 Pro hardware. See [OTA updates](docs/ota-updates.md).
 
 ### eSIM profiles (optional)
 
@@ -324,105 +372,36 @@ Switching, adding, renaming and deleting require an agent password. In the apps:
 
 ## Web UI
 
-The agent also serves a web app, so any phone or computer on the router's Wi-Fi can check and manage the router without installing anything.
+Connect to the router’s Wi-Fi or USB network and open **http://192.168.0.1:9090/**. Sign in with the agent password (`ZTE_AGENT_PASSWORD` in its startup script). The same responsive console works on phones, tablets and desktop computers. Old `/ui/` bookmarks redirect to the corresponding console screen; the old page, form and live-stream routes are retired.
 
-1. Connect to the router's Wi-Fi.
-2. Open **http://192.168.0.1:9090/** in a browser.
-3. By default, log in with the **official router admin password** (B31). An explicitly set `ZTE_AGENT_PASSWORD` overrides this: existing installations made by `setup.sh`, the browser installer or `deploy.sh` keep their configured agent password. To use the official password instead, remove that export and add `unset ZTE_AGENT_PASSWORD` to the agent's start script, then restart the agent.
+The five sections are Dashboard, Network, SMS, Tools and Settings. They cover live connectivity and carrier aggregation, IPv4/IPv6, connected devices, Wi-Fi/mobile/APN settings, eSIM management, SMS and forwarding, network operators, battery/power details, diagnostics, LAN/DHCP, firewall/DMZ/UPnP, port forwarding, QoS and device controls. Data changes arrive over SSE. JavaScript is required; the console serves its own scripts, styles and fonts without a cloud service.
 
-The default reads the official admin's SHA-256 verifier once at startup, without copying its plaintext password or changing the official panel. After changing the official admin password, restart the agent for it to take effect here too; a restart also expires all agent sessions. An empty explicit password, an unreadable factory configuration or an unsupported verifier stops startup instead of exposing an unauthenticated API. On other firmware, use a nonempty `ZTE_AGENT_PASSWORD` override. Session tokens and Mihomo's internal API secret remain independently generated.
-
-It keeps the iOS app's original five tabs, screens and words, with an additional experimental web-only Relay tab and Mihomo controls in Router. What stays in the apps is listed [below](#not-in-the-browser-use-the-apps).
-
-- **Dashboard:** operator and network type, signal, live traffic, battery, CPU and battery temperature, Wi-Fi and the number of connected devices. Each card opens its details, as in the app:
-  - **Connection & signal:** 5G NR, LTE and WCDMA readings (RSRP, RSRQ, SINR, RSSI, band, channel, bandwidth, carrier aggregation), the data session, a 2-minute signal chart, the WAN addresses and **Network mode**.
-  - **Live traffic**, **Battery Details** (capacity, status, voltage, current, power, temperature, time to full or empty) and **CPU & temperatures** (every temperature sensor; **CPU, memory & processes** shows cores, uptime and memory, and the live process list, where you can kill bloat daemons after a confirmation; **Kill All Bloat** leaves the SMS daemon and the boot-critical daemons running).
-  - **Wi-Fi & devices:** the Wi-Fi networks and the live list of connected devices (hostname, IPv4 address and full MAC address; other device lists remain masked), and **Share Wi-Fi** with the password (hidden until you ask) and a QR code to join.
-  - **USB-C:** while a cable is attached, a card offers **Fast Charging** (charge your phone from the router's battery) or **Dismiss** (until the cable is unplugged).
-- **SMS:** your conversations (search, storage filter, unread counts), reading and replying, **New Message** and deleting a conversation (after a confirmation). **SMS Forwarding** (gear icon, also under Tools): turn forwarding on or off, add, edit, test, switch and delete rules (Telegram, webhook, SMS, ntfy, Discord, Slack; saved tokens and webhook URLs are never shown, leave a field empty to keep it), and the **Forward Log** with **Retry** and **Clear**.
-- **Tools:**
-  - **Automations** (scheduled actions: create, edit, switch on or off, delete) and **SMS Forwarding**.
-  - **Speed Test** (asks first: it uses mobile data), **Enable ADB** (asks first), **USB Mode** (the cable's state and the **Fast Charging (Powerbank)** switch).
-  - **Band Lock** (NR and LTE bands; asks first), **AT Terminal** (asks before commands that can cut the connection; long digit runs such as an IMEI are masked).
-  - **Device Info** (the IMEI shows only its last 4 digits) and **Connected Devices** (with search).
-  - The app's placeholders for TTL Settings, Enable SSH and Device Explorer.
-- **Router:**
-  - **Mihomo / Clash (experimental, web-only):** start/stop switch, private profile library (HTTPS subscription/manual or scheduled refresh, file/paste import), global Merge/JavaScript and a local **Zashboard** link shown only while the proxy runs. Setup shows the saved automatic-start choice independently of the running state and offers **Stop automatic start & keep off** when only that choice remains. The optional official core/dashboard downloads are version- and SHA-256-pinned; the controller is loopback-only behind the authenticated web session. See [network extensions](zte-agent/docs/network-extensions.md) before enabling transparent routing.
-  - **Remembered relay Wi-Fi and fixed client IPs:** optional saved upstream credentials with Forget, and downstream MAC-to-IPv4 DHCP reservations shared by relay/cellular modes. Remember defaults on in the connection form. Only the last successfully connected remembered/open network is eligible to resume after restart; Disconnect clears that choice. Mobile interfaces are unchanged.
-  - **Cellular:** Mobile Network (mobile data, airplane mode, connection mode, data roaming, network selection with a scan and manual registration), Network Mode (Auto, 5G NSA, 5G SA only, 4G only, 4G + 3G, 3G only), Cell Lock (with the neighbour scan), Smart Tower Connect, Signal Detection, SIM Card (PIN, PUK and unlock code; the ICCID, IMSI and number are masked), eSIM Profiles (switch, rename, delete, operator receipts, and **Add eSIM** from a photo of the QR code or the code) and SIM Services (USSD and the SIM Toolkit).
-  - **Connectivity:** WiFi, Guest WiFi, APN, LAN / DHCP, DNS (with DNS over HTTPS and its cache).
-  - **Security and quality:** Firewall (on/off and level, NAT, UPnP, DMZ, port forwarding), Telemetry Blocker, VPN Passthrough, QoS.
-  - **Device Controls:** charge limit (50–100 %), Power-save Mode, Fast Boot, Auto Sleep with its idle timeout, and **Reboot Router** and **Factory Reset**, which ask for the agent password (wrong passwords count like failed logins).
-  - Changes that can cut the connection or are destructive ask for confirmation first (mobile data off, roaming on, airplane mode on, a network mode, a band or cell lock, WiFi, APN, LAN, DNS and firewall changes, deletes); over Tailscale the question also says how it affects your remote connection. Mobile data, airplane mode, network mode and eSIM changes show their progress until they have settled. Passwords are never shown (leave the field empty to keep the current one), and after a change that restarts WiFi or moves the router's address the page tells you where to reconnect.
-- **Settings:** Session (**Log out**), Polling (how often live pages update the signal, 1–10 s), Appearance (System, Light or Dark), **HTTPS & Install as App** (see [below](#install-it-as-an-app)), About and Legal. The refresh interval and the theme are saved in the browser.
-- **Relay (experimental, web-only):** a separate Wi-Fi upstream tab for scanning, connecting/disconnecting and connection status. IPv4 NAT plus optional capability-gated Wi-Fi IPv6/Mihomo egress and LAN SLAAC/NAT66; absent usable upstream IPv6, relay stays IPv4-only and blocks cellular IPv6 bypass. Wi-Fi loss can fall back to already-enabled cellular but does not trigger automatic reconnection while the agent runs. After reboot/agent restart, the agent attempts to resume the saved relay choice; Stop reconnecting cancels it. No iOS/Android screens are changed. See [network extensions](zte-agent/docs/network-extensions.md) for limitations and device acceptance tests.
-
-You stay logged in for 12 hours without use, and at most 7 days. Restarting the agent logs every browser out.
+The sign-in token stays in this tab’s session storage, with an in-memory fallback when browser storage is unavailable. Navigation and reload retain it; locking, expiry or an agent restart requires a new sign-in. Theme preferences are separate from the token.
 
 ### Install it as an app
 
-Browsers install web apps only from HTTPS pages, so the agent can serve the web UI over HTTPS on your LAN with a certificate from the router's own certificate authority. No internet, account or domain is needed; each phone or computer trusts that authority once.
+Open **Settings → HTTPS & Install** to enable HTTPS, renew its certificate or reset the router’s local certificate authority. The screen shows the router clock, expiry, public certificate fingerprints and HTTPS addresses. Enabling or renewing asks for confirmation; resetting requires typing `RESET` and stops open HTTPS connections. Reopen the HTTP address afterward.
 
-1. **Turn it on:** Settings › **HTTPS & Install as App** › **Turn On HTTPS** (it shows the router's date, which the certificates are dated from). The web UI is then also at **https://192.168.0.1:9443/** and **https://u60.home.arpa:9443/**; plain http on port 9090 keeps working.
-2. **Trust the router's certificate authority on each device** (Settings › **Install on Your Devices** has the downloads, the fingerprint to compare and these steps):
-   - **iPhone/iPad:** in Safari tap **Profile for iPhone and iPad** › **Allow**; Settings › **Profile Downloaded** › **Install**; then Settings › General › About › **Certificate Trust Settings** › turn on full trust for "U60 Pro local CA …".
-   - **Android:** tap **Certificate (.crt)** to download it; Settings › Security & privacy › More security & privacy › Encryption & credentials › **Install a certificate** › **CA certificate** › Install anyway, confirm with your screen lock, pick the file (names differ by maker: search Settings for "CA certificate").
-   - **Mac:** open the downloaded `.crt` (Keychain Access adds it), double-click "U60 Pro local CA …" › Trust › **Always Trust**.
-   - **Windows:** open the `.crt` › **Install Certificate** › Current User › Place all certificates in the following store › **Trusted Root Certification Authorities**.
-   - **Firefox:** version 120 and later uses the certificates you add to Windows, macOS or Android. On Linux (or with that setting off): Settings › Privacy & Security › Certificates › View Certificates… › Authorities › Import…, and trust it for websites.
-   - **Check the fingerprint** each device shows (iPhone: Profile Downloaded › More Details, before Install; Mac: Keychain Access; Android: Trusted credentials › User; Windows: Details › Thumbprint, SHA-1) against one that did not come over plain http: the Install page opened over HTTPS on a device that already trusts the CA, or `sha256sum /data/zte-agent-tls/ca.crt` over SSH. Someone on your Wi-Fi could otherwise swap the http page and the file for their own.
-3. **Install:** open `https://192.168.0.1:9443/` (or `https://u60.home.arpa:9443/`) and log in, then **Chrome:** menu › **Install** (Android: Add to Home screen › Install); **Safari on iPhone:** ••• › Share › View More › **Add to Home Screen**; **Safari on Mac:** File › **Add to Dock**.
+1. Turn on HTTPS. HTTP on port 9090 remains available; HTTPS normally uses port 9443.
+2. Download the public certificate/profile from that screen. Compare its fingerprint with a trusted copy: this screen over HTTPS on a device that already trusts the router, or `sha256sum /data/zte-agent-tls/ca.crt` over SSH. Plain HTTP could be altered by someone on the network.
+3. Follow the platform instructions shown there to trust the router’s authority, then open a listed HTTPS address. Use Safari’s Add to Home Screen/Add to Dock or your browser’s Install option.
 
-- The certificate authority can only vouch for this router: its LAN address when you turned HTTPS on and `u60.home.arpa` (and names under it), never for other websites or devices. Its root key is destroyed after setup; the key the router keeps is limited the same way. If you change the router's LAN address later, `https://u60.home.arpa:9443/` keeps working; for the new address, reset HTTPS and trust the new authority. See [SECURITY.md](SECURITY.md).
-- The certificate lasts 397 days. It renews itself only when the agent has a verified clock (a configured Live Activity provider); otherwise Settings shows **Renew Certificate** in its last 30 days, about every 13 months. Devices keep trusting the same authority.
-- `u60.home.arpa` comes from the router's DNS and works only over HTTPS. A device that uses its own DNS (Android's Private DNS set to a provider, DNS over HTTPS in the browser, a VPN) may not find it; the address always works.
-- The http and https addresses keep separate logins (and a home-screen app has its own), so log in once on the one you use.
-- **Reset HTTPS** (Settings) deletes the certificate authority and stops HTTPS (open https pages stop working too). Remove the old one from your devices; turning HTTPS on again needs each device to trust the new one.
-- Without HTTPS you can still add the page to the home screen: Safari's ••• › Share › View More › **Add to Home Screen** works over http (log in once inside it); Chrome for Android only makes a shortcut that opens as a normal tab.
-
-### With and without JavaScript
-
-Everything works with JavaScript off: logging in and out, every page and every setting.
-
-- The dashboard and its detail pages show a snapshot with its age ("over 1 min old" after a minute) and a **Refresh** link.
-- A change that shows its progress (mobile data, airplane mode, network mode, a scan, an eSIM switch or download, a speed test, a signal detection) reloads its page every 3 s until it is done.
-- The theme (Settings › Appearance) works without JavaScript too. With it, under System, iPhone's status bar also follows a light/dark switch made while a page is open.
-
-With JavaScript, the dashboard, its detail pages, the progress pages and the pages that follow the router (SMS, SIM Card, eSIM Profiles, SIM Services, Signal Detection) update live. This uses Datastar, which the agent serves itself, so no internet is needed.
-
-- Updates stop while the page is hidden or the phone is locked, and the router samples nothing while no one is watching. Settings › Polling sets how often the signal updates while a live page is open.
-- "No updates for 15 s" means the connection dropped.
-- Live updates pause after 30 minutes; tap **Resume** to continue.
+The authority is constrained to this router’s LAN address and local name; private keys are never served. Old installed shortcuts keep their application identity but launch `/console/`. Devices using private DNS, browser DNS-over-HTTPS or a VPN may need the listed LAN address rather than `u60.home.arpa`.
 
 ### Security
 
-On port 9090 the web UI is plain HTTP on your LAN, like the apps' connection to the agent: your password and session cookie are not encrypted in transit, and anyone who can watch traffic on the router's network can read them. Turn on HTTPS ([above](#install-it-as-an-app)) and use the https address to encrypt the browser's traffic.
+Use HTTPS to encrypt browser traffic. Plain HTTP exposes credentials and bearer tokens to anyone able to observe the LAN. Never forward port 9090 to the internet; use Tailscale for remote access.
 
-- Use a strong Wi-Fi password and never forward port 9090 to the internet.
-- The agent refuses connections that arrive over mobile data, even with the router's firewall off or at Low; Wi-Fi, USB and Tailscale keep working. `ZTE_AGENT_ALLOW_MOBILE=1` in the start script turns this off.
-- For remote access, use Tailscale, which is encrypted. The web UI also answers on the router's Tailscale name.
-- Sessions use an `HttpOnly`, `SameSite=Strict` cookie, and every form carries a CSRF token.
-- Requests for unknown host names are refused (DNS-rebinding defence). To use another local DNS name, list it in `ZTE_AGENT_UI_HOSTS` (comma-separated) in the start script.
-- Repeated wrong passwords are rate limited.
-- Lost a phone, or think the password leaked? In default mode, change the official admin password and restart the agent. For an explicit override, set a new agent password (`./deploy.sh <new-password>`). The restart logs every app and browser out.
+The console uses the authenticated JSON API, its Host/Origin checks, rate-limited login and boot-clock token expiry. HTML and scripts are not stored by caches. Legacy cookies do not authenticate API requests, and retired `/ui/` forms cannot change settings. See [SECURITY.md](SECURITY.md) and the [console developer guide](zte-agent/docs/responsive-console.md).
 
-See [SECURITY.md](SECURITY.md) and [zte-agent/docs/web-ui.md](zte-agent/docs/web-ui.md).
-
-### Not in the browser (use the apps)
-
-- The Lock Screen / Dynamic Island **Live Activity** (iOS); the live dashboard is the browser's equivalent.
-- **Scanning an eSIM QR code** with the live camera: take or choose a photo of it, or type the code.
-- Anything that needs the phone's **location**.
-- **Phone calls** (the app's dialer).
-- **LAN Speed Test** (it measures on the phone) and **Config Decrypt/Encrypt** (it handles a config file with credentials on the phone).
-- The app's **Gateway** and **Keychain** settings: the browser is already on the router, and its password manager can keep the agent password.
+Native apps remain available for features that require the phone, such as iOS Live Activities, location, calls and client-side LAN speed tests or configuration-file tools.
 
 ## Project Structure
 
 ```
 u60-Pro-rs/
 ├── zte-agent/                 On-device agent: REST API + browser UI (port 9090)
-│   ├── build.rs               Web UI assets: Datastar hash check, icons, gzip, manifest
+│   ├── build.rs               Console icons and archived fixture asset preparation
 │   ├── docs/                  esim.md, events.md, live-activity.md, web-ui.md
 │   └── src/
 │       ├── main.rs            Entry point: event bus, background services, listener
@@ -431,7 +410,7 @@ u60-Pro-rs/
 │       ├── httpd/             HTTP listener: axum on hyper http1, one tokio thread, blocking-work gate
 │       ├── auth/              Bearer tokens, browser sessions, login rate limit (boot clock)
 │       ├── events/            Event hub, demand-driven sampler, GET /api/events (SSE)
-│       ├── web/               Browser UI under /ui/: maud pages, sessions + CSRF, live updates
+│       ├── web/               Retired renderers/shared security helpers and archived regression fixtures
 │       │   └── assets/        app.css, vendored Datastar 1.0.4
 │       └── esim*.rs, stk/, tailscale/, doh/, ...
 ├── euicc/                     eSIM card library (Rust translation of lpac's libeuicc, LGPL-2.1)

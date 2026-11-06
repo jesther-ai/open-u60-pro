@@ -18,9 +18,12 @@ base64 = "0.22"
 p256 = { version = "0.13", features = ["ecdsa", "pem"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "http2", "rustls-tls", "stream"] }
 httpdate = "1"
+ipnet = { version = "2", features = ["serde"] }
+wireguard-control = "2"
 # SGP.22 card commands: LGPL-2.1-only Rust translation of lpac's libeuicc (see euicc/).
 euicc = { path = "../euicc" }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"
 # LAN HTTPS (`tls`, `httpd::tls`): the server side of the TLS stack reqwest
 # already links (same versions and features), and ring for the router's own
 # CA (P-256 keys, ECDSA signatures, digests).
@@ -56,6 +59,8 @@ png = "0.18"
 # Web UI, Add eSIM's photo upload: the multipart delimiter search (`web::upload`;
 # already linked via serde_json, same features).
 memchr = "2"
+semver = "1"
+thiserror = "2"
 
 [build-dependencies]
 # build.rs: asset hashing, gzip and icon PNGs (host-only; both already in Cargo.lock).

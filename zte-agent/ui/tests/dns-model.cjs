@@ -1,0 +1,15 @@
+const assert=require('node:assert/strict'),D=require('../dns-model.js');
+assert.equal(D.ipv4('1.1.1.1'),true);assert.equal(D.ipv4('2a07:a8c0::94:a9b1'),false);assert.equal(D.ipv4('01.1.1.1'),false);
+assert.deepEqual(D.payload({mode:'automatic',primary:'1.1.1.1'}),{mode:'automatic',primary:'',secondary:'',doh_url:'',dot_endpoint:'',dot_server_name:''});
+assert.deepEqual(D.payload({mode:'doh',primary:' 1.1.1.1 ',secondary:'1.0.0.1',doh_url:' https://cloudflare-dns.com/dns-query ',dot_endpoint:'ignored',dot_server_name:'ignored'}),{mode:'doh',primary:'1.1.1.1',secondary:'1.0.0.1',doh_url:'https://cloudflare-dns.com/dns-query',dot_endpoint:'',dot_server_name:''});
+assert.equal(D.endpoint({mode:'dot',dot_endpoint:'9.9.9.9:853',dot_server_name:'dns.quad9.net'}),'9.9.9.9:853 · dns.quad9.net');
+assert.deepEqual(D.rows([{domain:'z.example',type:'A',ttl:65},{domain:'a.example',type:'AAAA',ttl:3601}]),[{domain:'a.example',type:'AAAA',ttl:'1h 0m'},{domain:'z.example',type:'A',ttl:'1m 5s'}]);
+assert.deepEqual(D.cacheEntries([{domain:'Z.Example',type:'a',type_id:1,ttl:65.9},{domain:'a.example',type:'AAAA',type_id:28,ttl:-1}]),[{key:'a.example\u001f28',domain:'a.example',type:'AAAA',typeId:28,ttlSeconds:0},{key:'z.example\u001f1',domain:'Z.Example',type:'A',typeId:1,ttlSeconds:65}]);
+assert.equal(D.cacheKey({domain:'Same.Example',type:'A'}),'same.example\u001fA');
+assert.equal(D.presets.cloudflare.dot_server_name,'one.one.one.one');
+assert.equal(D.presets.quad9.doh_url,'https://dns.quad9.net/dns-query');
+assert.equal(D.nextdnsId({doh_url:'https://dns.nextdns.io/abc123'}),'abc123');
+assert.equal(D.nextdnsId({dot_server_name:'ABC123.dns.nextdns.io'}),'abc123');
+assert.deepEqual(D.nextdnsPreset('ABC123'),{name:'NextDNS',primary:'1.1.1.1',secondary:'1.0.0.1',doh_url:'https://dns.nextdns.io/abc123',dot_endpoint:'abc123.dns.nextdns.io:853',dot_server_name:'abc123.dns.nextdns.io'});
+assert.equal(D.nextdnsPreset('bad.profile'),null);
+console.log('Passed: DNS payload scoping, endpoint labels, cache normalization and provider presets.');

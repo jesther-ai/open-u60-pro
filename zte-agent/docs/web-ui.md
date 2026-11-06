@@ -1,3 +1,7 @@
+# Archived server-rendered UI
+
+This design describes the retired interface. It is no longer served in production. `/` and `/ui/` now open the responsive console; see [the current guide](responsive-console.md). Shared certificate/security helpers and renderer regression fixtures remain internal.
+
 # Web UI: `/ui/`
 
 ## Experimental Web-Only Network Extensions

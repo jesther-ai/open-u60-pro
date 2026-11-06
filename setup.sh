@@ -65,14 +65,21 @@ fi
 [ -n "$AGENT_PASSWORD" ] || fail "Agent password cannot be empty; use --factory-password instead."
 fi
 
+if [[ "$AGENT_PASSWORD" == *$'\n'* || "$AGENT_PASSWORD" == *$'\r'* ]]; then
+    fail "Agent password cannot contain a line break."
+fi
+
 GATEWAY=192.168.0.1
 AGENT_PORT=9090
 SSH_PORT=2222
 TARGET=aarch64-unknown-linux-musl
 BINARY=target/$TARGET/release/zte-agent
+OTA_ROOT=/data/open-u60/update
+REMOTE_SLOT=$OTA_ROOT/slot-a/zte-agent
 REMOTE_BIN=/data/zte-agent
+SUPERVISOR_LOCAL=scripts/router/zte-agent-supervisor.sh
 STARTUP_SCRIPT=/data/local/tmp/start_zte_agent.sh
-DOWNLOAD_URL="https://github.com/jesther-ai/open-u60-pro/releases/latest/download/zte-agent"
+DOWNLOAD_URL="${ZTE_AGENT_DOWNLOAD_URL:-https://github.com/jesther-ai/open-u60-pro/releases/latest/download/zte-agent}"
 WORKDIR=$(mktemp -d)
 chmod 700 "$WORKDIR"
 umask 077
@@ -441,6 +448,16 @@ rpush "$BINARY" "$STAGE/agent.new"
 REMOTE_SHA=$(rcmd "sha256sum '$STAGE/agent.new'" | awk '{print $1}')
 [ "$LOCAL_SHA" = "$REMOTE_SHA" ] || fail "Staged binary checksum mismatch; current agent is untouched."
 
+# The A/B update supervisor and its first slot contents are staged and checked
+# like the agent: nothing on the router changes before install.sh runs.
+rpush "$SUPERVISOR_LOCAL" "$STAGE/supervisor.new"
+REMOTE_VERSION=$(rcmd "'$STAGE/agent.new' --version" | awk 'NR == 1 {print $2}')
+if [[ ! "$REMOTE_VERSION" =~ ^[0-9A-Za-z][0-9A-Za-z.+-]{0,63}$ ]]; then
+    fail "The staged agent reported an invalid build version; current agent is untouched."
+fi
+rcmd "'$STAGE/agent.new' ota-probe '$REMOTE_VERSION' >/dev/null 2>&1" \
+    || fail "The staged agent failed its on-device compatibility probe; current agent is untouched."
+
 if [ "$FACTORY_PASSWORD" = true ]; then
     python3 scripts/install-agent.py launcher "$WORKDIR/start.sh"
 else
@@ -461,8 +478,8 @@ rcmd "sh -n '$STAGE/rc.local.new'; [ \"\$(sha256sum /etc/rc.local | awk '{print 
 # same lock. Stop only verified mains, never relay callbacks/CLI helpers.
 python3 scripts/install-agent.py install "$WORKDIR/install.sh"
 rpush "$WORKDIR/install.sh" "$STAGE/install.sh"
-rcmd "sh '$STAGE/install.sh' '$STAGE' '$RC_SHA'"
-ok "Installed $REMOTE_BIN; verifying before enabling the boot hook."
+rcmd "sh '$STAGE/install.sh' '$STAGE' '$RC_SHA' '$LOCAL_SHA' '$REMOTE_VERSION'"
+ok "Installed $REMOTE_SLOT (A/B slots and update supervisor, linked at $REMOTE_BIN); verifying before enabling the boot hook."
 
 if [ "$USE_SSH" = true ]; then
     VERIFY_URL="http://$GATEWAY:$AGENT_PORT"
@@ -473,18 +490,18 @@ else
 fi
 READY=false
 for attempt in $(seq 1 30); do
-    if curl --noproxy '*' -fsS --max-time 2 "$VERIFY_URL/ui/login" >"$WORKDIR/login.html" 2>/dev/null \
-        && grep -q 'name="password"' "$WORKDIR/login.html"; then
+    if curl --noproxy '*' -fsSL --max-time 2 "$VERIFY_URL/console/" >"$WORKDIR/console.html" 2>/dev/null \
+        && grep -q 'OpenU60' "$WORKDIR/console.html"; then
         READY=true
         break
     fi
     sleep 1
 done
-[ "$READY" = true ] || fail "Panel not ready; boot hook is unchanged. Backup: $STAGE"
+[ "$READY" = true ] || fail "Console not ready; boot hook is unchanged. Backup: $STAGE"
 [ "$(curl --noproxy '*' -sS --max-time 5 -o /dev/null -w '%{http_code}' "$VERIFY_URL/api/device")" = 401 ] \
     || fail "Unauthenticated API was not rejected; boot hook is unchanged."
-rcmd 'p=$(cat /tmp/zte-agent-run/pid); [ "$(readlink /proc/$p/exe)" = /data/zte-agent ]' \
-    || fail "The responding panel is not the installed process."
+rcmd "p=\$(cat /tmp/zte-agent-run/pid); [ \"\$(readlink /proc/\$p/exe)\" = '$REMOTE_SLOT' ]" \
+    || fail "The responding agent is not the process the supervisor started from OTA slot A."
 if [ "$FACTORY_PASSWORD" = true ]; then
     rcmd "grep -q '^\[auth\] using factory admin password' /tmp/zte-agent.log" \
         || fail "The installed agent did not load the factory admin verifier."
@@ -507,7 +524,7 @@ mv /etc/rc.local.zte-agent-new /etc/rc.local
 sync"
 ok "Boot hook enabled in rc.local; unrelated boot commands are preserved."
 # Keep only rollback inputs, not upload payloads or install helpers.
-rcmd "rm -f '$STAGE/agent.new' '$STAGE/start.sh' '$STAGE/rc.local.new' '$STAGE/install.sh' '$STAGE/backups.ready'"
+rcmd "rm -f '$STAGE/agent.new' '$STAGE/agent.ready' '$STAGE/supervisor.new' '$STAGE/supervisor.ready' '$STAGE/start.sh' '$STAGE/start.ready' '$STAGE/rc.local.new' '$STAGE/install.sh' '$STAGE/backups.ready'"
 
 # ── Step 9: Optional SSH setup ──────────────────────────────────────
 if [ "$SKIP_SSH" = true ]; then
@@ -614,7 +631,7 @@ echo ""
 echo -e "${GREEN}Setup complete!${NC}"
 echo ""
 echo "  Agent API:  http://$GATEWAY:$AGENT_PORT"
-echo "  Web UI:     http://$GATEWAY:$AGENT_PORT/ui/"
+echo "  Console:    http://$GATEWAY:$AGENT_PORT/console/"
 if [ "$FACTORY_PASSWORD" = true ]; then
     echo "  Login:      official router admin password (restart agent after changing it)"
     echo "  Update:     ./setup.sh --build --adb --factory-password --no-ssh"
