@@ -53,6 +53,18 @@
     window.dispatchEvent(new Event('dashboard:locked'));
     OpenU60Motion.showDialog(dialog);
   }
+  async function lockConsole() {
+    const retiring = token;
+    lock();
+    const epoch = authEpoch;
+    if (!retiring) return;
+    try {
+      const response = await fetch('/api/auth/logout', {method:'POST', cache:'no-store', credentials:'same-origin', signal:AbortSignal.timeout(8000), headers:{Authorization:`Bearer ${retiring}`}});
+      if (!response.ok && response.status !== 401) throw new Error('logout failed');
+    } catch {
+      if (epoch === authEpoch && locked) $('login-error').textContent = 'This tab is locked, but the router did not confirm sign-out. Existing Zashboard access may remain until that session expires or the agent restarts.';
+    }
+  }
   const bytes = value => {
     const n = number(value);
     if (n === null || n < 0) return '—';
@@ -455,7 +467,7 @@
     finally { button.disabled = false; }
   });
   dialog.addEventListener('cancel', event => event.preventDefault());
-  $('signout').addEventListener('click', lock);
+  $('signout').addEventListener('click', lockConsole);
   $('device-search').addEventListener('input', () => drawClients());
   $('sms-search').addEventListener('input', drawMessages);
   document.addEventListener('visibilitychange', () => {

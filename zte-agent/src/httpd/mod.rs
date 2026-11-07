@@ -459,7 +459,7 @@ impl Drop for PeerSlot {
 /// API fallback (no per-route registration, so there is no automatic 405
 /// and no HEAD-to-GET routing for `/api`).
 pub fn app(ctx: Ctx) -> Router {
-    let router = Router::new().merge(crate::console::router()).fallback(api::api_entry).with_state(ctx);
+    let router = Router::new().merge(crate::console::router()).merge(crate::mihomo::dashboard::router()).fallback(api::api_entry).with_state(ctx);
     #[cfg(test)]
     let router = router.route("/test-upgrade", axum::routing::get(test_upgrade));
     router

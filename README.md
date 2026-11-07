@@ -323,10 +323,12 @@ Switching Clash off or disconnecting Relay clears the respective resume choice.
 An older installation without these markers cannot supply missing intent; saved
 profiles or Wi-Fi credentials alone do not enable either extension. See
 [restart policy](zte-agent/docs/network-extensions.md#after-a-restart).
-Relay and Mihomo are currently controlled through their JSON API
-(`/api/wifi-relay/*`, `/api/mihomo/*`); the responsive console does not have
-pages for them yet, and the former `/ui/relay` and `/ui/router/mihomo` pages
-(including the Zashboard bridge) are no longer served.
+Wi-Fi Relay, Clash / Mihomo and Clash proxies are pages under **Network** in the
+responsive console (`#network/relay`, `#network/mihomo`, `#network/proxies`); the
+same operations remain available through `/api/wifi-relay/*` and `/api/mihomo/*`.
+**Open Zashboard** on the Clash pages opens the pinned dashboard in a new tab,
+already connected to Clash. Old `/ui/relay` and `/ui/router/mihomo` bookmarks open
+the console pages (see [network extensions](zte-agent/docs/network-extensions.md)).
 In factory-password mode, successful login with the actual password is a manual
 check; setup verifies that the factory verifier loaded without reading plaintext.
 

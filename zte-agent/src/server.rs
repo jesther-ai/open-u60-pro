@@ -87,6 +87,7 @@ pub enum Pre {
     Reply(u16, Value),
     /// `POST /api/auth/login`: read at most `LOGIN_BODY_MAX`, needs the peer address.
     Login,
+    Logout { owner: SessionId },
     LanDownload { size: usize },
     LanUpload,
     /// Authenticated JPEG/PNG upload for the bounded eSIM QR decoder.
@@ -94,6 +95,8 @@ pub enum Pre {
     /// `GET /api/events`: a stream for this bearer token.
     Events { owner: SessionId },
     Dashboard,
+    /// `POST /api/mihomo/dashboard`: a Zashboard pass for this console session.
+    DashboardPass { owner: SessionId },
     /// Read at most `body_limit` bytes, then `route()`.
     Dispatch { body_limit: usize },
 }
@@ -131,6 +134,12 @@ pub fn precheck(req: &ReqInfo, env: &PreEnv) -> Pre {
     }
     match (req.method, req.path) {
         (Method::Post, "/api/auth/login") => return Pre::Login,
+        (Method::Post, "/api/auth/logout") => {
+            return match principal {
+                Some(p) if !p.is_local() => Pre::Logout { owner: p.id },
+                _ => refuse(403, "logout needs a login token"),
+            };
+        }
         // Answered here, without a hand-off, so the RTT measurement stays honest.
         (Method::Get, "/api/lan/ping") => {
             let (status, body) = lan_test::ping();
@@ -152,6 +161,13 @@ pub fn precheck(req: &ReqInfo, env: &PreEnv) -> Pre {
         // they need a password.
         (Method::Get, "/api/dashboard/events") => {
             return if principal.is_some() { Pre::Dashboard } else { refuse(403,"agent password required") };
+        }
+        (Method::Post, "/api/mihomo/dashboard") => {
+            return match principal {
+                Some(p) if !p.is_local() => Pre::DashboardPass { owner: p.id },
+                Some(_) => refuse(403, "the dashboard needs a login token"),
+                None => refuse(403, "agent password required"),
+            };
         }
         (Method::Get, "/api/events") => {
             return match principal {
@@ -213,7 +229,8 @@ pub fn lane(method: Method, path: &str) -> Lane {
     use Method::{Delete, Get, Post, Put};
     let slow = match (method, path) {
         (Post, "/api/router/reservations") => true,
-        (Get, "/api/mihomo/status" | "/api/mihomo/profiles" | "/api/wifi-relay/status") => false,
+        (Get, "/api/mihomo/status" | "/api/mihomo/profiles" | "/api/mihomo/extensions" | "/api/wifi-relay/status") => false,
+        (Get, p) if p.starts_with("/api/mihomo/profiles/") => false,
         (_, p) if p.starts_with("/api/mihomo/") || p.starts_with("/api/wifi-relay/") => true,
         (Get, "/api/network/client-details") => true,
         (Get, "/api/esim/switch")
@@ -484,7 +501,13 @@ fn route_inner(method: &Method, path: &str, state: &AppState, body: &[u8]) -> (u
         (&Method::Get, "/api/router/reservations") => crate::dhcp_reservations::status(state),
         (&Method::Post, "/api/router/reservations") => crate::dhcp_reservations::change(state, body),
         (&Method::Get, "/api/mihomo/profiles") => crate::mihomo::profiles::status(state),
+        (&Method::Get, "/api/mihomo/extensions") => crate::mihomo::profiles::extensions(state),
+        (&Method::Get, p) if p.starts_with("/api/mihomo/profiles/") => crate::mihomo::profiles::editor(state, &p["/api/mihomo/profiles/".len()..]),
         (&Method::Post, "/api/mihomo/profiles") => crate::mihomo::profiles::change(state, body),
+        (&Method::Get, "/api/mihomo/proxies") => crate::mihomo::control::proxies(state),
+        (&Method::Post, "/api/mihomo/proxies/select") => crate::mihomo::control::select(state, body),
+        (&Method::Post, "/api/mihomo/proxies/delay") => crate::mihomo::control::delay(state, body),
+        (&Method::Post, "/api/mihomo/mode") => crate::mihomo::control::mode(state, body),
         (&Method::Post, "/api/mihomo/install") => crate::mihomo::change(state, "install", body),
         (&Method::Put, "/api/mihomo/config") => crate::mihomo::change(state, "config", body),
         (&Method::Post, "/api/mihomo/switch") => crate::mihomo::change(state, "switch", body),
@@ -823,5 +846,34 @@ mod tests {
     fn ota_download_uses_the_slow_lane_without_blocking_status() {
         assert_eq!(lane(Method::Post, "/api/update/download"), Lane::Slow);
         assert_eq!(lane(Method::Get, "/api/update/status"), Lane::General);
+    }
+
+    #[test]
+    fn console_reads_of_mihomo_state_stay_quick_and_every_change_is_slow() {
+        for path in ["/api/mihomo/status", "/api/mihomo/profiles", "/api/mihomo/extensions", "/api/mihomo/profiles/0a1b2c3d", "/api/wifi-relay/status"] {
+            assert_eq!(lane(Method::Get, path), Lane::General, "{path}");
+        }
+        for (method, path) in [
+            (Method::Get, "/api/mihomo/proxies"),
+            (Method::Post, "/api/mihomo/proxies/select"),
+            (Method::Post, "/api/mihomo/proxies/delay"),
+            (Method::Post, "/api/mihomo/mode"),
+            (Method::Post, "/api/mihomo/profiles"),
+            (Method::Post, "/api/wifi-relay/connect"),
+            (Method::Post, "/api/wifi-relay/scan"),
+        ] {
+            assert_eq!(lane(method, path), Lane::Slow, "{path}");
+        }
+    }
+
+    #[test]
+    fn mihomo_editors_validate_ids_and_never_serve_other_methods() {
+        let state = AppState::new();
+        for bad in ["", "../etc", "a b", "x%2Fy", &"a".repeat(65)] {
+            let (status, _) = route(&Method::Get, &format!("/api/mihomo/profiles/{bad}"), &state, b"");
+            assert_eq!(status, 400, "{bad:?}");
+        }
+        assert_eq!(route(&Method::Get, "/api/mihomo/profiles/0a1b2c3d4e5f6071", &state, b"").0, 404);
+        assert_eq!(route(&Method::Delete, "/api/mihomo/profiles/0a1b2c3d4e5f6071", &state, b"").0, 404);
     }
 }

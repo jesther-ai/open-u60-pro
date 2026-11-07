@@ -104,9 +104,9 @@ mod tests {
         }
         if let Ok(out) = std::env::var("U60_WEB_QA_DIR") {
             let mut response = axum::response::Response::new(axum::body::Body::empty());
-            crate::web::mihomo::secure_dashboard(&mut response);
+            crate::mihomo::dashboard::secure_dashboard(&mut response);
             let info = serde_json::json!({
-                "location": crate::web::mihomo::dashboard_link(),
+                "location": crate::mihomo::dashboard::dashboard_link(),
                 "csp": response.headers()[axum::http::header::CONTENT_SECURITY_POLICY].to_str().unwrap(),
             });
             std::fs::write(std::path::Path::new(&out).join("dashboard-entry.json"), serde_json::to_vec(&info).unwrap()).unwrap();

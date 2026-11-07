@@ -7,7 +7,7 @@ use std::net::IpAddr;
 use std::net::Ipv6Addr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -16,13 +16,37 @@ use super::{IFACE, JOURNAL, PREF, ROOT, TABLE};
 use crate::boottime::{BootClock, Clock};
 use crate::net_tools::{self as net, Cmd, Step, Transaction};
 
-const RA_STATE: &str = "ra.json";
 const TAILNET: &str = "fd7a:115c:a1e0::/48";
 // A client may keep a previously advertised address after the vendor removes
 // it from br-lan. Keep only a bounded, session-owned return route, not the old
 // vendor address/configuration. Never carry this observation across reboot.
 const LAN_GRACE: u64 = 7200;
+/// Lifetimes count down in the kernel, so an unchanged lease only needs its
+/// address/route lifetimes and the RA overlay re-asserted now and then. The
+/// LAN ULA address (valid 180 s, preferred 90 s) and RA router lifetime
+/// (90 s) bound the interval; a short upstream lifetime refreshes every tick.
+const MAINTAIN_EVERY: Duration = Duration::from_secs(15);
+/// Consecutive ticks whose inspection reads fail before the path is withdrawn.
+const UNREADABLE_TICKS: u8 = 3;
 mod ra;
+
+/// Why checking an unchanged path failed.
+#[derive(Debug)]
+enum Fault {
+    /// A device read failed. Nothing shows that the owned path changed, so it
+    /// is kept and the check retried (`UNREADABLE_TICKS`).
+    Unreadable(String),
+    /// An owned object conflicts with another writer or cannot be restored.
+    Conflict(String),
+}
+
+impl Fault {
+    fn message(self) -> String {
+        match self {
+            Self::Unreadable(e) | Self::Conflict(e) => e,
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct Address {
@@ -58,6 +82,25 @@ struct Lease {
 
 fn now() -> u64 {
     BootClock.now().as_secs()
+}
+
+/// Whether an unchanged lease is due for its periodic lifetime/RA refresh.
+/// `shortest` is the first finite upstream lifetime in seconds.
+fn maintenance_due(last: Option<Instant>, now: Instant, shortest: u32) -> bool {
+    last.is_none_or(|at| now.saturating_duration_since(at) >= MAINTAIN_EVERY)
+        || u64::from(shortest) <= 3 * MAINTAIN_EVERY.as_secs()
+}
+
+// A renewal must reach the kernel even when its new lifetime is long: the
+// previously installed short lifetime may expire before the next periodic tick.
+fn lease_maintenance_due(
+    last: Option<Instant>,
+    now: Instant,
+    installed: Option<&Lease>,
+    received: Option<&Lease>,
+    live: &Lease,
+) -> bool {
+    installed != received || maintenance_due(last, now, live.shortest_lifetime())
 }
 
 fn usable(address: Ipv6Addr) -> bool {
@@ -174,6 +217,18 @@ fn parse_lease(get: impl Fn(&str) -> String, received: u64) -> Lease {
 }
 
 impl Lease {
+    /// Seconds until the first finite lifetime of this (already remaining) lease ends.
+    fn shortest_lifetime(&self) -> u32 {
+        self.addresses
+            .iter()
+            .flat_map(|a| [a.valid, a.preferred])
+            .chain(self.routers.iter().map(|r| r.valid))
+            .chain(self.onlink.iter().map(|r| r.valid))
+            .filter(|&n| n != u32::MAX)
+            .min()
+            .unwrap_or(u32::MAX)
+    }
+
     fn remaining(&self, current: u64) -> Self {
         let elapsed = current
             .saturating_sub(self.received)
@@ -258,6 +313,11 @@ pub struct Upstream {
     lan_observed: BTreeMap<String, u64>,
     lan_sources: Vec<String>,
     local: Vec<IpAddr>,
+    maintained: Option<Instant>,
+    rules_checked: Option<Instant>,
+    rdns_table: &'static str,
+    /// Consecutive ticks whose inspection reads failed (`Fault::Unreadable`).
+    unreadable: u8,
 }
 
 pub fn off_status() -> Value {
@@ -282,6 +342,10 @@ impl Upstream {
             lan_observed: BTreeMap::new(),
             lan_sources: Vec::new(),
             local: Vec::new(),
+            maintained: None,
+            rules_checked: None,
+            rdns_table: "filter",
+            unreadable: 0,
         }
     }
 
@@ -309,9 +373,7 @@ impl Upstream {
         let attempt = (|| {
             capabilities()?;
             net::reserve("ip6tables", "filter", &["U60_R6_IN"], "-6", TABLE, PREF)?;
-            for step in setup_plan() {
-                self.setup.apply(step)?;
-            }
+            self.setup.apply_network(setup_plan())?;
             let mut nonce = [0u8; 16];
             getrandom::getrandom(&mut nonce).map_err(|_| "Cannot create IPv6 relay session")?;
             let session = nonce.iter().map(|b| format!("{b:02x}")).collect::<String>();
@@ -343,19 +405,25 @@ impl Upstream {
     }
 
     pub fn tick(&mut self) -> Result<(), String> {
+        // Only effective upstream identity/availability belongs to the core.
+        // Repairs and LAN exemptions must not redial all proxy transports.
+        let before = self.path.as_ref().map(upstream_identity);
+        let revision = self.revision;
         if let Err(error) = self.tick_inner() {
             // Only an unsafe, failed undo may propagate to the relay owner.
             // Ordinary RA/lease errors withdraw IPv6, not working IPv4.
             self.network.rollback()?;
-            if self.installed.take().is_some() {
-                self.revision = self.revision.wrapping_add(1);
-            }
+            self.installed = None;
             self.path = None;
             self.lan_prefix = None;
             self.ra_mtu = None;
             self.phase = "error";
+            self.unreadable = 0;
             self.error = Some(format!("{error}; IPv4 relay remains active"));
         }
+        self.revision = revision.wrapping_add(u64::from(
+            before != self.path.as_ref().map(upstream_identity),
+        ));
         Ok(())
     }
 
@@ -380,7 +448,6 @@ impl Upstream {
         if live.is_none() {
             if self.installed.is_some() {
                 self.network.rollback()?;
-                self.revision = self.revision.wrapping_add(1);
                 self.installed = None;
                 self.path = None;
                 self.lan_prefix = None;
@@ -402,10 +469,22 @@ impl Upstream {
         let sources: Vec<_> = self.lan_observed.keys().cloned().collect();
         if self.path.as_ref().is_some_and(|p| same_path(p, &live))
             && sources == self.lan_sources
-            && local == self.local
             && self.ra_mtu == Some(ra_mtu)
         {
-            maintain_ra()?;
+            // Checks stay prompt; only redundant lifetime writes are throttled.
+            let checked = self.check_owned(&live, &sources, &local);
+            self.tolerate(checked)?;
+            if !lease_maintenance_due(
+                self.maintained,
+                Instant::now(),
+                self.installed.as_ref(),
+                lease.as_ref(),
+                &live,
+            ) {
+                self.installed = lease;
+                self.path = Some(live);
+                return Ok(());
+            }
             let ula = self.lan_prefix.as_ref().unwrap();
             let address = Ipv6Addr::from(u128::from(cidr(ula).unwrap().0) + 1);
             let refreshed = refresh_path(&live).and_then(|_| {
@@ -432,26 +511,27 @@ impl Upstream {
             if refreshed.is_ok() {
                 self.installed = lease;
                 self.path = Some(live);
+                self.maintained = Some(Instant::now());
                 return Ok(());
             }
             // A delayed watchdog may find the old finite address/route already
             // expired. Rebuild only IPv6; this is not an IPv4 relay failure.
         }
         self.network.rollback()?;
-        self.revision = self.revision.wrapping_add(1);
         self.installed = None;
         self.path = None;
         self.lan_prefix = None;
         self.ra_mtu = None;
         match self.configure(&live, ra_mtu) {
             Ok(lan_prefix) => {
-                self.revision = self.revision.wrapping_add(1);
                 self.installed = lease;
                 self.path = Some(live);
                 self.lan_prefix = Some(lan_prefix);
                 self.ra_mtu = Some(ra_mtu);
                 self.phase = "configured";
                 self.error = None;
+                self.maintained = Some(Instant::now());
+                self.unreadable = 0;
             }
             Err(e) => {
                 self.network.rollback()?;
@@ -463,8 +543,187 @@ impl Upstream {
         Ok(())
     }
 
+    /// Each active tick of an unchanged path: RA ownership, owned addresses,
+    /// routes and policy rule, and (when addresses change or the audit is due)
+    /// the local DNS exemptions. Missing objects are re-added with their
+    /// existing undo records; none of this changes the upstream identity.
+    fn check_owned(
+        &mut self,
+        live: &Lease,
+        sources: &[String],
+        local: &[IpAddr],
+    ) -> Result<(), Fault> {
+        maintain_ra()?;
+        self.repair_addresses(live)?;
+        self.repair_routes(live, sources)?;
+        if local != self.local
+            || self
+                .rules_checked
+                .is_none_or(|at| at.elapsed() >= net::EXEMPTION_AUDIT)
+        {
+            self.follow_local(local)?;
+            self.rules_checked = Some(Instant::now());
+        }
+        Ok(())
+    }
+
+    /// A failed read is not evidence that the owned path changed: keep it for
+    /// a few ticks (lifetime maintenance continues) instead of withdrawing
+    /// IPv6 and restarting the core twice. A conflict, or reads that keep
+    /// failing, withdraw it.
+    fn tolerate(&mut self, checked: Result<(), Fault>) -> Result<(), String> {
+        match checked {
+            Ok(()) => {
+                if self.unreadable > 0 {
+                    self.unreadable = 0;
+                    self.error = None;
+                }
+                Ok(())
+            }
+            Err(Fault::Unreadable(e)) if self.unreadable + 1 < UNREADABLE_TICKS => {
+                self.unreadable += 1;
+                eprintln!(
+                    "[relay-ipv6] owned path check unavailable ({}/{UNREADABLE_TICKS}); path kept",
+                    self.unreadable
+                );
+                self.error = Some(format!("{e}; IPv6 relay path kept, retrying"));
+                Ok(())
+            }
+            Err(fault) => Err(fault.message()),
+        }
+    }
+
+    fn follow_local(&mut self, local: &[IpAddr]) -> Result<(), Fault> {
+        let current: Vec<_> = local.iter().copied().filter(IpAddr::is_ipv6).collect();
+        let previous: Vec<_> = self.local.iter().copied().filter(IpAddr::is_ipv6).collect();
+        for (table, chain) in [("nat", "U60_R6_DNS"), (self.rdns_table, "U60_R6_RDNS")] {
+            let present = net::firewall::exclusions("ip6tables", table, chain, "ACCEPT")
+                .map_err(Fault::Unreadable)?;
+            let rule = |address: &IpAddr| {
+                net::rule(
+                    "ip6tables",
+                    table,
+                    chain,
+                    &["-d", &address.to_string(), "-j", "ACCEPT"],
+                    true,
+                )
+            };
+            net::sync_exemptions(&mut self.network, &present, &current, &previous, rule)
+                .map_err(Fault::Conflict)?;
+        }
+        self.local = local.to_vec();
+        Ok(())
+    }
+
+    fn repair_addresses(&mut self, lease: &Lease) -> Result<(), Fault> {
+        let text = Cmd::new("ip", &["-j", "-6", "addr", "show"])
+            .run()
+            .map_err(Fault::Unreadable)?;
+        let interfaces: Vec<Value> = serde_json::from_str(&text)
+            .map_err(|_| Fault::Unreadable("Cannot inspect owned IPv6 addresses".into()))?;
+        let ula = self.lan_prefix.as_ref().unwrap();
+        let lan = Ipv6Addr::from(u128::from(cidr(ula).unwrap().0) + 1);
+        let expected = lease
+            .addresses
+            .iter()
+            .map(|a| (a.address, 128, IFACE, a.valid, a.preferred))
+            .chain(std::iter::once((lan, 64, "br-lan", 180, 90)));
+        let mut dad = Vec::new();
+        for (ip, prefix, iface, valid, preferred) in expected {
+            let text = ip.to_string();
+            let present = interfaces
+                .iter()
+                .filter(|i| i["ifname"] == iface)
+                .filter_map(|i| i["addr_info"].as_array())
+                .flatten()
+                .find(|a| a["local"].as_str().and_then(|s| s.parse::<Ipv6Addr>().ok()) == Some(ip));
+            if present.is_some_and(|a| {
+                a["prefixlen"].as_u64() != Some(u64::from(prefix)) || a["dadfailed"] == true
+            }) {
+                return Err(Fault::Conflict(
+                    "An owned IPv6 address changed externally".into(),
+                ));
+            }
+            if present.is_none() {
+                self.network
+                    .ensure(address_step(ip, prefix, iface, valid, preferred))
+                    .map_err(Fault::Conflict)?;
+                if iface == IFACE {
+                    dad.push(text);
+                }
+            }
+        }
+        if !dad.is_empty() {
+            wait_addresses(&dad).map_err(Fault::Conflict)?;
+        }
+        Ok(())
+    }
+
+    fn repair_routes(&mut self, lease: &Lease, sources: &[String]) -> Result<(), Fault> {
+        let routes: Vec<Value> =
+            match Cmd::new("ip", &["-j", "-6", "route", "show", "table", TABLE]).run() {
+                Ok(text) => serde_json::from_str(&text)
+                    .map_err(|_| Fault::Unreadable("Cannot inspect owned IPv6 routes".into()))?,
+                // Deleting every route removes the table itself: all are missing.
+                Err(e) => match net::route_table_listed("-6", TABLE) {
+                    Ok(false) => Vec::new(),
+                    Ok(true) | Err(_) => return Err(Fault::Unreadable(e)),
+                },
+            };
+        let mut all_sources = sources.to_vec();
+        if let Some(ula) = &self.lan_prefix {
+            if !all_sources.contains(ula) {
+                all_sources.push(ula.clone());
+            }
+        }
+        let expected = network_plan(
+            lease,
+            self.lan_prefix.as_ref().unwrap(),
+            &all_sources,
+            false,
+            &[],
+        )
+        .into_iter()
+        .filter(|s| s.apply.program == "ip" && s.apply.args.get(1).is_some_and(|v| v == "route"));
+        for step in expected {
+            let (_, destination) = net::route_target(&step.apply.args);
+            let existing: Vec<_> = routes
+                .iter()
+                .filter(|r| r["dst"].as_str() == Some(destination))
+                .collect();
+            if existing.is_empty() {
+                // `add`, not `replace`: never overwrite a route racing this read.
+                self.network.ensure(step).map_err(Fault::Conflict)?;
+            } else if existing.iter().any(|r| !route_matches(r, &step.apply)) {
+                return Err(Fault::Conflict(
+                    "An owned IPv6 route changed externally".into(),
+                ));
+            }
+        }
+        match net::plain_policy_rule("-6", PREF, TABLE).map_err(Fault::Unreadable)? {
+            net::PolicyRule::Missing => self
+                .network
+                .ensure(net::ip_step("-6", "rule", &["pref", PREF, "lookup", TABLE]))
+                .map_err(Fault::Conflict)?,
+            net::PolicyRule::Owned => {}
+            net::PolicyRule::Foreign | net::PolicyRule::Shared => {
+                return Err(Fault::Conflict(
+                    "IPv6 policy priority belongs to another writer".into(),
+                ))
+            }
+        }
+        Ok(())
+    }
+
     fn configure(&mut self, lease: &Lease, mtu: u32) -> Result<String, String> {
-        net::reserve("ip6tables", "filter", &["U60_R6_FWD"], "-6", TABLE, PREF)?;
+        net::reserve(
+            "ip6tables",
+            "filter",
+            &["U60_R6_FWD", "U60_R6_OUT"],
+            "-6",
+            TABLE,
+            PREF,
+        )?;
         for chain in ["U60_R6_NAT", "U60_R6_DNS", "U60_R6_RDNS"] {
             if Cmd::new("ip6tables", &["-w", "2", "-t", "nat", "-S", chain])
                 .run()
@@ -532,6 +791,7 @@ impl Upstream {
         }
         let local = Cmd::new("ip", &["-j", "-6", "addr", "show"]).run()?;
         let dns_lease = safe_dns_lease(lease, &sources, &local)?;
+        self.rdns_table = rdns_table(&dns_lease);
         let mihomo_dns = Cmd::new(
             "ip6tables",
             &[
@@ -549,15 +809,13 @@ impl Upstream {
         )
         .run()
         .is_ok();
-        for step in network_plan(
+        self.network.apply_network(network_plan(
             &dns_lease,
             &ula,
             &sources,
             mihomo_dns,
             &net::local_addresses()?,
-        ) {
-            self.network.apply(step)?;
-        }
+        ))?;
         let route = Cmd::new("ip", &["-6", "route", "get", "2606:4700:4700::1111"]).run()?;
         if !route.contains(&format!("dev {IFACE}")) {
             return Err("IPv6 routing did not select Wi-Fi".into());
@@ -580,6 +838,9 @@ impl Upstream {
         self.lan_prefix = None;
         self.ra_mtu = None;
         self.phase = "off";
+        self.maintained = None;
+        self.rules_checked = None;
+        self.unreadable = 0;
         self.lan_observed.clear();
         self.lan_sources.clear();
         self.local.clear();
@@ -857,6 +1118,17 @@ fn lan_route(source: &str, action: &str) -> Cmd {
     )
 }
 
+fn upstream_identity(lease: &Lease) -> (Vec<(Ipv6Addr, u8)>, Option<Ipv6Addr>) {
+    (
+        lease
+            .addresses
+            .iter()
+            .map(|a| (a.address, a.prefix))
+            .collect(),
+        lease.routers.first().map(|r| r.address),
+    )
+}
+
 fn same_path(a: &Lease, b: &Lease) -> bool {
     a.addresses
         .iter()
@@ -1024,6 +1296,42 @@ fn addresses_ready(text: &str, addresses: &[String]) -> Result<bool, String> {
     Ok(true)
 }
 
+fn route_matches(route: &Value, command: &Cmd) -> bool {
+    let args = &command.args;
+    let field = |name: &str| {
+        args.windows(2)
+            .find(|a| a[0] == name)
+            .map(|a| a[1].as_str())
+    };
+    // The kernel reports an implicit dev=lo on throw routes; it was not an
+    // interface selected by this plan and must not look like an external edit.
+    field("dev").is_none_or(|dev| route["dev"].as_str() == Some(dev))
+        && route["gateway"].as_str() == field("via")
+        && route["type"].as_str().unwrap_or("unicast") == net::route_target(args).0
+}
+
+fn address_step(ip: Ipv6Addr, prefix: u8, iface: &str, valid: u32, preferred: u32) -> Step {
+    let address = format!("{ip}/{prefix}");
+    let mut step = net::ip_step(
+        "-6",
+        "addr",
+        &[
+            &address,
+            "dev",
+            iface,
+            "valid_lft",
+            &valid.to_string(),
+            "preferred_lft",
+            &preferred.to_string(),
+        ],
+    );
+    if iface == IFACE {
+        step.apply.args.push("noprefixroute".into());
+    }
+    step.undo = Cmd::new("ip", &["-6", "addr", "del", &address, "dev", iface]);
+    step
+}
+
 fn network_plan(
     l: &Lease,
     ula: &str,
@@ -1037,51 +1345,13 @@ fn network_plan(
     local.dedup();
     let mut p = Vec::new();
     for a in &l.addresses {
-        // /128 noprefixroute avoids any new kernel route in the main table.
-        let mut step = net::ip_step(
-            "-6",
-            "addr",
-            &[
-                &format!("{}/128", a.address),
-                "dev",
-                IFACE,
-                "noprefixroute",
-                "valid_lft",
-                &a.valid.to_string(),
-                "preferred_lft",
-                &a.preferred.to_string(),
-            ],
-        );
-        step.undo = Cmd::new(
-            "ip",
-            &[
-                "-6",
-                "addr",
-                "del",
-                &format!("{}/128", a.address),
-                "dev",
-                IFACE,
-            ],
-        );
-        p.push(step);
+        p.push(address_step(a.address, 128, IFACE, a.valid, a.preferred));
     }
     let mut dad = Cmd::new("@u60-relay-ipv6-dad", &[]);
     dad.args = l.addresses.iter().map(|a| a.address.to_string()).collect();
     p.push(Step::new(dad, Cmd::new("true", &[])));
     let lan_address = Ipv6Addr::from(u128::from(cidr(ula).unwrap().0) + 1);
-    p.push(net::ip_step(
-        "-6",
-        "addr",
-        &[
-            &format!("{lan_address}/64"),
-            "dev",
-            "br-lan",
-            "valid_lft",
-            "180",
-            "preferred_lft",
-            "90",
-        ],
-    ));
+    p.push(address_step(lan_address, 64, "br-lan", 180, 90));
     p.push(net::ip_step(
         "-6",
         "route",
@@ -1153,11 +1423,21 @@ fn network_plan(
         &["-o", IFACE, "-j", "U60_R6_NAT"],
         true,
     ));
+    // Keep broad rejects inside an exclusive chain so prejournaled undo
+    // cannot delete an identical vendor rule that predates this transaction.
+    p.extend(net::chain("ip6tables", "filter", "U60_R6_OUT"));
+    p.push(net::rule(
+        "ip6tables",
+        "filter",
+        "U60_R6_OUT",
+        &["-o", "rmnet+", "-j", "REJECT"],
+        false,
+    ));
     p.push(net::rule(
         "ip6tables",
         "filter",
         "OUTPUT",
-        &["-o", "rmnet+", "-j", "REJECT"],
+        &["-j", "U60_R6_OUT"],
         true,
     ));
     p.extend(net::chain("ip6tables", "filter", "U60_R6_FWD"));
@@ -1236,12 +1516,8 @@ fn network_plan(
     }
     // Local management DNS is not rewritten; other router DNS follows
     // the Wi-Fi RDNSS instead of the vendor's SIM-only resolver.
-    let upstream_dns = l.dns.iter().find(|a| !a.is_unicast_link_local());
-    let dns_table = if upstream_dns.is_some() {
-        "nat"
-    } else {
-        "filter"
-    };
+    let upstream_dns = upstream_dns(l);
+    let dns_table = rdns_table(l);
     p.extend(net::chain("ip6tables", dns_table, "U60_R6_RDNS"));
     for dest in ["::1/128", TAILNET, "fe80::/10"]
         .into_iter()
@@ -1323,20 +1599,6 @@ fn network_plan(
     p
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-struct OptionState {
-    key: String,
-    list: bool,
-    original: Option<String>,
-    applied: Option<String>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct RaState {
-    boot: String,
-    options: Vec<OptionState>,
-}
-
 fn boot_id() -> String {
     fs::read_to_string("/proc/sys/kernel/random/boot_id")
         .unwrap_or_default()
@@ -1344,26 +1606,7 @@ fn boot_id() -> String {
         .into()
 }
 
-#[cfg(test)]
-fn ra_options(ula: &str, dns: Ipv6Addr) -> Vec<(&'static str, bool, Option<String>)> {
-    vec![
-        ("ra", false, Some("server".into())),
-        ("dhcpv6", false, Some("disabled".into())),
-        ("ndp", false, Some("disabled".into())),
-        ("ra_slaac", false, Some("1".into())),
-        ("ra_default", false, Some("2".into())),
-        ("ra_lifetime", false, Some("90".into())),
-        ("ra_mininterval", false, Some("10".into())),
-        ("ra_maxinterval", false, Some("30".into())),
-        ("ra_flags", true, Some("none".into())),
-        ("ra_mtu", false, Some("1280".into())),
-        ("ra_useleasetime", false, Some("0".into())),
-        ("prefix_filter", false, Some(ula.into())),
-        ("ra_dns", false, Some("1".into())),
-        ("dns", true, Some(dns.to_string())),
-    ]
-}
-
+#[cfg(all(test, target_os = "linux"))]
 fn read_option(key: &str) -> Result<Option<String>, String> {
     let all = Cmd::new("uci", &["-q", "show", "dhcp.lan"]).run()?;
     if !all
@@ -1377,23 +1620,6 @@ fn read_option(key: &str) -> Result<Option<String>, String> {
         .map(Some)
 }
 
-fn write_option(key: &str, list: bool, value: &Option<String>) -> Result<(), String> {
-    let name = format!("dhcp.lan.{key}");
-    if (list || value.is_none()) && read_option(key)?.is_some() {
-        Cmd::new("uci", &["-q", "delete", &name]).run()?;
-    }
-    if let Some(value) = value {
-        if list {
-            for part in value.split_whitespace() {
-                Cmd::new("uci", &["add_list", &format!("{name}={part}")]).run()?;
-            }
-        } else {
-            Cmd::new("uci", &["set", &format!("{name}={value}")]).run()?;
-        }
-    }
-    Ok(())
-}
-
 fn reload_ra() -> Result<(), String> {
     Cmd::new("/etc/init.d/odhcpd", &["reload"])
         .run()
@@ -1402,7 +1628,10 @@ fn reload_ra() -> Result<(), String> {
 
 fn ra_step(ula: &str, dns: Ipv6Addr, mtu: u32) -> Step {
     Step::new(
-        Cmd::new("@u60-relay-ra", &["apply", ula, &dns.to_string(), &mtu.to_string()]),
+        Cmd::new(
+            "@u60-relay-ra",
+            &["apply", ula, &dns.to_string(), &mtu.to_string()],
+        ),
         Cmd::new("@u60-relay-ra", &["restore"]),
     )
 }
@@ -1425,312 +1654,28 @@ pub fn ra_command(args: &[String]) -> Result<(), String> {
 }
 
 fn ra_restore() -> Result<(), String> {
-    // Compatibility only: remove previously committed relay values once.
-    // New sessions never create this historical UCI snapshot.
-    legacy_ra_restore()?;
     ra::release()
 }
 
-#[cfg(all(test, target_os = "linux"))]
-fn legacy_ra_command(args: &[String]) -> Result<(), String> {
-    match args {
-        [action] if action == "restore" => ra_restore(),
-        [action, ula, dns]
-            if action == "apply"
-                && cidr(ula).is_some_and(|(a, p)| a.octets()[0] == 0xfd && p == 64) =>
-        {
-            let dns: Ipv6Addr = dns.parse().map_err(|_| "Invalid LAN RA DNS")?;
-            if !dns.is_unicast_link_local() {
-                return Err("LAN RA DNS must be link-local".into());
-            }
-            let path = Path::new(JOURNAL).join(RA_STATE);
-            if path.exists()
-                || !Cmd::new("uci", &["-q", "changes", "dhcp"])
-                    .run()?
-                    .is_empty()
-            {
-                return Err("DHCP settings changed; IPv6 RA was not taken over".into());
-            }
-            let mut options = Vec::new();
-            for (key, list, applied) in ra_options(ula, dns) {
-                options.push(OptionState {
-                    key: key.into(),
-                    list,
-                    original: read_option(key)?,
-                    applied,
-                });
-            }
-            let state = RaState {
-                boot: boot_id(),
-                options,
-            };
-            net::write_private(&path, &serde_json::to_vec(&state).unwrap())?;
-            for o in &state.options {
-                write_option(&o.key, o.list, &o.applied)?;
-            }
-            reload_ra()
-        }
-        _ => Err("Invalid IPv6 RA recovery command".into()),
+/// The first upstream resolver router DNS is redirected to (link-local RDNSS
+/// cannot be a DNAT target from the router).
+fn upstream_dns(l: &Lease) -> Option<Ipv6Addr> {
+    l.dns.iter().copied().find(|a| !a.is_unicast_link_local())
+}
+
+/// Where `U60_R6_RDNS` lives: NAT redirects to `upstream_dns`; without one the
+/// filter table rejects router DNS so IPv4 DNS is used. The plan and the
+/// exemption audit must agree, or the audit reads the wrong table.
+fn rdns_table(l: &Lease) -> &'static str {
+    if upstream_dns(l).is_some() {
+        "nat"
+    } else {
+        "filter"
     }
 }
 
-fn legacy_ra_restore() -> Result<(), String> {
-    let path = Path::new(JOURNAL).join(RA_STATE);
-    if !path.exists() {
-        return Ok(());
-    }
-    let state: RaState =
-        serde_json::from_slice(&fs::read(&path).map_err(|_| "Cannot read RA recovery")?)
-            .map_err(|_| "Invalid RA recovery snapshot")?;
-    if !state.boot.is_empty() && state.boot != boot_id() {
-        // Runtime overlays vanished. Keep the vendor's new boot baseline,
-        // repairing only exact persisted relay values, never missing lists.
-        if restore_committed_ra(&state, true)? {
-            reload_ra()?;
-        }
-        return fs::remove_file(path).map_err(|e| e.to_string());
-    }
-    // A cellular toggle may rewrite only some options and commit our other
-    // deltas. Release changed options individually; never let one vendor/user
-    // edit strand all owned NAT/routes or overwrite its new value.
-    let mut external = Vec::new();
-    for o in &state.options {
-        if !option_owned(o, &read_option(&o.key)?) {
-            external.push(o.key.as_str());
-        }
-    }
-    restore_committed_ra(&state, false)?;
-    if !external.contains(&"ra_lifetime") {
-        write_option("ra_lifetime", false, &Some("0".into()))?;
-        reload_ra()?;
-        std::thread::sleep(Duration::from_millis(1200));
-    }
-    for o in state.options.iter().rev() {
-        if external.contains(&o.key.as_str()) || !option_owned(o, &read_option(&o.key)?) {
-            continue;
-        }
-        // No commit: per-option revert removes our /tmp/.uci delta without
-        // discarding any other option's changes. A vendor commit must not
-        // silently turn temporary relay settings into permanent configuration.
-        let name = format!("dhcp.lan.{}", o.key);
-        let _ = Cmd::new("uci", &["-q", "revert", &name]).run();
-        let current = read_option(&o.key)?;
-        if current != o.original && option_owned(o, &current) {
-            return Err("DHCP configuration changed during relay cleanup; retry cleanup".into());
-        }
-    }
-    reload_ra()?;
-    fs::remove_file(path).map_err(|e| e.to_string())
-}
-
-// B31's cellular switch can commit the whole DHCP package, including our
-// temporary options. Repair only owned persisted values, never commit pending
-// global UCI deltas. A random package alias isolates libuci's default delta path.
-fn restore_committed_ra(state: &RaState, after_reboot: bool) -> Result<bool, String> {
-    use std::io::{Read, Write};
-    use std::os::fd::AsRawFd;
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
-
-    let path = Path::new("/etc/config/dhcp");
-    let mut source = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-        .map_err(|_| "Cannot open persistent DHCP configuration")?;
-    if unsafe { libc::flock(source.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        return Err("Persistent DHCP configuration is busy; retry recovery".into());
-    }
-    let metadata = source.metadata().map_err(|e| e.to_string())?;
-    let mut before = Vec::new();
-    Read::by_ref(&mut source)
-        .take(1024 * 1024 + 1)
-        .read_to_end(&mut before)
-        .map_err(|e| e.to_string())?;
-    if before.len() > 1024 * 1024 {
-        return Err("Persistent DHCP configuration is too large".into());
-    }
-    let mut random = [0; 8];
-    getrandom::getrandom(&mut random).map_err(|_| "Cannot create private RA staging")?;
-    let alias = format!(
-        "u60_ra_{}",
-        random
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>()
-    );
-    let stage = Path::new(JOURNAL).join(&alias);
-    fs::DirBuilder::new()
-        .mode(0o700)
-        .create(&stage)
-        .map_err(|e| e.to_string())?;
-    let temporary = Path::new("/etc/config").join(format!(".{alias}.new"));
-    let result = (|| {
-        net::write_private(&stage.join(&alias), &before)?;
-        let deltas = stage.join("deltas");
-        net::private_dir(&deltas)?;
-        let deltas = deltas.to_str().ok_or("Invalid RA delta path")?;
-        let base = stage.to_str().ok_or("Invalid RA staging path")?;
-        let uci = |args: &[&str]| {
-            let mut command = vec!["-c", base, "-t", deltas, "-q"];
-            command.extend_from_slice(args);
-            Cmd::new("uci", &command).run()
-        };
-        let original = uci(&["show", &alias])?;
-        let mut changed = Vec::new();
-        for o in &state.options {
-            let name = format!("{alias}.lan.{}", o.key);
-            let exists = original.lines().any(|l| l.starts_with(&format!("{name}=")));
-            let current = if exists {
-                Some(uci(&["get", &name])?)
-            } else {
-                None
-            };
-            let owned = if after_reboot {
-                current.is_some() && current == o.applied
-            } else {
-                option_owned(o, &current)
-            };
-            if current != o.original && owned {
-                changed.push(o);
-            }
-        }
-        if changed.is_empty() {
-            return Ok(false);
-        }
-        for o in &changed {
-            let name = format!("{alias}.lan.{}", o.key);
-            if original.lines().any(|l| l.starts_with(&format!("{name}="))) {
-                uci(&["delete", &name])?;
-            }
-            if let Some(value) = &o.original {
-                if o.list {
-                    for item in value.split_whitespace() {
-                        uci(&["add_list", &format!("{name}={item}")])?;
-                    }
-                } else {
-                    uci(&["set", &format!("{name}={value}")])?;
-                }
-            }
-        }
-        uci(&["commit", &alias])?;
-        let revised = uci(&["show", &alias])?;
-        let unowned = |text: &str| {
-            let mut map = crate::ubus::uci_show_map(text);
-            for o in &changed {
-                map.remove(&format!("{alias}.lan.{}", o.key));
-            }
-            map
-        };
-        if unowned(&original) != unowned(&revised) {
-            return Err("Unrelated DHCP configuration changed in RA staging".into());
-        }
-        let after = fs::read(stage.join(&alias)).map_err(|e| e.to_string())?;
-        let mut replacement = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&temporary)
-            .map_err(|e| e.to_string())?;
-        replacement.write_all(&after).map_err(|e| e.to_string())?;
-        if unsafe { libc::fchown(replacement.as_raw_fd(), metadata.uid(), metadata.gid()) } != 0 {
-            return Err("Cannot preserve DHCP configuration ownership".into());
-        }
-        replacement
-            .set_permissions(fs::Permissions::from_mode(metadata.mode()))
-            .map_err(|e| e.to_string())?;
-        replacement.sync_all().map_err(|e| e.to_string())?;
-        let current = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
-        if current.ino() != metadata.ino()
-            || current.dev() != metadata.dev()
-            || fs::read(path).map_err(|e| e.to_string())? != before
-        {
-            return Err("DHCP configuration changed during RA recovery; retry".into());
-        }
-        fs::rename(&temporary, path).map_err(|e| e.to_string())?;
-        fs::File::open("/etc/config")
-            .and_then(|dir| dir.sync_all())
-            .map_err(|e| e.to_string())?;
-        Ok(true)
-    })();
-    let _ = fs::remove_file(temporary);
-    let _ = fs::remove_dir_all(stage);
-    result
-}
-
-fn maintain_ra() -> Result<(), String> {
+fn maintain_ra() -> Result<(), Fault> {
     ra::maintain()
-}
-
-#[cfg(all(test, target_os = "linux"))]
-fn legacy_maintain_ra() -> Result<(), String> {
-    let mut state: RaState = serde_json::from_slice(
-        &fs::read(Path::new(JOURNAL).join(RA_STATE))
-            .map_err(|_| "LAN RA ownership snapshot is missing")?,
-    )
-    .map_err(|_| "Invalid LAN RA ownership snapshot")?;
-    let config = crate::ubus::uci_show_map(&Cmd::new("uci", &["-q", "show", "dhcp.lan"]).run()?);
-    let pending = Cmd::new("uci", &["-q", "changes", "dhcp"]).run()?;
-    let mut changes = Vec::new();
-    for (index, o) in state.options.iter_mut().enumerate() {
-        // All applied lists contain exactly one item, so uci_show_map can
-        // compare them without flattening any externally changed list.
-        if config.get(&format!("dhcp.lan.{}", o.key)) != o.applied.as_ref() {
-            let current = read_option(&o.key)?;
-            if pending_option(&pending, &o.key) {
-                return Err("Pending LAN RA edits detected; relay cleanup preserves them".into());
-            }
-            if !option_owned(o, &current) {
-                o.original = current.clone();
-            }
-            changes.push((index, current));
-        }
-    }
-    if !changes.is_empty() {
-        // Preserve the vendor's new baseline before reasserting the temporary
-        // relay overlay. A mobile-data toggle must not disconnect Wi-Fi.
-        net::write_private(
-            &Path::new(JOURNAL).join(RA_STATE),
-            &serde_json::to_vec(&state).unwrap(),
-        )?;
-        for (index, current) in changes {
-            let o = &state.options[index];
-            if read_option(&o.key)? != current {
-                return Err("LAN RA settings changed again during refresh; retry relay".into());
-            }
-            write_option(&o.key, o.list, &o.applied)?;
-        }
-        reload_ra()?;
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-fn pending_option(changes: &str, key: &str) -> bool {
-    let option = format!("dhcp.lan.{key}");
-    changes.lines().any(|line| {
-        let name = line
-            .split('=')
-            .next()
-            .unwrap_or("")
-            .trim_start_matches(['+', '-']);
-        name == option || name == "dhcp.lan" || name == "dhcp"
-    })
-}
-
-fn option_owned(o: &OptionState, current: &Option<String>) -> bool {
-    current == &o.original
-        || current == &o.applied
-        || (o.key == "ra_lifetime" && current.as_deref() == Some("0"))
-        || (o.list
-            && (current.is_none()
-                || current.as_ref().is_some_and(|c| {
-                    [&o.original, &o.applied].into_iter().flatten().any(|v| {
-                        v.starts_with(c)
-                            && (v.len() == c.len() || v.as_bytes().get(c.len()) == Some(&b' '))
-                    })
-                })))
 }
 
 #[cfg(test)]
@@ -1751,6 +1696,203 @@ mod tests {
             },
             100,
         )
+    }
+
+    #[test]
+    fn kernel_implicit_throw_device_is_not_a_foreign_route() {
+        let throw = net::ip_step("-6", "route", &["throw", "ff00::/8", "table", TABLE]);
+        assert!(route_matches(
+            &json!({"type":"throw","dst":"ff00::/8","dev":"lo","metric":1024}),
+            &throw.apply
+        ));
+        let route = default_route(&lease(), "add");
+        assert!(route_matches(
+            &json!({"dst":"default","dev":IFACE,"gateway":"fe80::1"}),
+            &route
+        ));
+        assert!(!route_matches(
+            &json!({"dst":"default","dev":"rmnet_data0","gateway":"fe80::1"}),
+            &route
+        ));
+    }
+
+    #[test]
+    fn prejournaled_undos_cannot_match_a_vendor_cellular_reject() {
+        let plan = network_plan(
+            &lease(),
+            "fd12:3456:789a::/64",
+            &["fd12:3456:789a::/64".into()],
+            false,
+            &[],
+        );
+        let vendor = net::rule(
+            "ip6tables",
+            "filter",
+            "OUTPUT",
+            &["-o", "rmnet+", "-j", "REJECT"],
+            true,
+        );
+        assert!(!plan.iter().any(|step| step.undo == vendor.undo));
+        assert!(plan
+            .iter()
+            .any(|s| s.apply.args.windows(2).any(|a| a == ["-N", "U60_R6_OUT"])));
+        let local = ["2001:db8:2::1".parse().unwrap()];
+        for mihomo_dns in [false, true] {
+            let plan = network_plan(
+                &lease(),
+                "fd12:3456:789a::/64",
+                &["fd12:3456:789a::/64".into()],
+                mihomo_dns,
+                &local,
+            );
+            assert!(
+                net::foreign_identity(&plan).is_empty(),
+                "{:?}",
+                net::foreign_identity(&plan)
+            );
+        }
+        assert!(net::foreign_identity(&setup_plan()).is_empty());
+    }
+
+    #[test]
+    fn the_exemption_audit_reads_the_table_the_plan_used() {
+        let mut linklocal = lease();
+        linklocal.dns = vec!["fe80::53".parse().unwrap()];
+        for l in [lease(), linklocal] {
+            let plan = network_plan(&l, "fd12:3456:789a::/64", &[], false, &[]);
+            let created = plan
+                .iter()
+                .find(|s| s.apply.args.windows(2).any(|w| w == ["-N", "U60_R6_RDNS"]))
+                .unwrap();
+            assert!(
+                created
+                    .apply
+                    .args
+                    .windows(2)
+                    .any(|w| w == ["-t", rdns_table(&l)]),
+                "{l:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unreadable_checks_keep_the_path_for_a_few_ticks_but_conflicts_withdraw_it() {
+        let mut upstream = Upstream::new();
+        for _ in 1..UNREADABLE_TICKS {
+            assert!(upstream
+                .tolerate(Err(Fault::Unreadable("busy".into())))
+                .is_ok());
+        }
+        assert!(upstream
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("path kept")));
+        assert_eq!(
+            upstream
+                .tolerate(Err(Fault::Unreadable("busy".into())))
+                .unwrap_err(),
+            "busy"
+        );
+        upstream.unreadable = 1;
+        upstream.tolerate(Ok(())).unwrap();
+        assert_eq!(
+            (upstream.unreadable, upstream.error.as_deref()),
+            (0, None),
+            "a good read resets the count"
+        );
+        assert_eq!(
+            upstream
+                .tolerate(Err(Fault::Conflict("foreign".into())))
+                .unwrap_err(),
+            "foreign"
+        );
+    }
+
+    #[test]
+    fn core_identity_ignores_maintenance_but_tracks_sources_and_gateway() {
+        let original = lease();
+        let mut changed = original.clone();
+        changed.received += 10;
+        changed.mtu = 1400;
+        changed.dns.clear();
+        changed.addresses[0].valid += 10;
+        assert_eq!(upstream_identity(&original), upstream_identity(&changed));
+        changed.routers[0].address = "fe80::99".parse().unwrap();
+        assert_ne!(upstream_identity(&original), upstream_identity(&changed));
+    }
+
+    #[test]
+    fn renewal_extends_the_kernel_lifetime_before_periodic_maintenance() {
+        let start = Instant::now();
+        let mut old = lease();
+        old.addresses[0].valid = 5;
+        old.addresses[0].preferred = 5;
+        let next = lease();
+        let live = next.remaining(next.received);
+        assert!(same_path(&old, &next));
+        assert!(lease_maintenance_due(
+            Some(start),
+            start + Duration::from_secs(3),
+            Some(&old),
+            Some(&next),
+            &live
+        ));
+        assert!(!lease_maintenance_due(
+            Some(start),
+            start + Duration::from_secs(3),
+            Some(&next),
+            Some(&next),
+            &live
+        ));
+        let mut preferred = live;
+        preferred.addresses[0].preferred = 2;
+        assert_eq!(preferred.shortest_lifetime(), 2);
+    }
+
+    #[test]
+    fn unchanged_leases_are_maintained_on_a_schedule_not_every_tick() {
+        let l = lease();
+        // valid lifetimes in `lease()`: address 1200 s, router 300 s, on-link 1200 s.
+        assert_eq!(l.remaining(100).shortest_lifetime(), 300);
+        assert_eq!(l.remaining(250).shortest_lifetime(), 150);
+        let forever = Lease {
+            addresses: vec![Address {
+                valid: u32::MAX,
+                preferred: u32::MAX,
+                ..l.addresses[0].clone()
+            }],
+            routers: vec![],
+            onlink: vec![],
+            ..l.clone()
+        };
+        assert_eq!(
+            forever.shortest_lifetime(),
+            u32::MAX,
+            "infinite lifetimes never force a refresh"
+        );
+        let start = Instant::now();
+        let tick = Duration::from_secs(3);
+        assert!(
+            maintenance_due(None, start, 300),
+            "first sight after a rebuild or start"
+        );
+        assert!(!maintenance_due(Some(start), start + tick, 300));
+        assert!(!maintenance_due(
+            Some(start),
+            start + MAINTAIN_EVERY - Duration::from_millis(1),
+            300
+        ));
+        assert!(maintenance_due(Some(start), start + MAINTAIN_EVERY, 300));
+        assert!(
+            maintenance_due(Some(start), start + tick, 45),
+            "short upstream lifetimes refresh every tick"
+        );
+        assert!(!maintenance_due(Some(start), start + tick, 46));
+        assert!(!maintenance_due(Some(start), start + tick, u32::MAX));
+        assert!(
+            !maintenance_due(Some(start + tick), start, 300),
+            "a clock step back never forces it"
+        );
     }
 
     #[test]
@@ -2017,50 +2159,6 @@ mod tests {
     }
 
     #[test]
-    fn ra_uses_single_existing_service_and_restores_only_owned_options() {
-        let options = ra_options("fd12:3456:789a::/64", "fe80::1".parse().unwrap());
-        assert!(options
-            .iter()
-            .any(|(k, _, v)| *k == "prefix_filter" && v.as_deref() == Some("fd12:3456:789a::/64")));
-        assert!(options
-            .iter()
-            .any(|(k, _, v)| *k == "dhcpv6" && v.as_deref() == Some("disabled")));
-        let o = OptionState {
-            key: "dns".into(),
-            list: true,
-            original: Some("fe80::1 2001:db8::53".into()),
-            applied: Some("fe80::1".into()),
-        };
-        assert!(option_owned(&o, &None));
-        assert!(option_owned(&o, &Some("fe80::1".into())));
-        assert!(!option_owned(&o, &Some("2001:db8::99".into())));
-        assert!(option_owned(&o, &o.original));
-    }
-
-    #[test]
-    fn pending_ra_edits_are_not_adopted_as_a_committed_vendor_baseline() {
-        for changes in [
-            "dhcp.lan.ra_mtu='1400'",
-            "-dhcp.lan.ra_mtu",
-            "+dhcp.lan.dns='fe80::1'",
-            "-dhcp.lan",
-        ] {
-            assert!(pending_option(
-                changes,
-                if changes.contains("dns") {
-                    "dns"
-                } else {
-                    "ra_mtu"
-                }
-            ));
-        }
-        assert!(!pending_option(
-            "dhcp.lan.ra_mtu='1400'\ndhcp.lan.label='keep'",
-            "dns"
-        ));
-    }
-
-    #[test]
     fn ipv6_lan_parsing_preserves_existing_prefix_and_requires_linklocal_dns() {
         let s = r#"[{"addr_info":[{"local":"2001:db8:2::1","prefixlen":64},{"local":"fe80::1","prefixlen":64}]}]"#;
         let (p, ll) = lan_state(s).unwrap();
@@ -2094,9 +2192,18 @@ mod tests {
         assert_eq!(step.undo.args, ["restore"]);
         let mut renewed = upstream.clone();
         renewed.mtu = 1400;
-        assert!(!same_path(&upstream, &renewed), "An upstream MTU change must rebuild the RA");
+        assert!(
+            !same_path(&upstream, &renewed),
+            "An upstream MTU change must rebuild the RA"
+        );
         for bad in ["1279", "1501", "invalid"] {
-            assert!(ra_command(&["apply".into(), "fd12::/64".into(), "fe80::1".into(), bad.into()]).is_err());
+            assert!(ra_command(&[
+                "apply".into(),
+                "fd12::/64".into(),
+                "fe80::1".into(),
+                bad.into()
+            ])
+            .is_err());
         }
     }
 
@@ -2396,67 +2503,11 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    #[ignore = "Mutates UCI; only run in the disposable OpenWrt QA chroot"]
-    fn isolated_openwrt_previous_boot_ra_recovery() {
-        assert_eq!(std::env::var("U60_IPV6_ISOLATED_QA").as_deref(), Ok("1"));
-        assert!(Path::new("/u60-ipv6-qa-disposable").exists());
-        assert!(!Path::new(JOURNAL).join(RA_STATE).exists());
-        let baseline = fs::read("/etc/config/dhcp").unwrap();
-        assert!(Cmd::new("uci", &["-q", "changes", "dhcp"])
-            .run()
-            .unwrap()
-            .is_empty());
-        let dns = Some("fe80::1 2001:db8::53 2001:db8::54".into());
-        write_option("dns", true, &dns).unwrap();
-        Cmd::new("uci", &["commit", "dhcp"]).run().unwrap();
-        legacy_ra_command(&[
-            "apply".into(),
-            "fd12:3456:789a::/64".into(),
-            "fe80::1".into(),
-        ])
-        .unwrap();
-        let path = Path::new(JOURNAL).join(RA_STATE);
-        let mut state: RaState = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        state.boot = "previous-boot".into();
-        net::write_private(&path, &serde_json::to_vec(&state).unwrap()).unwrap();
-        // Reboot drops temporary UCI edits; B31 also clears old cellular DNS.
-        Cmd::new("uci", &["revert", "dhcp"]).run().unwrap();
-        Cmd::new("uci", &["delete", "dhcp.lan.dns"]).run().unwrap();
-        Cmd::new("uci", &["set", "dhcp.lan.ra_mtu=1450"])
-            .run()
-            .unwrap();
-        Cmd::new("uci", &["commit", "dhcp"]).run().unwrap();
-        Cmd::new("uci", &["set", "dhcp.lan.qa_pending=preserve"])
-            .run()
-            .unwrap();
-        let committed = fs::read("/etc/config/dhcp").unwrap();
-        let pending = Cmd::new("uci", &["-q", "changes", "dhcp"]).run().unwrap();
-        legacy_ra_command(&["restore".into()])
-            .expect("Postboot vendor DNS/MTU changes must not block relay cleanup");
-        assert!(!path.exists());
-        assert_eq!(fs::read("/etc/config/dhcp").unwrap(), committed);
-        assert_eq!(
-            Cmd::new("uci", &["-q", "changes", "dhcp"]).run().unwrap(),
-            pending
-        );
-        assert!(
-            read_option("dns").unwrap().is_none(),
-            "Never revive stale cellular DNS after reboot"
-        );
-        assert_eq!(read_option("ra_mtu").unwrap().as_deref(), Some("1450"));
-        legacy_ra_command(&["restore".into()]).unwrap();
-        Cmd::new("uci", &["revert", "dhcp"]).run().unwrap();
-        fs::write("/etc/config/dhcp", baseline).unwrap();
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
     #[ignore = "Mutates network/UCI; only run in the disposable OpenWrt QA chroot"]
     fn isolated_openwrt_start_refresh_stop() {
         assert_eq!(std::env::var("U60_IPV6_ISOLATED_QA").as_deref(), Ok("1"));
         assert!(Path::new("/u60-ipv6-qa-disposable").exists());
         assert!(std::env::var_os("U60_IPV6_QA_CALLBACK").is_some());
-        assert!(!Path::new(JOURNAL).join(RA_STATE).exists());
         let original = Cmd::new("uci", &["-q", "show", "dhcp.lan"]).run().unwrap();
         let committed = fs::read("/etc/config/dhcp").unwrap();
         let main = Cmd::new("ip", &["-6", "route", "show", "table", "main"])
@@ -2495,7 +2546,12 @@ mod tests {
         for _ in 0..3 {
             std::thread::sleep(Duration::from_millis(200));
             upstream.tick().unwrap();
-            assert_eq!(upstream.status()["state"], "configured");
+            assert_eq!(
+                upstream.status()["state"],
+                "configured",
+                "{}",
+                upstream.status()
+            );
         }
         assert_eq!(upstream.status()["upstream_mtu"], 1500);
         assert_eq!(upstream.status()["lan_mtu"], 1500);
@@ -2504,7 +2560,12 @@ mod tests {
             .run()
             .unwrap();
         upstream.tick().unwrap();
-        assert_eq!(upstream.status()["state"], "configured");
+        assert_eq!(
+            upstream.status()["state"],
+            "configured",
+            "{}",
+            upstream.status()
+        );
         assert_eq!(upstream.status()["lan_mtu"], 1400);
         assert_eq!(ra::data().unwrap()["ra_mtu"], 1400);
         Cmd::new("ip", &["link", "set", "br-lan", "mtu", "1500"])
@@ -2520,7 +2581,12 @@ mod tests {
         .run()
         .unwrap();
         upstream.tick().unwrap();
-        assert_eq!(upstream.status()["state"], "configured");
+        assert_eq!(
+            upstream.status()["state"],
+            "configured",
+            "{}",
+            upstream.status()
+        );
         for destination in ["2001:db8:2::123", "2001:db8:3::123"] {
             assert!(Cmd::new("ip", &["-6", "route", "get", destination])
                 .run()
@@ -2568,18 +2634,147 @@ mod tests {
         .run()
         .unwrap();
         upstream.tick().unwrap();
+        let revision = upstream.revision();
+        Cmd::new(
+            "ip",
+            &[
+                "-6",
+                "addr",
+                "add",
+                "fd00:60:1107::1/128",
+                "dev",
+                "lo",
+                "nodad",
+            ],
+        )
+        .run()
+        .unwrap();
+        upstream.tick().unwrap();
+        assert_eq!(
+            upstream.revision(),
+            revision,
+            "local address additions must not redial core transports"
+        );
+        let rule = [
+            "-w",
+            "2",
+            "-t",
+            "nat",
+            "-C",
+            "U60_R6_DNS",
+            "-d",
+            "fd00:60:1107::1",
+            "-j",
+            "ACCEPT",
+        ];
+        Cmd::new("ip6tables", &rule).run().unwrap();
+        let journal = fs::read(Path::new(JOURNAL).join("ipv6-network.json")).unwrap();
+        let mut remove = rule;
+        remove[4] = "-D";
+        Cmd::new("ip6tables", &remove).run().unwrap();
+        upstream.rules_checked = None;
+        upstream.tick().unwrap();
+        Cmd::new("ip6tables", &rule).run().unwrap();
+        assert_eq!(
+            fs::read(Path::new(JOURNAL).join("ipv6-network.json")).unwrap(),
+            journal,
+            "repair reuses the existing undo"
+        );
+        Cmd::new(
+            "ip",
+            &["-6", "addr", "del", "fd00:60:1107::1/128", "dev", "lo"],
+        )
+        .run()
+        .unwrap();
+        upstream.tick().unwrap();
+        assert_eq!(upstream.revision(), revision);
+        Cmd::new("ip", &["-6", "rule", "del", "pref", PREF, "lookup", TABLE])
+            .run()
+            .unwrap();
+        upstream.tick().unwrap();
+        assert_eq!(
+            net::plain_policy_rule("-6", PREF, TABLE).unwrap(),
+            net::PolicyRule::Owned
+        );
+        assert_eq!(
+            upstream.revision(),
+            revision,
+            "policy repair is not a new uplink"
+        );
         // Simulate expiry while the shared network lock delayed supervision,
         // followed by renewal of exactly the same address/router.
         default_route(upstream.path.as_ref().unwrap(), "del")
             .run()
             .unwrap();
         upstream.tick().unwrap();
-        assert_eq!(upstream.status()["state"], "configured");
+        assert_eq!(
+            upstream.status()["state"],
+            "configured",
+            "{}",
+            upstream.status()
+        );
+        assert_eq!(
+            upstream.revision(),
+            revision,
+            "repairing the same route must not restart the core"
+        );
         assert!(
             Cmd::new("ip", &["-6", "route", "get", "2606:4700:4700::1111"])
                 .run()
                 .unwrap()
                 .contains("dev u60sta0")
+        );
+        // Owned addresses, and a route table another writer emptied (which
+        // then no longer exists), are restored in place as well.
+        let owned = upstream.path.as_ref().unwrap().addresses[0].address;
+        let lan_address =
+            Ipv6Addr::from(u128::from(cidr(upstream.lan_prefix.as_ref().unwrap()).unwrap().0) + 1);
+        Cmd::new(
+            "ip",
+            &["-6", "addr", "del", &format!("{owned}/128"), "dev", IFACE],
+        )
+        .run()
+        .unwrap();
+        Cmd::new(
+            "ip",
+            &[
+                "-6",
+                "addr",
+                "del",
+                &format!("{lan_address}/64"),
+                "dev",
+                "br-lan",
+            ],
+        )
+        .run()
+        .unwrap();
+        upstream.tick().unwrap();
+        let addresses = Cmd::new("ip", &["-6", "addr", "show"]).run().unwrap();
+        assert!(
+            addresses.contains(&format!("{owned}/128"))
+                && addresses.contains(&format!("{lan_address}/64")),
+            "{addresses}"
+        );
+        Cmd::new("ip", &["-6", "route", "flush", "table", TABLE])
+            .run()
+            .unwrap();
+        upstream.tick().unwrap();
+        assert_eq!(
+            upstream.status()["state"],
+            "configured",
+            "{}",
+            upstream.status()
+        );
+        assert!(
+            Cmd::new("ip", &["-6", "route", "get", "2606:4700:4700::1111"])
+                .run()
+                .unwrap()
+                .contains("dev u60sta0")
+        );
+        assert_eq!(
+            upstream.revision(),
+            revision,
+            "restoring owned addresses and an emptied table is not a new uplink"
         );
         let ula = upstream.lan_prefix.as_ref().unwrap().clone();
         assert_eq!(ra::data().unwrap()["prefix_filter"], ula);
@@ -2616,7 +2811,6 @@ mod tests {
             .run()
             .unwrap()
             .contains(PREF));
-        assert!(!Path::new(JOURNAL).join(RA_STATE).exists());
         upstream.stop().unwrap();
 
         upstream.start(true).unwrap();
@@ -2628,7 +2822,12 @@ mod tests {
                 break;
             }
         }
-        assert_eq!(upstream.status()["state"], "configured");
+        assert_eq!(
+            upstream.status()["state"],
+            "configured",
+            "{}",
+            upstream.status()
+        );
         for event in ["ra-updated", "stopped", "started"] {
             let mut callback = Command::new(std::env::var_os("U60_IPV6_QA_CALLBACK").unwrap());
             callback
@@ -2639,7 +2838,12 @@ mod tests {
                 .env("RA_ROUTES", "::/0,fe80::dead,600,512");
             net::run(callback, Duration::from_secs(5)).unwrap();
             upstream.tick().unwrap();
-            assert_eq!(upstream.status()["state"], "configured");
+            assert_eq!(
+                upstream.status()["state"],
+                "configured",
+                "{}",
+                upstream.status()
+            );
             assert_ne!(upstream.status()["gateway"], "fe80::dead");
         }
         let mut expired = upstream.installed.as_ref().unwrap().clone();
@@ -2674,7 +2878,12 @@ mod tests {
                 break;
             }
         }
-        assert_eq!(upstream.status()["state"], "configured");
+        assert_eq!(
+            upstream.status()["state"],
+            "configured",
+            "{}",
+            upstream.status()
+        );
         let revision = upstream.revision();
         let child = upstream.client.as_mut().unwrap();
         child.kill().unwrap();
@@ -2700,7 +2909,12 @@ mod tests {
                 break;
             }
         }
-        assert_eq!(upstream.status()["state"], "configured");
+        assert_eq!(
+            upstream.status()["state"],
+            "configured",
+            "{}",
+            upstream.status()
+        );
         Cmd::new(
             "ubus",
             &[
@@ -2736,7 +2950,12 @@ mod tests {
                 break;
             }
         }
-        assert_eq!(upstream.status()["state"], "configured");
+        assert_eq!(
+            upstream.status()["state"],
+            "configured",
+            "{}",
+            upstream.status()
+        );
         upstream.stop().unwrap();
 
         // B31's cellular switch commits the full DHCP package. Runtime RA
@@ -2749,7 +2968,12 @@ mod tests {
                 break;
             }
         }
-        assert_eq!(upstream.status()["state"], "configured");
+        assert_eq!(
+            upstream.status()["state"],
+            "configured",
+            "{}",
+            upstream.status()
+        );
         Cmd::new("uci", &["set", "dhcp.lan.qa_external=preserve"])
             .run()
             .unwrap();
@@ -2783,7 +3007,6 @@ mod tests {
             read_option("ra_useleasetime").unwrap().as_deref(),
             Some("1")
         );
-        assert!(!Path::new(JOURNAL).join(RA_STATE).exists());
         let deltas = Cmd::new("uci", &["-q", "changes", "dhcp"]).run().unwrap();
         assert_eq!(deltas, "dhcp.lan.qa_pending='uncommitted'");
         Cmd::new("uci", &["revert", "dhcp.lan.qa_pending"])
@@ -2799,75 +3022,6 @@ mod tests {
         assert_eq!(
             Cmd::new("uci", &["-q", "show", "dhcp.lan"]).run().unwrap(),
             original
-        );
-
-        // While still relaying, a vendor reload must refresh only the RA
-        // overlay and retain its new baseline, not disconnect the station.
-        legacy_ra_command(&[
-            "apply".into(),
-            "fd12:3456:789a::/64".into(),
-            "fe80::1".into(),
-        ])
-        .unwrap();
-        for (key, value) in [
-            ("ra_useleasetime", "1"),
-            ("dhcpv6", "server"),
-            ("ra_flags", "other-config"),
-        ] {
-            Cmd::new("uci", &["set", &format!("dhcp.lan.{key}={value}")])
-                .run()
-                .unwrap();
-        }
-        Cmd::new("uci", &["commit", "dhcp"]).run().unwrap();
-        legacy_maintain_ra().unwrap();
-        assert_eq!(
-            read_option("ra_useleasetime").unwrap().as_deref(),
-            Some("0")
-        );
-        assert_eq!(read_option("dhcpv6").unwrap().as_deref(), Some("disabled"));
-        ra_restore().unwrap();
-        assert_eq!(
-            read_option("ra_useleasetime").unwrap().as_deref(),
-            Some("1")
-        );
-        assert_eq!(
-            read_option("ra_flags").unwrap().as_deref(),
-            Some("other-config")
-        );
-        assert!(read_option("prefix_filter").unwrap().is_none());
-        assert!(Cmd::new("uci", &["-q", "changes", "dhcp"])
-            .run()
-            .unwrap()
-            .is_empty());
-
-        legacy_ra_command(&[
-            "apply".into(),
-            "fd12:3456:789a::/64".into(),
-            "fe80::1".into(),
-        ])
-        .unwrap();
-        Cmd::new("uci", &["set", "dhcp.lan.ra_mtu=1400"])
-            .run()
-            .unwrap();
-        let committed = fs::read("/etc/config/dhcp").unwrap();
-        let edited_delta = Cmd::new("uci", &["-q", "changes", "dhcp"])
-            .run()
-            .unwrap()
-            .lines()
-            .filter(|line| line.starts_with("dhcp.lan.ra_mtu="))
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            legacy_maintain_ra().is_err(),
-            "An uncommitted edit must not become a persisted baseline"
-        );
-        ra_restore().unwrap();
-        assert_eq!(read_option("ra_mtu").unwrap().as_deref(), Some("1400"));
-        assert_eq!(fs::read("/etc/config/dhcp").unwrap(), committed);
-        assert_eq!(
-            Cmd::new("uci", &["-q", "changes", "dhcp"]).run().unwrap(),
-            edited_delta,
-            "Preserve the external edit's same-key delta history instead of normalizing it"
         );
     }
 }

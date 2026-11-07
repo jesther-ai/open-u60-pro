@@ -205,13 +205,9 @@ If every owned key disappears after netifd reinitialization, an active session
 can rebuild its overlay from its live lease. Conflicting partial changes degrade
 IPv6 after safe withdrawal rather than starting a UCI reassert/commit loop.
 
-Legacy UCI snapshots are compatibility migration only: repair exact recognized
-persisted relay values in a private staged UCI package, preserving unrelated
-pending/committed data and newer external values. After reboot, absent DNS is
-fresh vendor state, not a reason to revive old resolvers. Same-value external
-writes cannot be distinguished without provenance; this limitation remains in
-legacy migration, not normal RA operation. New sessions never create a legacy
-snapshot. Do not expand the migration algorithm into the steady-state design.
+RA state is a runtime overlay (`ra-runtime.json`), never a UCI snapshot. The
+earlier persisted-UCI snapshot (`ra.json`) and its recovery path were removed once
+the only affected router had been upgraded; a stray `ra.json` is ignored.
 
 The volatile resolver update preserves symlinks/permissions, checks inode and
 content before atomic replacement and retries bounded concurrent vendor writes.
@@ -219,9 +215,8 @@ No snapshot can overwrite a newer cellular resolver list. A separate DNS journal
 allows independent routing/AP cleanup even if DNS removal needs a retry.
 
 Across reboot, never replay old AP runtime or RA data. All new runtime resources
-are gone; discard their old-boot journals. Inspect legacy persisted RA ownership
-only when an actual legacy snapshot exists. Do not blindly delete ambiguous
-legacy evidence or an unknown-version journal.
+are gone; discard their old-boot journals. Do not blindly delete an
+unknown-version journal.
 
 ## 6. Disconnect and recovery ordering
 

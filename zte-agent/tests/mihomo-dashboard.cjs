@@ -5,7 +5,7 @@ const path = require("node:path");
 const test = require("node:test");
 const vm = require("node:vm");
 
-const bootstrap = fs.readFileSync(path.join(__dirname, "../src/web/mihomo/bootstrap.js"), "utf8");
+const bootstrap = fs.readFileSync(path.join(__dirname, "../src/mihomo/dashboard/bootstrap.js"), "utf8");
 function memoryStorage(values = {}) {
     const saved = new Map(Object.entries(values));
     return {

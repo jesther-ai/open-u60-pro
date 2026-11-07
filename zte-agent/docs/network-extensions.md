@@ -6,40 +6,30 @@ not a released or fully device-accepted firmware. Dated validation below and in
 change. The iOS/Android interfaces and the Next.js public site are unchanged.
 Do not assume successful unit tests prove B31 forwarding works.
 
-> **Browser pages (2026-11-07):** after merging `origin/main`, production serves
-> only the responsive console (`src/console.rs`). The maud pages described under
-> "Web layout" and "Routes" (`/ui/relay`, `/ui/router/mihomo`, the Zashboard
-> dashboard and its `/ui/mihomo/api` bridge) remain in the tree as test-only
-> fixtures (`#[cfg(test)] mod web`) and are not reachable on a device. Relay and
-> Mihomo are driven through `/api/wifi-relay/*` and `/api/mihomo/*` until the
-> console gets pages for them. Everything else in this document is unchanged.
+## Console pages
 
-## Web layout
-
-- **Router -> Mihomo / Clash** has a start/stop switch. **Open Zashboard** is
-  rendered only while the agent owns a running core. Off also refuses old
-  dashboard/API URLs, removes interception and stops the owned child.
-- **Router -> Mihomo setup & status** installs the optional core/dashboard and
-  manages a private library of up to 16 complete Mihomo YAML profiles: HTTPS
-  subscription download, manual or scheduled refresh, file import and paste.
-  Supply your own nodes or proxy-providers; no account is included.
-- **Relay** is a sixth, independent browser tab: scan, select an upstream, enter
-  a password, explicitly acknowledge hotspot interruption/cellular charges,
-  connect and disconnect. A connected relay keeps a short unverified-network
-  notice; there is no separate hotel-login card or external login shortcut.
+- **Network → Clash / Mihomo** has a start/stop switch and installs the optional
+  core/dashboard. **Open Zashboard** is shown only while the agent owns a running
+  core. Off also refuses dashboard/API URLs, removes interception and stops the
+  owned child.
+- The same page manages a private library of up to 16 complete Mihomo YAML
+  profiles: HTTPS subscription download, manual or scheduled refresh, file import
+  and paste. Supply your own nodes or proxy-providers; no account is included.
+- **Network → Clash proxies** sets the routing mode, picks the node of each
+  selector group and tests delay without leaving the console; **Open Zashboard**
+  there gives the full dashboard.
+- **Network → Wi-Fi Relay**: scan, select an upstream, enter a password,
+  explicitly acknowledge hotspot interruption/cellular charges, connect and
+  disconnect. A connected relay keeps a short unverified-network notice; there is
+  no separate hotel-login card or external login shortcut.
 - **Remember this network** defaults on and saves credentials only after a
   successful connection. Scan again and select a saved SSID with an empty
   password to reuse it; Forget removes the credential without disconnecting.
   The last successfully connected remembered/open network is eligible to resume
   after restart; the saved-network list is not an auto-connect list.
-- **Router -> LAN / DHCP -> Fixed client IPs** reserves downstream DHCPv4
-  addresses by client MAC with either cellular or Wi-Fi relay. The Relay page
-  has no duplicate shortcut; this does not set the upstream router's lease.
-- The mobile browser dock shows the current tab's name and keeps the other
-  five as named icons (hover titles and screen-reader text remain); desktop
-  shows all six labels. Narrow screens use a compact current-tab treatment.
-  Relay uses a status card, selectable network cards and separate scan,
-  connect and disconnect buttons; compatibility notes are collapsed by default.
+- **Network → LAN → Fixed client IPs** reserves downstream DHCPv4 addresses by
+  client MAC with either cellular or Wi-Fi relay; this does not set the upstream
+  router's lease.
 - Restart restoration follows persisted owner intent: Mihomo's enabled marker
   and Relay's last eligible connection. Off/Disconnect clears the respective
   choice; a dropped relay link is not automatically reconnected at runtime.
@@ -50,9 +40,8 @@ Do not assume successful unit tests prove B31 forwarding works.
 
 `/data/zte-agent-mihomo/profiles.json` (0600 in a 0700 directory) atomically
 stores originals, processed YAML, selected ID, subscription URLs, intervals and
-extensions. Existing `source.yaml` is imported lazily as Existing configuration;
-the old file is preserved. Once the manifest exists it is authoritative; a
-corrupt manifest is not silently replaced with old data. GET/status returns only
+extensions. The manifest is authoritative; a
+corrupt manifest is not silently replaced. GET/status returns only
 names, IDs, timestamps, intervals and sanitized errors, never YAML, URLs or scripts.
 Add/Edit opens a native dialog, with a plain form fallback without JavaScript.
 The authenticated editor explicitly shows only that profile's subscription URL,
@@ -242,25 +231,88 @@ database or subscription is embedded in the Rust binary.
   not an anonymity kill switch. Firmware firewall reloads are not continuously
   repaired by this first integration; inspect actual routes after such changes.
 
+Generated network plans journal every undo with one durable write before any
+effect. Supported contiguous firewall runs use `iptables-restore` or
+`ip6tables-restore --noflush --wait 2`; route and radio operations retain their
+ordering barriers. Chain creation uses exclusive `-N`, never a declaration that
+could flush an existing chain. A later table/family failure may leave earlier
+COMMITs applied: the same individual undo records recover that partial state.
+A failed restore is never retried blindly as individual commands. Because an
+interrupted plan also runs the undo of steps that never ran, no such undo may
+match another writer's identical rule: a rule in a chain the agent does not own
+jumps to an owned `U60_*` chain or matches only the agent's own interfaces or
+comment (the relay's broad cellular IPv6 reject lives in `U60_RELAY_OUT`, the
+IPv6 relay's in `U60_R6_OUT`; a unit test checks every prejournaled plan). File fsync is
+retained; this is not a claim that runtime network journals survive power loss
+as an atomic rename transaction. Previous-boot runtime journals are discarded.
+
 ### Configuration and dashboard security
 
 The uploaded YAML is parsed, then the agent overrides controller, ports, DNS
 binding and IPv6. It disables subscription-provided listeners, TUN, iptables,
-NTP service, alternate controllers and server listeners. Configuration checks
-run `mihomo -t`; rejected YAML does not replace `source.yaml`. Credentials in
+NTP service, alternate controllers and server listeners; a subscription's
+`sniffer` section is kept as written (it cannot bind an interface or open a
+port). Configuration checks
+run `mihomo -t`; rejected YAML does not replace the selected profile. A restart whose
+generated configuration, referenced geodata contents and installed core identity
+match one that already passed and started (with the per-start secret masked)
+can skip the repeated check (logged as `validation reused`). Databases referenced
+by rules, sub-rules, rule providers, DNS and the sniffer's `geosite:`/`geoip:`
+entries count; missing or unreadable dependencies disable reuse, and a
+dependency change during the check or startup prevents caching that result.
+Database digests are reused while a file keeps its inode, size, modification and
+change times. This does not claim that `mihomo -t` validates every provider's
+downloaded contents.
+A check beside a live core uses one Go execution slot (`GOMAXPROCS=1`), a soft
+128 MiB Go memory target and a lower priority. Neither is an OS-thread count or
+RSS hard cap. Validation logs only its elapsed time, background flag and result. Credentials in
 source/runtime YAML are private (`0600`, parent `0700`) and never rendered back.
 Only import configurations from sources you trust: nodes/providers can of
 course cause outbound requests and choose proxy destinations.
 The subscription's TUN object is replaced by the managed one. Node/provider
 interface and mark overrides are removed; DNS URL fragments may select declared
 proxies/groups but not an arbitrary interface. Local-address exclusions refresh
-on the existing active watchdog; its own TUN addresses are excluded from change
-detection. Renumbering can briefly interrupt connections while the core restarts.
+on the existing active watchdog, in place: only the exact-address firewall
+exemptions are added or removed (each with its own journal entry), so an
+address change alone (Tailscale, LAN or another non-egress interface) does not
+restart the core or drop connections. Relay IPv4 and IPv6 also update their
+local DNS exemptions in place. Its own
+TUN addresses are excluded from change detection. Exact-address exclusions are
+audited in chain snapshots at most every 15 seconds even when addresses are
+unchanged; a missing chain remains a reported recovery problem, not permission
+to flush or take over another writer's rules. The relay announces changes of
+its own path, and such an uplink change restarts the core. For any other egress
+(cellular) the watchdog compares the effective egress with the core's reference
+egress whenever addresses change and at each 15 s audit, and restarts only when
+existing connections are stranded: a readable family moved to another interface
+(name or index) or lost a source address it had. Added addresses, gateway or
+preferred-source changes and a family that became available (IPv6, or IPv4
+after an offline start) only update the reference in place. An unreadable or
+lost family is no evidence and keeps its last reference, so its return on
+another address still strands. A stranding observation must stay identical for
+5 s before the restart, so a flapping uplink restarts nothing until it settles,
+and the watchdog restarts the core at most once per 60 s; relay notifications
+and owner operations are not limited.
+Duplicate notifications with the same effective routes and source-address sets
+on both egress interfaces keep a live core running. Non-egress address changes
+and lifetime countdowns do not change that identity; withdrawal of a secondary
+egress address does. Unknown/offline observations do not authorize skipping recovery. A long switch
+may still need an intermediate fallback core followed by the new Wi-Fi core.
 
 The core API binds `127.0.0.1:19090` with a fresh random secret each start.
 Zashboard is served locally at `/ui/mihomo/dashboard/`; its `secondaryPath`
-points to `/ui/mihomo/api`. The Router entry opens `#/proxies` directly, including
-on a first visit or with browser storage disabled. Before the pinned dashboard
+points to `/ui/mihomo/api`. The console's **Open Zashboard** button opens a new
+tab: the console first calls `POST /api/mihomo/dashboard` with its bearer token
+and receives a `zte_ui_zashboard` pass cookie (HttpOnly, SameSite=Strict, path
+`/ui/mihomo/`, twelve hours, one per console session, at most eight; over HTTPS
+it becomes a Secure `__Host-` cookie with `Path=/`). The pass opens only the dashboard and its bridge,
+never the JSON API, and stops working when its console session ends. Lock console
+calls `POST /api/auth/logout` to revoke that session and clear the pass cookie.
+Existing WebSocket streams also end on pass expiry, replacement or eviction.
+If logout cannot be confirmed over the network, the locked console reports it. Without a
+valid pass, dashboard pages go back to the console and bridge calls get 401. The
+dashboard opens at `#/proxies` directly, including on a first visit or with
+browser storage disabled. Before the pinned dashboard
 initializes its connection, a small Rust serving adapter selects its managed
 U60 backend using the browser's current protocol, hostname and port (including
 HTTPS/default ports and bracketed IPv6). A stale selected backend or URL query
@@ -280,7 +332,7 @@ browser storage or a browser-supplied header. HTTP/WebSocket requests are
 bounded, and the bridge disallows core upgrades/restarts and arbitrary config
 replacement. Node selection, latency, provider refresh, mode, connections,
 traffic and logs are bridged. Unsupported advanced Zashboard controls can show
-an explicit denied operation; manage lifecycle and YAML in Router instead.
+an explicit denied operation; manage lifecycle and YAML in the console's Clash / Mihomo page instead.
 Upgraded WebSocket connections retain the shared total/per-peer listener slots
 until they end; HTTPS Reset also closes live WSS immediately. Stale browser
 `token` query values are removed before the server injects its private credential.
@@ -458,7 +510,15 @@ earlier B31 association observations, not a translation of enhanced's GPL code.
   Loss/expiry withdraws owned IPv6 forwarding; missing IPv6 does not stop an
   otherwise working IPv4 relay. Lifetime-only renewals update owned addresses
   and the route without tearing down NAT/RA. Changed addressing rebuilds the
-  owned IPv6 transaction. Status says **configured / internet not verified**:
+  owned IPv6 transaction. Each active tick checks owned addresses, routes,
+  policy rules and the runtime RA overlay; missing owned effects are repaired
+  without changing the upstream revision, including a route table emptied by
+  another writer (it then no longer exists). A failed inspection read keeps the
+  path for up to three ticks before IPv6 is withdrawn; a conflicting owned
+  object withdraws it at once. Redundant lifetime writes are spaced
+  15 s apart (every tick while an upstream lifetime is under 45 s), and a new
+  renewal is checked before using that throttle. Local DNS exclusions update
+  in place and are audited at 15 s intervals. Status says **configured / internet not verified**:
   RA/DHCP is not proof of hotel authorization or Internet reachability.
 - RA release withdraws the temporary default, then nulls only still-owned
   runtime keys. JSON null is ignored by odhcpd's typed parser, leaving its
@@ -476,8 +536,19 @@ earlier B31 association observations, not a translation of enhanced's GPL code.
   The longer-term state/ownership design and release gates are documented in
   [relay-cellular-recovery-plan.md](relay-cellular-recovery-plan.md); those
   coordinator/dependency-group changes are a plan, not already deployed code.
-- The active-only watchdog checks link/process/lease state every 3 seconds.
-  Link/process loss or a changed lease removes relay and restores AP settings;
+- The active-only watchdog waits 3 seconds between checks; network-lock waits
+  and device commands add to the observed interval. An incomplete association
+  gets a 12-second CLOCK_BOOTTIME grace period from its first failed observation,
+  provided both helpers and the original lease remain valid and the hotspot is
+  still on. Recovery clears the timer; an expired grace period, lost helper or
+  changed address/mask/gateway/first resolver removes relay and restores AP
+  settings. A renewal changing only later resolvers is adopted in place after
+  the usual lease checks. During association recovery, the tick skips maintenance
+  and does not extend any lease. When the association completes again, udhcpc
+  is asked to renew (at most every 30 s): a roam onto another network with the
+  same SSID then loses its lease and tears the relay down instead of keeping a
+  stale address. Status exposes the association state and elapsed
+  recovery time; logs add the reason, command time and lock wait without credentials;
   **cellular fallback may consume SIM data**. There is no internet-down probe
   and no reconnect after a dropped link while the agent runs; after an agent
   restart or a reboot it attempts only the saved eligible connection (see
@@ -611,10 +682,9 @@ failure, retain the journal for diagnosis; do not blindly delete it.
 
 ## Routes
 
-All JSON routes below require the agent password and a bearer token. Browser
-actions use the existing session, exact-origin/CSRF checks and one-time forms;
-slow effects run through the blocking gate. Credentials go in request bodies,
-never URLs. Zashboard's bridge uses a browser session instead of a bearer token.
+All JSON routes below require the agent password and a bearer token. Slow
+effects run through the blocking gate. Credentials go in request bodies,
+never URLs. Zashboard's bridge uses the pass cookie instead of a bearer token.
 
 | Method | Path | Purpose |
 | --- | --- | --- |
@@ -627,13 +697,18 @@ never URLs. Zashboard's bridge uses a browser session instead of a bearer token.
 | POST | `/api/wifi-relay/connect` | `{"network":"opaque scan id","password":"...","confirmed":true,"ipv6":true}`; omitted IPv6 defaults on |
 | POST | `/api/wifi-relay/disconnect` | Restore runtime hotspot/routes |
 | POST | `/api/wifi-relay/clock` | Explicit fresh HTTPS time check; requires an active relay, never reconnects it |
-| GET | `/ui/router/mihomo` | Install/configure/status page |
-| POST | `/ui/router/mihomo/{install,config,switch}` | Authenticated lifecycle forms |
-| GET | `/ui/router/mihomo/open` | Running-only same-origin Zashboard jump |
-| GET | `/ui/mihomo/dashboard/` | Running-only local third-party panel |
-| restricted | `/ui/mihomo/api/*` | Same-origin authenticated HTTP/WebSocket bridge |
-| GET | `/ui/relay` | Independent Relay tab |
-| POST | `/ui/relay/{scan,connect,disconnect,clock}` | Authenticated relay forms |
+| GET | `/api/mihomo/profiles` | Profile library status, no URLs or YAML |
+| GET | `/api/mihomo/profiles/{id}` | Explicit private editor read (metadata and URL, never saved YAML) for one profile |
+| POST | `/api/mihomo/profiles` | Add, edit, select, refresh and delete profiles; set Merge and Script |
+| GET | `/api/mihomo/extensions` | Explicit private editor read of the global Merge and Script |
+| GET | `/api/mihomo/proxies` | Proxy groups, members, current choice, last delay and routing mode; 409 when Clash is off |
+| POST | `/api/mihomo/proxies/select` | `{"group":"...","name":"..."}`; slow lane |
+| POST | `/api/mihomo/proxies/delay` | `{"name":"..."}`; tests against a fixed URL, `0` means failed, `null` never tested; slow lane |
+| POST | `/api/mihomo/mode` | `{"mode":"rule\|global\|direct"}`; slow lane |
+| POST | `/api/wifi-relay/tuning`, `/api/wifi-relay/forget` | Bandwidth choice for a saved network; forget a saved network |
+| POST | `/api/mihomo/dashboard` | Console login only; issues the Zashboard pass cookie and returns `{"url":"/ui/mihomo/dashboard/#/proxies"}`; 409 when Clash is off |
+| GET | `/ui/mihomo/dashboard/*` | Running-only local third-party panel, pass cookie required |
+| restricted | `/ui/mihomo/api/*` | Same-origin pass-cookie HTTP/WebSocket bridge |
 
 ## Historical validation snapshot (2026-10-26)
 
@@ -878,7 +953,7 @@ Unknown，不能制造零分。TX 字节仅做上下文记录；G3 之前不使�
 
 `widths.json` 保留不透明网络 id、最新 32 条、0600；新记录为
 `{id,width,source:"airtime",signal_dbm,saved_utc?}`，UTC 只来自本次启动已验证的网络
-时钟。旧格式仍能作为起点；信号差 >10 dB 或可信时钟证明年龄 >30 天时，仅作排序
+时钟。条目缺少 `source:"airtime"` 或信号即无效，重写时丢弃；信号差 >10 dB 或可信时钟证明年龄 >30 天时，仅作排序
 参考，起点改用已有扫描预测。缓存不替代本次测量，只在 Win 或首次合格锚点窗口后写，
 未确认、Paused、Observe 都不写。页面只增加文字状态，不新增 CSS/JS、不承诺最快。
 日志仅包含匿名 id、代次、模式、宽度、E/R、证据量、信号、PHY、字段名与客户端数量，
@@ -1087,3 +1162,27 @@ Resolver ownership uses a separate comment line directly before its matching
 `nameserver` entry. Inline comments are intentionally avoided because B31's
 BusyBox nslookup treats them as part of the server address. Old tagged inline
 entries are recognized during cleanup/migration.
+
+### Association and IPv6 maintenance timing
+
+An incomplete association or unavailable status query starts a bounded 12-second
+recovery window measured on CLOCK_BOOTTIME, rather than a count of watchdog
+samples. A valid existing lease and both live helpers are required throughout;
+lease loss, helper death and explicit hotspot shutdown still clean up promptly.
+The window resets only on a completed association. It does not enable automatic
+reconnection after teardown, or guarantee every B31 roam/rekey fits this window.
+A completed recovery requests one DHCP renew (spaced at least 30 s apart, as
+BusyBox udhcpc deconfigures on a second renew signal while one is pending).
+The API exposes association state and recovery duration; logs use only whitelisted
+states, teardown reasons and query/lock timing, never tool output or credentials.
+
+Unchanged IPv6 leases retain the 15-second limit on redundant lifetime writes.
+RA ownership and owned address/route existence are checked on each active tick.
+Missing objects are added using their existing undo records; conflicting routes
+are not replaced. An emptied route table counts as all routes missing. A failed
+inspection read (netifd, `ip`, or a chain snapshot) is retried on the next two
+ticks with the path kept; only a third consecutive failure or a confirmed
+conflict withdraws IPv6. Local exclusions, lifetime renewal and successful same-path
+repair do not advance the core's upstream revision. Actual source/gateway or
+availability changes do. Readiness and bounded recovery remain distinct from
+real Internet/paid-node acceptance, including IPv6 fragmented UDP.

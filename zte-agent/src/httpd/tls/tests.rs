@@ -428,7 +428,6 @@ fn upgraded_tls_socket_keeps_shared_cap_and_ends_immediately_on_reset() {
 }
 
 #[test]
-#[ignore = "the retired maud UI (and its Zashboard bridge) is not served by httpd::app; revive with a console port of Mihomo"]
 fn actual_mihomo_bridge_checks_auth_origin_redacts_configs_and_upgrades_over_tls() {
     use crate::auth::{Kind, PeerKey};
     let core = CoreMock::start();
@@ -441,9 +440,13 @@ fn actual_mihomo_bridge_checks_auth_origin_redacts_configs_and_upgrades_over_tls
     let cfg = client(&s.tls.ca_der().unwrap(), &[&rustls::version::TLS13]);
     let host = format!("u60.home.arpa:{}", addr.port());
     let origin = format!("https://{host}");
-    let issued = s.app.auth.login(PW, Kind::Browser, PeerKey::from(addr), &[]).unwrap();
-    let cookie = format!("Cookie: __Host-zte_ui_session={}", issued.token.expose());
+    let bearer = s.app.auth.login(PW, Kind::Bearer, PeerKey::from(addr), &[]).unwrap();
     let mut c = connect(addr, Arc::clone(&cfg), "u60.home.arpa").unwrap();
+    let grant = request(&mut c, &format!("POST /api/mihomo/dashboard HTTP/1.1\r\nHost: {host}\r\nOrigin: {origin}\r\nAuthorization: Bearer {}", bearer.token.expose()), "");
+    assert_eq!(grant.status, 200);
+    let set = grant.header("set-cookie").expect("pass cookie").to_owned();
+    assert!(set.starts_with("__Host-zte_ui_zashboard=") && set.contains("; Path=/;") && set.ends_with("Secure"), "{set}");
+    let cookie = format!("Cookie: {}", set.split(';').next().unwrap());
     let before = core.requests.lock().unwrap().len();
     assert_eq!(request(&mut c, &format!("GET /ui/mihomo/api/version HTTP/1.1\r\nHost: {host}\r\nOrigin: {origin}"), "").status, 401);
     for extra in ["Origin: https://evil.invalid".to_owned(), String::new(), "Origin: http://u60.home.arpa".to_owned()] {
@@ -474,6 +477,23 @@ fn actual_mihomo_bridge_checks_auth_origin_redacts_configs_and_upgrades_over_tls
     assert_eq!((r.status, r.header("sec-websocket-accept")), (101, Some("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")));
     assert!(core.requests.lock().unwrap().iter().any(|h| h.starts_with("GET /traffic HTTP/1.1")));
     assert!(core.requests.lock().unwrap().iter().all(|h| !h.contains("old-browser-token") && !h.contains("also-old")));
+    // Replacing a pass ends the old stream without waiting for the 15s heartbeat.
+    let grant = request(&mut c, &format!("POST /api/mihomo/dashboard HTTP/1.1\r\nHost: {host}\r\nOrigin: {origin}\r\nAuthorization: Bearer {}", bearer.token.expose()), "");
+    assert_eq!(grant.status, 200);
+    ws.sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let before = Instant::now();
+    let mut buf = [0u8; 256];
+    loop {
+        match ws.read(&mut buf) {
+            Ok(0) => break,
+            Ok(_) => assert!(before.elapsed() < Duration::from_secs(2), "revoked pass still streaming"),
+            Err(e) => { assert!(!matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock), "{e}"); break; }
+        }
+    }
+    let cookie = format!("Cookie: {}", grant.header("set-cookie").unwrap().split(';').next().unwrap());
+    let mut ws = connect(addr, Arc::clone(&cfg), "u60.home.arpa").unwrap();
+    let upgrade = format!("GET /ui/mihomo/api/traffic HTTP/1.1\r\nHost: {host}\r\nOrigin: {origin}\r\n{cookie}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==");
+    assert_eq!(request(&mut ws, &upgrade, "").status, 101);
     // Real bridged frames stop immediately when HTTPS is reset.
     ws.sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
     s.tls.reset().unwrap();
@@ -490,7 +510,7 @@ fn actual_mihomo_bridge_checks_auth_origin_redacts_configs_and_upgrades_over_tls
         }
     }
     assert!(before.elapsed() < Duration::from_secs(2));
-    drop(issued);
+    drop(bearer);
 }
 
 /// The translations on their own.

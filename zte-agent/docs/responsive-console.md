@@ -30,6 +30,18 @@ Tools → Battery & Power subscribes to the optional `power` topic (five-second 
 
 Battery and USB power use measured voltage × current with µV/µA conversion, independently of unreliable driver `power_now`. Battery flow and USB input are separate. Kernel time estimates use seconds; the existing firmware estimates use minutes. Nonpositive/sentinel estimates are unavailable, and charging estimates are suppressed outside charging/full state. Raw source fields remain available in a collapsed details section. Missing data is not zero; interrupted streams retain values with a stale caption, and locking or leaving the page clears its optional data.
 
+## Wi-Fi Relay and Clash
+
+Three pages under **Network** drive the optional Rust extensions described in [network-extensions.md](network-extensions.md). None of them polls while idle; Relay re-reads its status every five seconds only while a restore is in progress, and every change asks for confirmation first. A request that gets no reply is shown as uncertain and the status is read again instead of assuming success. All text from the router is rendered with `textContent`.
+
+- **Wi-Fi Relay** (`#network/relay`): scan, pick an upstream, connect and disconnect, explicit clock check, saved networks (forget, per-network bandwidth choice) and the compatibility notes. Passwords go only in the request body.
+- **Clash / Mihomo** (`#network/mihomo`): install the pinned core, start and stop, up to 16 configuration profiles (add by subscription URL, file or paste; edit, refresh, select, delete) and the global Merge and Script. A subscription URL is fetched only when the editor is opened; saved YAML is never returned to the browser.
+- **Clash proxies** (`#network/proxies`): routing mode, node choice per selector group (rolled back on failure) and delay tests (three at a time, at most 30 nodes per group). The Mihomo controller secret never leaves the router; the agent performs these fixed operations itself.
+
+Clash-specific routes: `POST /api/mihomo/dashboard`, `GET /api/mihomo/extensions`, `GET /api/mihomo/profiles/{id}`, `GET /api/mihomo/proxies`, `POST /api/mihomo/proxies/select`, `POST /api/mihomo/proxies/delay` and `POST /api/mihomo/mode`. Profile and extension reads use the general lane and remain available while Clash is off. Proxy reads and controller changes use the slow lane and return 409 while Clash is off. Dashboard passes use a dedicated authenticated precheck and a general-lane running-state check; they also return 409 while Clash is off. Old `/ui/relay` and `/ui/router/mihomo` bookmarks redirect to these pages.
+
+**Open Zashboard** (Clash / Mihomo and Clash proxies pages, shown only while Clash runs) opens the pinned dashboard in a new tab for connections, logs, traffic, rules and providers. The page opens the tab first, so the click still counts as a user gesture, then trades its bearer token for a short-lived `zte_ui_zashboard` cookie with `POST /api/mihomo/dashboard`. Over HTTP the cookie is scoped to `/ui/mihomo/`; HTTPS translates it to a Secure `__Host-` cookie with `Path=/`. Server-side checks restrict it to the dashboard and bridge, and the JSON API never accepts it. Lock console calls `POST /api/auth/logout` to revoke the session and its passes; if the router cannot confirm logout, the locked tab reports that existing dashboard access may remain. Open streams end when their pass expires, is replaced or evicted, or its session is revoked. If the browser blocks the tab, a link appears instead.
+
 ## Source and checks
 
 - `zte-agent/ui/`: dependency-free HTML, CSS and browser modules.
@@ -37,7 +49,7 @@ Battery and USB power use measured voltage × current with µV/µA conversion, i
 - `src/dashboard.rs`, `dashboard_extra.rs`, `client_details.rs`: demand-driven readings, bounded async SSE and client measurements.
 - `ui/tests/`: pure Node validation checks and Playwright browser fixtures. They never contact a router or mutate real settings.
 
-Run pure checks with Node (`actions`, `advanced`, `battery-model`, `cellular`, `clients-model`, `esim-model`, `routing-model`). Browser suites (`https`, `battery`, `dashboard`, `controls`, `workspaces`, `routing`, `clients`, `esim`, `session`, `numbers`, `navigation`) use Playwright with Chrome; `navigation` also uses WebKit. `PLAYWRIGHT_WEBKIT_EXECUTABLE` can select an installed bundle outside Playwright’s default path. Rust checks use `cargo test -p zte-agent --locked` and the normal aarch64-musl release build.
+Run pure checks with Node (`actions`, `advanced`, `battery-model`, `cellular`, `clients-model`, `esim-model`, `routing-model`, `relay-model`, `mihomo-model`). Browser suites (`https`, `battery`, `dashboard`, `controls`, `workspaces`, `routing`, `clients`, `esim`, `session`, `numbers`, `navigation`, `relay`, `mihomo`, `proxies`, `network-session`) use Playwright with Chrome; `navigation` also uses WebKit. `PLAYWRIGHT_WEBKIT_EXECUTABLE` can select an installed bundle outside Playwright’s default path. Rust checks use `cargo test -p zte-agent --locked` and the normal aarch64-musl release build.
 
 ## Public screenshots
 

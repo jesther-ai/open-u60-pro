@@ -19,6 +19,8 @@ ln -sf /usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1 /ow/lib/ld-linux-aarch64
 cp /usr/sbin/xtables-nft-multi /ow/usr/sbin/
 ln -sf xtables-nft-multi /ow/usr/sbin/ip6tables
 ln -sf xtables-nft-multi /ow/usr/sbin/iptables
+ln -sf xtables-nft-multi /ow/usr/sbin/iptables-restore
+ln -sf xtables-nft-multi /ow/usr/sbin/ip6tables-restore
 case "${U60_OPENWRT_QA_MODE:-lifecycle}" in
     lifecycle) exec python3 /qa/openwrt_lifecycle.py ;;
     runtime-ra) exec python3 /qa/ra_runtime.py ;;

@@ -1,9 +1,12 @@
 //! Prepare official rule databases outside the shared network lock. The core's
 //! short validation command must not double as a hidden first-run downloader.
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
+use std::sync::Mutex;
 
 use serde_yaml_ng::Value;
 use sha2::{Digest, Sha256};
@@ -42,11 +45,14 @@ fn required(config: &Value) -> Vec<Asset> {
             _ => false,
         }
     }
+    // mihomo v1.19.33 also loads databases for the sniffer's `geosite:` and
+    // `geoip:` entries (config/config.go parseSniffer) during `-t`.
     let references = Value::Sequence(vec![
         config["rules"].clone(),
         config["sub-rules"].clone(),
         config["rule-providers"].clone(),
         config["dns"].clone(),
+        config["sniffer"].clone(),
     ]);
     let mut assets = Vec::new();
     if contains(&references, "GEOSITE,")
@@ -118,6 +124,83 @@ pub(super) fn prepare(
     })
 }
 
+/// The identity of a database file as last hashed. A replacement (new inode),
+/// a size change or any rewrite (which moves the change time) re-hashes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Stamp {
+    dev: u64,
+    ino: u64,
+    len: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+impl Stamp {
+    fn of(metadata: &fs::Metadata) -> Self {
+        Self {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            len: metadata.len(),
+            mtime: (metadata.mtime(), metadata.mtime_nsec()),
+            ctime: (metadata.ctime(), metadata.ctime_nsec()),
+        }
+    }
+}
+
+/// Per-database digests, so repeated fingerprints of unchanged files do not
+/// re-read tens of MiB under the network lock.
+#[derive(Default)]
+pub(super) struct Digests(Mutex<HashMap<&'static str, (Stamp, [u8; 32])>>);
+
+impl Digests {
+    fn of(&self, path: &Path, asset: &Asset) -> Option<[u8; 32]> {
+        let file = fs::File::open(path).ok()?;
+        let stamp = Stamp::of(&file.metadata().ok()?);
+        let mut known = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((_, digest)) = known.get(asset.local).filter(|(at, _)| *at == stamp) {
+            return Some(*digest);
+        }
+        let mut digest = Sha256::new();
+        let mut file = file.take(asset.limit + 1);
+        let mut length = 0u64;
+        let mut buf = [0u8; 16384];
+        loop {
+            let n = file.read(&mut buf).ok()?;
+            if n == 0 {
+                break;
+            }
+            length += n as u64;
+            if length > asset.limit {
+                return None;
+            }
+            digest.update(&buf[..n]);
+        }
+        // Empty, or changed while it was read: never a reusable identity.
+        if length == 0 || length != stamp.len {
+            known.remove(asset.local);
+            return None;
+        }
+        let digest: [u8; 32] = digest.finalize().into();
+        known.insert(asset.local, (stamp, digest));
+        Some(digest)
+    }
+}
+
+/// Hash the actual databases consumed by validation, not just the YAML that
+/// names them. Missing/unreadable/oversized dependencies disable cache reuse.
+pub(super) fn validation_inputs(root: &Path, config: &str, digests: &Digests) -> Option<String> {
+    let config: Value = serde_yaml_ng::from_str(config).ok()?;
+    let mut digest = Sha256::new();
+    for asset in required(&config) {
+        digest.update(asset.local.as_bytes());
+        digest.update(digests.of(&root.join(asset.local), &asset)?);
+    }
+    Some(format!("{:x}", digest.finalize()))
+}
+
 fn file_matches(path: &Path, sha: &str, limit: u64) -> bool {
     let Ok(file) = fs::File::open(path) else {
         return false;
@@ -178,6 +261,86 @@ fn prepare_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validation_cache_tracks_database_bytes_even_with_preserved_size_and_mtime() {
+        let dir = std::env::temp_dir().join(format!("u60-geodata-key-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let config = "geodata-mode: true\nrules: ['GEOIP,CN,DIRECT']";
+        let digests = Digests::default();
+        assert!(validation_inputs(&dir, config, &digests).is_none());
+        let file = dir.join("GeoIP.dat");
+        fs::write(&file, b"first").unwrap();
+        let time = fs::metadata(&file).unwrap().modified().unwrap();
+        let first = validation_inputs(&dir, config, &digests).unwrap();
+        assert_eq!(validation_inputs(&dir, config, &digests).unwrap(), first);
+        // Content, not timestamps, is the key: an in-place rewrite that keeps
+        // size and mtime still differs (fresh digests isolate the content).
+        fs::write(&file, b"other").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(time)
+            .unwrap();
+        assert_ne!(
+            validation_inputs(&dir, config, &Digests::default()).unwrap(),
+            first
+        );
+        assert!(validation_inputs(&dir, "rules: ['MATCH,DIRECT']", &digests).is_some());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn unchanged_databases_reuse_their_digest_but_a_replacement_is_rehashed() {
+        let dir = std::env::temp_dir().join(format!("u60-geodata-memo-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let config = "rules: ['GEOSITE,cn,DIRECT']";
+        let file = dir.join("GeoSite.dat");
+        fs::write(&file, b"first").unwrap();
+        let digests = Digests::default();
+        let first = validation_inputs(&dir, config, &digests).unwrap();
+        // A reused digest is not recomputed: altering the remembered one shows.
+        digests.0.lock().unwrap().get_mut("GeoSite.dat").unwrap().1 = [7; 32];
+        let reused = validation_inputs(&dir, config, &digests).unwrap();
+        assert_ne!(reused, first);
+        let time = fs::metadata(&file).unwrap().modified().unwrap();
+        let next = dir.join("GeoSite.dat.new");
+        fs::write(&next, b"other").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&next)
+            .unwrap()
+            .set_modified(time)
+            .unwrap();
+        fs::rename(&next, &file).unwrap();
+        let replaced = validation_inputs(&dir, config, &digests).unwrap();
+        assert_ne!(replaced, reused);
+        assert_eq!(
+            replaced,
+            validation_inputs(&dir, config, &Digests::default()).unwrap()
+        );
+        fs::remove_file(&file).unwrap();
+        assert!(
+            validation_inputs(&dir, config, &digests).is_none(),
+            "a missing database disables reuse"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_sniffers_geosite_and_geoip_entries_are_required_databases() {
+        let config: Value = serde_yaml_ng::from_str(
+            "sniffer: {enable: true, skip-domain: ['geosite:apple'], skip-dst-address: ['geoip:cn']}\nrules: ['MATCH,DIRECT']",
+        )
+        .unwrap();
+        let local: Vec<_> = required(&config).iter().map(|a| a.local).collect();
+        assert_eq!(local, ["GeoSite.dat", "geoip.metadb"]);
+        let plain: Value =
+            serde_yaml_ng::from_str("sniffer: {enable: true, skip-domain: ['+.push.apple.com']}")
+                .unwrap();
+        assert!(required(&plain).is_empty());
+    }
 
     #[test]
     fn databases_follow_rules_dns_policies_and_ip_mode() {

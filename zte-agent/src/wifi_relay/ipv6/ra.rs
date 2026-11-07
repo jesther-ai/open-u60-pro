@@ -6,7 +6,7 @@ use std::{fs, path::Path, time::Duration};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
-use super::{boot_id, reload_ra, JOURNAL};
+use super::{boot_id, reload_ra, Fault, JOURNAL};
 use crate::net_tools::{self as net, Cmd};
 
 const STATE: &str = "ra-runtime.json";
@@ -145,15 +145,21 @@ pub(super) fn apply(ula: &str, mtu: u32) -> Result<(), String> {
     // Journal before effects; a crash between set_data and its reply is safe.
     overlay.save()?;
     set(&overlay.values)?;
-    maintain()
+    maintain().map_err(Fault::message)
 }
 
-pub(super) fn maintain() -> Result<(), String> {
-    let overlay = read()?.ok_or("Runtime RA ownership journal is missing")?;
+/// A failed netifd query or write is `Unreadable` (retried); a missing or
+/// stale journal or another writer's overlay is a `Conflict`.
+pub(super) fn maintain() -> Result<(), Fault> {
+    let overlay = read()
+        .map_err(Fault::Conflict)?
+        .ok_or_else(|| Fault::Conflict("Runtime RA ownership journal is missing".into()))?;
     if overlay.boot != boot_id() {
-        return Err("Runtime RA belongs to a previous boot".into());
+        return Err(Fault::Conflict(
+            "Runtime RA belongs to a previous boot".into(),
+        ));
     }
-    let current = data()?;
+    let current = data().map_err(Fault::Unreadable)?;
     if overlay
         .values
         .iter()
@@ -164,8 +170,8 @@ pub(super) fn maintain() -> Result<(), String> {
     // A LAN/netifd reinitialization discards all runtime data. Rebuild only
     // from this session's live lease; never adopt someone else's overlay.
     if overlay.values.keys().all(|key| absent(&current, key)) {
-        set(&overlay.values)?;
-        let current = data()?;
+        set(&overlay.values).map_err(Fault::Unreadable)?;
+        let current = data().map_err(Fault::Unreadable)?;
         if overlay
             .values
             .iter()
@@ -174,7 +180,9 @@ pub(super) fn maintain() -> Result<(), String> {
             return Ok(());
         }
     }
-    Err("LAN runtime RA changed externally; relay IPv6 is being released".into())
+    Err(Fault::Conflict(
+        "LAN runtime RA changed externally; relay IPv6 is being released".into(),
+    ))
 }
 
 pub(super) fn release() -> Result<(), String> {

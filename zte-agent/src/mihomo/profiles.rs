@@ -3,6 +3,7 @@
 
 use std::fs;
 use std::io::Read;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -15,6 +16,10 @@ use transform::Extensions;
 const MAX_PROFILES: usize = 16;
 const MAX_LIBRARY: u64 = 24 * 1024 * 1024;
 const INTERVALS: &[u64] = &[0, 1, 6, 12, 24, 72, 168];
+
+/// Saves in this process, plus the library file's mtime and length: a status
+/// answered from `Mihomo::status_cache` is valid while all three are unchanged.
+pub(super) type LibraryStamp = (u64, Option<SystemTime>, u64);
 
 #[derive(Clone, Deserialize, Serialize)]
 struct Profile {
@@ -103,29 +108,7 @@ impl Mihomo {
                 }
                 Ok(library)
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let mut library = Library::default();
-                match fs::read_to_string(self.root.join("source.yaml")) {
-                    Ok(source) => {
-                        transform::mapping(&source)?;
-                        library.selected = Some("legacy".into());
-                        library.profiles.push(Profile {
-                            id: "legacy".into(),
-                            name: "Existing configuration".into(),
-                            url: None,
-                            interval_hours: 0,
-                            updated: 0,
-                            attempted: 0,
-                            error: None,
-                            compiled: source.clone(),
-                            source,
-                        });
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(_) => return Err("Cannot read existing configuration".into()),
-                }
-                Ok(library)
-            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Library::default()),
             Err(_) => Err("Cannot read profile library".into()),
         }
     }
@@ -136,7 +119,16 @@ impl Mihomo {
             return Err("Profile library is full".into());
         }
         net::write_private(&self.library_path(), &bytes)
-            .map_err(|_| "Cannot save private profile library".into())
+            .map_err(|_| "Cannot save private profile library".to_owned())?;
+        self.library_revision.fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
+
+    fn library_stamp(&self) -> LibraryStamp {
+        let (modified, length) = fs::metadata(self.library_path())
+            .map(|m| (m.modified().ok(), m.len()))
+            .unwrap_or((None, 0));
+        (self.library_revision.load(Ordering::Acquire), modified, length)
     }
 
     pub(super) fn selected_source(&self) -> Result<String, String> {
@@ -147,15 +139,32 @@ impl Mihomo {
     }
 
     pub fn profile_status(&self) -> Result<Value, String> {
+        // The library can hold up to 24 MB of subscription text (each profile
+        // stored twice); status is polled, so parse it only after a change.
+        let stamp = self.library_stamp();
+        if let Some((cached, value)) = self
+            .status_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            if *cached == stamp {
+                return Ok(value.clone());
+            }
+        }
         let library = self.load_library()?;
-        Ok(
+        let value =
             json!({"selected": library.selected, "profiles":library.profiles.iter().map(|p| json!({
             "id":p.id,"name":p.name,"remote":p.url.is_some(),"interval_hours":p.interval_hours,
             "updated":p.updated,"attempted":p.attempted,"error":p.error
         })).collect::<Vec<_>>(), "merge_enabled": library.extensions.merge_enabled,
             "script_enabled":library.extensions.script_enabled,
-            "merge_saved":!library.extensions.merge.is_empty(),"script_saved":!library.extensions.script.is_empty()}),
-        )
+            "merge_saved":!library.extensions.merge.is_empty(),"script_saved":!library.extensions.script.is_empty()});
+        *self
+            .status_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((stamp, value.clone()));
+        Ok(value)
     }
 
     /// Explicit authenticated editor only; not a status/list response.
@@ -185,7 +194,7 @@ impl Mihomo {
         // The profile mutex also excludes installation. Do not hold the core
         // lifecycle mutex here: relay loss must be able to restart the core.
         net::write_private(&self.root.join("check.yaml"), config.as_bytes())?;
-        let result = self.check("check.yaml");
+        let result = self.check_with("check.yaml", self.running());
         let _ = fs::remove_file(self.root.join("check.yaml"));
         result
     }
@@ -575,6 +584,26 @@ pub fn status(state: &crate::handlers::AppState) -> (u16, Value) {
     }
 }
 
+/// Explicit editor read for one profile (name, schedule, subscription URL).
+/// Never part of status or list answers; the route requires the agent password.
+pub fn editor(state: &crate::handlers::AppState, id: &str) -> (u16, Value) {
+    if id.is_empty() || id.len() > 64 || !id.bytes().all(|c| c.is_ascii_alphanumeric()) {
+        return (400, json!({"ok":false,"error":"Invalid profile ID"}));
+    }
+    match state.mihomo.profile_editor(id) {
+        Ok(data) => (200, json!({"ok":true,"data":data})),
+        Err(e) => (if e == "Unknown profile" { 404 } else { 503 }, json!({"ok":false,"error":e})),
+    }
+}
+
+/// Explicit editor read for the global Merge and Script (private content).
+pub fn extensions(state: &crate::handlers::AppState) -> (u16, Value) {
+    match state.mihomo.extensions_editor() {
+        Ok(data) => (200, json!({"ok":true,"data":data})),
+        Err(e) => (503, json!({"ok":false,"error":e})),
+    }
+}
+
 pub fn change(state: &crate::handlers::AppState, body: &[u8]) -> (u16, Value) {
     let request = match serde_json::from_slice(body) {
         Ok(v) => v,
@@ -590,6 +619,27 @@ pub fn change(state: &crate::handlers::AppState, body: &[u8]) -> (u16, Value) {
 mod tests {
     use super::*;
 
+    /// A library holding one local profile, saved through the normal path.
+    fn seed(mihomo: &Mihomo, source: &str) -> Library {
+        let library = Library {
+            selected: Some("seed".into()),
+            profiles: vec![Profile {
+                id: "seed".into(),
+                name: "Seeded".into(),
+                url: None,
+                interval_hours: 0,
+                updated: 0,
+                attempted: 0,
+                error: None,
+                source: source.into(),
+                compiled: source.into(),
+            }],
+            ..Library::default()
+        };
+        mihomo.save_library(&library).unwrap();
+        library
+    }
+
     #[test]
     fn urls_never_accept_insecure_redirects_or_local_files() {
         for url in [
@@ -604,15 +654,10 @@ mod tests {
     }
 
     #[test]
-    fn metadata_has_no_subscription_or_node_credentials_and_legacy_is_preserved() {
+    fn metadata_has_no_subscription_or_node_credentials() {
         let dir = std::env::temp_dir().join(format!("u60-profiles-{}", std::process::id()));
-        net::write_private(
-            &dir.join("source.yaml"),
-            b"secret: private-node\nrules: ['MATCH,DIRECT']",
-        )
-        .unwrap();
         let mihomo = Mihomo::at(dir.clone(), Arc::new(std::sync::Mutex::new(())));
-        let mut library = mihomo.load_library().unwrap();
+        let mut library = seed(&mihomo, "secret: private-node\nrules: ['MATCH,DIRECT']");
         library.profiles[0].url = Some("https://example.com/?token=private-url".into());
         library.extensions.merge = "secret: private-extension-secret".into();
         library.extensions.script = "function main(c) { c.secret = 'private-script-secret'; return c; }".into();
@@ -628,7 +673,32 @@ mod tests {
             mihomo.selected_source().unwrap(),
             library.profiles[0].source
         );
-        assert!(dir.join("source.yaml").exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn status_is_parsed_once_per_change_of_the_library() {
+        let dir = std::env::temp_dir().join(format!("u60-status-cache-{}", std::process::id()));
+        let mihomo = Mihomo::at(dir.clone(), Arc::new(std::sync::Mutex::new(())));
+        seed(&mihomo, "rules: ['MATCH,DIRECT']");
+        let first = mihomo.profile_status().unwrap();
+        assert_eq!(first["selected"], "seed");
+        mihomo.save_library(&mihomo.load_library().unwrap()).unwrap();
+        let saved = mihomo.profile_status().unwrap();
+        assert_eq!(saved, first);
+        // Same length and mtime, damaged content: only a cached answer survives.
+        let path = mihomo.library_path();
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        let length = fs::metadata(&path).unwrap().len() as usize;
+        fs::write(&path, vec![b'x'; length]).unwrap();
+        fs::File::options().write(true).open(&path).unwrap().set_modified(modified).unwrap();
+        assert_eq!(mihomo.profile_status().unwrap(), first, "served from the cache");
+        // A different length (an out-of-band edit) must be noticed.
+        fs::write(&path, b"damaged").unwrap();
+        assert!(mihomo.profile_status().is_err());
+        // A save from this process always invalidates, even within one mtime tick.
+        mihomo.save_library(&Library::default()).unwrap();
+        assert!(mihomo.profile_status().unwrap()["selected"].is_null());
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -654,14 +724,12 @@ mod tests {
     fn delete_rechecks_lifecycle_before_committing_a_racing_start() {
         let dir =
             std::env::temp_dir().join(format!("u60-profile-start-race-{}", std::process::id()));
-        net::write_private(&dir.join("source.yaml"), b"rules: ['MATCH,DIRECT']").unwrap();
         let mihomo = Mihomo::for_bridge(
             dir.clone(),
             Arc::new(std::sync::Mutex::new(())),
             "test-secret".into(),
         );
-        let old = mihomo.load_library().unwrap();
-        mihomo.save_library(&old).unwrap();
+        let old = seed(&mihomo, "rules: ['MATCH,DIRECT']");
         let before = fs::read(mihomo.library_path()).unwrap();
         let next = Library {
             selected: None,

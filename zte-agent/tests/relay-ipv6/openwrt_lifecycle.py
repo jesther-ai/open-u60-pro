@@ -84,10 +84,6 @@ def lifecycle():
             "chroot", str(ROOT), "/qa-tests", "--ignored", "--exact",
             "wifi_relay::ipv6::tests::isolated_openwrt_runtime_ra_does_not_restore_old_ipv6", "--nocapture",
         ], env={**os.environ, "U60_IPV6_ISOLATED_QA": "1"}, check=True, timeout=60)
-        subprocess.run([
-            "chroot", str(ROOT), "/qa-tests", "--ignored", "--exact",
-            "wifi_relay::ipv6::tests::isolated_openwrt_previous_boot_ra_recovery", "--nocapture",
-        ], env={**os.environ, "U60_IPV6_ISOLATED_QA": "1"}, check=True, timeout=60)
         # netifd's initial proto-none setup flushed the earlier dummy address.
         # Establish the vendor LAN prefix before testing renumber/removal.
         ip("-6", "addr", "replace", "2001:db8:2::1/64", "dev", "br-lan")

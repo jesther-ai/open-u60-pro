@@ -33,13 +33,7 @@ fn legal_width(width: u32) -> bool {
 
 impl Entry {
     fn valid(&self) -> bool {
-        legal_width(self.width)
-            && match self.source.as_deref() {
-                // 旧格式没有来源和信号；保留原样，不能补写成已测量的 airtime。
-                None => true,
-                Some("airtime") => self.signal_dbm.is_some(),
-                _ => false,
-            }
+        legal_width(self.width) && self.source.as_deref() == Some("airtime") && self.signal_dbm.is_some()
     }
 }
 
@@ -72,7 +66,7 @@ pub(crate) fn remembered(
     })
 }
 
-/// 只新增 airtime 记录；保留旧记录的来源，最新优先、按网络替换，最多 32 条。
+/// 只写 airtime 记录；最新优先、按网络替换，最多 32 条。不是 airtime 记录的条目随重写丢弃。
 pub(crate) fn remember(
     path: &Path,
     id: &str,
@@ -163,24 +157,17 @@ mod tests {
     }
 
     #[test]
-    fn legacy_and_airtime_entries_can_be_read_together() {
+    fn airtime_entries_with_and_without_a_verified_utc_can_be_read_together() {
         let file = File::new();
         fs::write(
             &file.0,
             br#"[
-            {"id":"legacy20","width":20},
-            {"id":"legacy40","width":40},
             {"id":"airtime80","width":80,"source":"airtime","signal_dbm":-50},
             {"id":"airtime160","width":160,"source":"airtime","signal_dbm":-50,"saved_utc":100}
         ]"#,
         )
         .unwrap();
-        for (id, width) in [
-            ("legacy20", 20),
-            ("legacy40", 40),
-            ("airtime80", 80),
-            ("airtime160", 160),
-        ] {
+        for (id, width) in [("airtime80", 80), ("airtime160", 160)] {
             assert_eq!(
                 remembered(&file.0, id, -50, Some(100)),
                 Some(History {
@@ -211,14 +198,15 @@ mod tests {
     }
 
     #[test]
-    fn rewrites_preserve_legacy_provenance_and_drop_unsupported_sources() {
+    fn rewrites_keep_airtime_records_and_drop_everything_else() {
         let file = File::new();
         fs::write(
             &file.0,
             br#"[
-            {"id":"legacy","width":40},
+            {"id":"old-format","width":40},
             {"id":"phy","width":80,"source":"phy","signal_dbm":-50},
-            {"id":"bad-width","width":320}
+            {"id":"bad-width","width":320},
+            {"id":"kept","width":160,"source":"airtime","signal_dbm":-45}
         ]"#,
         )
         .unwrap();
@@ -227,15 +215,8 @@ mod tests {
             file.entries(),
             json!([
                 {"id":"new","width":20,"source":"airtime","signal_dbm":-50},
-                {"id":"legacy","width":40}
+                {"id":"kept","width":160,"source":"airtime","signal_dbm":-45}
             ])
-        );
-        assert_eq!(
-            remembered(&file.0, "legacy", -90, Some(u64::MAX)),
-            Some(History {
-                width: 40,
-                usable: true
-            })
         );
     }
 
@@ -256,6 +237,8 @@ mod tests {
         }
         fs::write(&file.0, br#"[{"id":"one","width":20,"source":"airtime"}]"#).unwrap();
         assert_eq!(remembered(&file.0, "one", -50, None), None);
+        fs::write(&file.0, br#"[{"id":"one","width":20}]"#).unwrap();
+        assert_eq!(remembered(&file.0, "one", -50, None), None, "a record without a source is not a measurement");
     }
 
     #[test]
@@ -387,7 +370,7 @@ mod tests {
         let file = File::new();
         fs::write(
             &file.0,
-            br#"[{"id":"one","width":20},{"id":"one","width":40}]"#,
+            br#"[{"id":"one","width":20,"source":"airtime","signal_dbm":-50},{"id":"one","width":40,"source":"airtime","signal_dbm":-50}]"#,
         )
         .unwrap();
         assert_eq!(

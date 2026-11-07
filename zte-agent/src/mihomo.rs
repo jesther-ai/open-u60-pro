@@ -6,8 +6,9 @@ use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use serde_yaml_ng::{Mapping, Value as Yaml};
@@ -15,6 +16,8 @@ use sha2::{Digest, Sha256};
 
 use crate::net_tools::{self as net, Cmd, NetworkLock, Step, Transaction};
 
+pub mod control;
+pub mod dashboard;
 mod dns;
 mod download;
 mod geodata;
@@ -53,6 +56,197 @@ struct Running {
     local_name: String,
     runtime: Value,
     local_addresses: Vec<std::net::IpAddr>,
+    rules_checked: Option<Instant>,
+    /// Egress this core's connections use: observed just before it started,
+    /// then updated in place by non-stranding watchdog observations.
+    uplink: Uplink,
+    /// A stranding egress the watchdog saw, and since when it has held.
+    stranding: Option<(Uplink, Instant)>,
+}
+
+impl Running {
+    fn alive(&mut self) -> bool {
+        self.child
+            .as_mut()
+            .is_some_and(|c| matches!(c.try_wait(), Ok(None)))
+    }
+}
+
+/// The relay's station interface (`wifi_relay::IFACE`). The relay announces
+/// changes of its own path through `uplink_changed_locked`.
+const RELAY_IFACE: &str = "u60sta0";
+/// A stranding egress change must stay identical this long before the
+/// watchdog restarts the core: a flapping uplink restarts nothing until it settles.
+const EGRESS_SETTLE: Duration = Duration::from_secs(5);
+/// At most one watchdog egress restart per window. Relay notifications and
+/// owner operations are not limited.
+const EGRESS_RESTART_GAP: Duration = Duration::from_secs(60);
+
+/// Effective egress per family (IPv4, IPv6), excluding timers/cache counters
+/// and unrelated local IPs. `None`: no readable route or source address set.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Uplink {
+    paths: [Option<Egress>; 2],
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Egress {
+    route: RouteIdentity,
+    source: SourceIdentity,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RouteIdentity {
+    device: String,
+    gateway: Option<String>,
+    source: Option<String>,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SourceIdentity {
+    ifindex: u64,
+    addresses: Vec<(std::net::IpAddr, u8)>,
+}
+impl Uplink {
+    fn route(text: &str) -> Option<RouteIdentity> {
+        let routes: Value = serde_json::from_str(text).ok()?;
+        let route = routes.as_array()?.first()?;
+        Some(RouteIdentity {
+            device: route["dev"].as_str()?.into(),
+            gateway: route["gateway"].as_str().map(str::to_owned),
+            source: route["prefsrc"]
+                .as_str()
+                .or_else(|| route["src"].as_str())
+                .map(str::to_owned),
+        })
+    }
+    fn read(routes: [Option<RouteIdentity>; 2], text: &str) -> Self {
+        let links: Option<Value> = serde_json::from_str(text).ok();
+        let source = |route: &RouteIdentity, family: &str| -> Option<SourceIdentity> {
+            let link = links
+                .as_ref()?
+                .as_array()?
+                .iter()
+                .find(|v| v["ifname"].as_str() == Some(&route.device))?;
+            let mut addresses = Vec::new();
+            for addr in link["addr_info"]
+                .as_array()?
+                .iter()
+                .filter(|a| a["family"].as_str() == Some(family))
+            {
+                let ip: std::net::IpAddr = addr["local"].as_str()?.parse().ok()?;
+                let prefix = addr["prefixlen"].as_u64()?;
+                if ip.is_ipv4() != (family == "inet")
+                    || prefix > if ip.is_ipv4() { 32 } else { 128 }
+                {
+                    return None;
+                }
+                addresses.push((ip, prefix as u8));
+            }
+            if addresses.is_empty() {
+                return None;
+            }
+            addresses.sort_unstable();
+            addresses.dedup();
+            Some(SourceIdentity {
+                ifindex: link["ifindex"].as_u64()?,
+                addresses,
+            })
+        };
+        let path = |route: Option<RouteIdentity>, family: &str| -> Option<Egress> {
+            let route = route?;
+            let source = source(&route, family)?;
+            Some(Egress { route, source })
+        };
+        let [v4, v6] = routes;
+        Self {
+            paths: [path(v4, "inet"), path(v6, "inet6")],
+        }
+    }
+    fn observe() -> Self {
+        let routes = [("-4", "1.1.1.1"), ("-6", "2606:4700:4700::1111")].map(|(family, to)| {
+            Cmd::new("ip", &["-j", family, "route", "get", to])
+                .run()
+                .ok()
+                .and_then(|s| Self::route(&s))
+        });
+        let addresses = Cmd::new("ip", &["-j", "addr", "show"])
+            .run()
+            .unwrap_or_default();
+        Self::read(routes, &addresses)
+    }
+    /// An unreadable/offline family is not evidence for skipping a restart:
+    /// only a fully known dual-stack egress can make a notification redundant.
+    fn complete(&self) -> bool {
+        self.paths.iter().all(Option::is_some)
+    }
+    /// Connections opened on `earlier` cannot leave through this egress any
+    /// more: a readable family moved to another interface (name or index) or
+    /// lost a source address it had. Added addresses, gateway or preferred
+    /// source changes and a newly available family keep them usable; an
+    /// unreadable family is no evidence (a failed read, or a lost uplink).
+    fn strands(&self, earlier: &Self) -> bool {
+        self.paths
+            .iter()
+            .zip(&earlier.paths)
+            .any(|(now, then)| match (now, then) {
+                (Some(now), Some(then)) => {
+                    now.route.device != then.route.device
+                        || now.source.ifindex != then.source.ifindex
+                        || then
+                            .source
+                            .addresses
+                            .iter()
+                            .any(|(ip, _)| !now.source.addresses.iter().any(|(kept, _)| kept == ip))
+                }
+                _ => false,
+            })
+    }
+    /// Takes readable families as the new reference. An unreadable family
+    /// keeps the last one, so its return on another address still strands.
+    fn adopt(&mut self, observed: &Self) {
+        for (kept, now) in self.paths.iter_mut().zip(&observed.paths) {
+            if now.is_some() {
+                kept.clone_from(now);
+            }
+        }
+    }
+    fn relayed(&self) -> bool {
+        self.paths
+            .iter()
+            .flatten()
+            .any(|path| path.route.device == RELAY_IFACE)
+    }
+}
+
+/// One watchdog egress observation. `uplink` is the egress the running core's
+/// connections use, `stranding` a stranding observation and when it was first
+/// seen. True: restart the core now.
+fn settle_egress(
+    uplink: &mut Uplink,
+    stranding: &mut Option<(Uplink, Instant)>,
+    observed: Uplink,
+    last_restart: Option<Instant>,
+    now: Instant,
+) -> bool {
+    if uplink.relayed() || observed.relayed() {
+        *stranding = None;
+        return false;
+    }
+    if !observed.strands(uplink) {
+        uplink.adopt(&observed);
+        *stranding = None;
+        return false;
+    }
+    match stranding {
+        Some((seen, since)) if *seen == observed => restart_due(*since, last_restart) <= now,
+        _ => {
+            *stranding = Some((observed, now));
+            false
+        }
+    }
+}
+
+fn restart_due(since: Instant, last_restart: Option<Instant>) -> Instant {
+    let settled = since + EGRESS_SETTLE;
+    last_restart.map_or(settled, |at| settled.max(at + EGRESS_RESTART_GAP))
 }
 
 struct RestartState {
@@ -66,6 +260,8 @@ struct Inner {
     error: Option<String>,
     /// Any owner switch supersedes this process's boot restoration.
     restore_cancelled: bool,
+    /// Last watchdog egress restart; the rate limit spans core restarts.
+    egress_restarted: Option<Instant>,
 }
 
 pub struct Mihomo {
@@ -75,7 +271,14 @@ pub struct Mihomo {
     profile_operation: Mutex<()>,
     profile_wake: Condvar,
     profile_revision: Mutex<u64>,
+    library_revision: AtomicU64,
+    status_cache: Mutex<Option<(profiles::LibraryStamp, Value)>>,
+    /// Fingerprint (secret masked) of the last configuration that passed
+    /// `mihomo -t` and then started; an identical restart skips the check.
+    validated_config: Mutex<Option<String>>,
+    digests: geodata::Digests,
     subscription_dns: Mutex<Vec<std::net::Ipv4Addr>>,
+    passes: dashboard::Passes,
     inner: Mutex<Inner>,
     wake: Condvar,
 }
@@ -93,11 +296,17 @@ impl Mihomo {
             profile_operation: Mutex::new(()),
             profile_wake: Condvar::new(),
             profile_revision: Mutex::new(0),
+            library_revision: AtomicU64::new(0),
+            status_cache: Mutex::new(None),
+            validated_config: Mutex::new(None),
+            digests: geodata::Digests::default(),
             subscription_dns: Mutex::new(Vec::new()),
+            passes: dashboard::Passes::default(),
             inner: Mutex::new(Inner {
                 run: None,
                 error: None,
                 restore_cancelled: false,
+                egress_restarted: None,
             }),
             wake: Condvar::new(),
         }
@@ -113,6 +322,9 @@ impl Mihomo {
             local_name: "u60.home.arpa".into(),
             runtime: json!({"mode":"rule","log-level":"info"}),
             local_addresses: Vec::new(),
+            rules_checked: None,
+            uplink: Uplink::default(),
+            stranding: None,
         });
         this
     }
@@ -210,11 +422,7 @@ impl Mihomo {
                     .inner
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let dead = i.run.as_mut().is_some_and(|r| {
-                    r.child
-                        .as_mut()
-                        .is_none_or(|c| !matches!(c.try_wait(), Ok(None)))
-                });
+                let dead = i.run.as_mut().is_some_and(|r| !r.alive());
                 if dead {
                     drop(i);
                     let error = this
@@ -242,20 +450,96 @@ impl Mihomo {
     }
 
     // B31 cannot match the live FIB LOCAL type. Reuse the active watchdog to
-    // refresh exact-address exemptions, including vendor IPv6 renumbering.
+    // refresh exact-address exemptions in place, including vendor IPv6
+    // renumbering: an address change alone (Tailscale, LAN, a non-egress
+    // interface) keeps the core running. Outside the relay (cellular) only an
+    // egress that strands the core's connections restarts it: another
+    // interface or a lost source address, settled for `EGRESS_SETTLE` and at
+    // most once per `EGRESS_RESTART_GAP`. The relay announces changes of its
+    // own path (`uplink_changed_locked`).
     fn refresh_local_locked(&self) -> Result<(), String> {
         let local = local_addresses()?;
-        let changed = self
-            .inner
+        // The caller's network lock serializes every user of `run.network`, so
+        // the journal leaves `inner` while device commands run: status, secret
+        // and dashboard requests never wait for iptables or a journal fsync.
+        let audit = {
+            let mut inner = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let last_restart = inner.egress_restarted;
+            let Some(run) = inner.run.as_mut() else {
+                return Ok(());
+            };
+            let audit = run.local_addresses != local
+                || !run
+                    .rules_checked
+                    .is_some_and(|at| at.elapsed() < net::EXEMPTION_AUDIT);
+            let settled = run
+                .stranding
+                .as_ref()
+                .is_some_and(|(_, since)| restart_due(*since, last_restart) <= Instant::now());
+            if !audit && !settled {
+                return Ok(());
+            }
+            audit.then(|| {
+                let network = std::mem::replace(&mut run.network, Transaction::new(PathBuf::new()));
+                (network, run.local_addresses.clone())
+            })
+        };
+        if let Some((mut network, previous)) = audit {
+            let synced = sync_local(&mut network, &local, &previous);
+            let mut inner = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(run) = inner.run.as_mut() else {
+                // Unreachable under the network lock; never lose the journal.
+                drop(inner);
+                return network.rollback().and(synced);
+            };
+            run.network = network;
+            if synced.is_ok() {
+                run.local_addresses = local;
+                run.rules_checked = Some(Instant::now());
+            }
+            drop(inner);
+            synced?;
+        }
+        let observed = Uplink::observe();
+        let restart = {
+            let mut inner = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let last_restart = inner.egress_restarted;
+            let Some(run) = inner.run.as_mut() else {
+                return Ok(());
+            };
+            settle_egress(
+                &mut run.uplink,
+                &mut run.stranding,
+                observed,
+                last_restart,
+                Instant::now(),
+            )
+        };
+        if !restart {
+            return Ok(());
+        }
+        // An owner operation restarts or stops the core itself; the next
+        // watchdog tick retries while the same stranding egress holds.
+        let Ok(_operation) = self.operation.try_lock() else {
+            return Ok(());
+        };
+        self.inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .run
-            .as_ref()
-            .is_some_and(|r| r.local_addresses != local);
-        if changed {
-            self.uplink_changed_locked()?;
-        }
-        Ok(())
+            .egress_restarted = Some(Instant::now());
+        eprintln!(
+            "[mihomo] egress left the core's interface or source address; restarting the core"
+        );
+        self.restart_locked()
     }
 
     pub fn install(&self) -> Result<(), String> {
@@ -271,6 +555,10 @@ impl Mihomo {
         if self.running() {
             return Err("Turn off Mihomo before installing".into());
         }
+        *self
+            .validated_config
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         net::private_dir(&self.root)?;
         let core = self.download(CORE_URL, CORE_SHA, 32 * 1024 * 1024)?;
         let mut binary = Vec::new();
@@ -340,15 +628,58 @@ impl Mihomo {
         })
     }
 
+    fn validation_fingerprint(&self, config: &str, secret: &str) -> Option<String> {
+        use std::os::unix::fs::MetadataExt;
+        let core = fs::metadata(self.root.join("mihomo")).ok()?;
+        let dependencies = geodata::validation_inputs(&self.root, config, &self.digests)?;
+        Some(format!(
+            "{}:{dependencies}:{}:{}:{}:{}:{}",
+            config_fingerprint(config, secret),
+            core.dev(),
+            core.ino(),
+            core.len(),
+            core.mtime(),
+            core.mtime_nsec()
+        ))
+    }
+
     fn check(&self, name: &str) -> Result<(), String> {
+        self.check_with(name, false)
+    }
+
+    /// `background` keeps a validation that runs beside a live core (profile
+    /// refresh) from competing with forwarding: one Go execution slot, a soft memory
+    /// limit for the Go runtime, and a lower scheduling priority.
+    fn check_with(&self, name: &str, background: bool) -> Result<(), String> {
         let mut c = Command::new(self.root.join("mihomo"));
         c.env("SKIP_SYSTEM_IPV6_CHECK", "true");
+        if background {
+            use std::os::unix::process::CommandExt;
+            c.env("GOMAXPROCS", "1").env("GOMEMLIMIT", "128MiB");
+            // SAFETY: only the async-signal-safe setpriority(2) runs before exec.
+            unsafe {
+                c.pre_exec(|| {
+                    libc::setpriority(libc::PRIO_PROCESS as _, 0, 10);
+                    Ok(())
+                });
+            }
+        }
         c.args(["-t", "-d"])
             .arg(&self.root)
             .arg("-f")
             .arg(self.root.join(name));
-        net::run(c, Duration::from_secs(30))
-            .map(|_| ())
+        let started = Instant::now();
+        let result = net::run(c, Duration::from_secs(30));
+        let outcome = match &result {
+            Ok(_) => "ok",
+            Err(error) if error == "Device tool timed out" => "timeout",
+            Err(_) => "rejected",
+        };
+        eprintln!(
+            "[mihomo] validation background={background} elapsed_ms={} outcome={outcome}",
+            started.elapsed().as_millis()
+        );
+        result.map(|_| ())
             .map_err(|error| {
                 if error == "Device tool timed out" {
                     "Mihomo validation timed out; a provider or rule database may be unavailable. Check Internet access and retry; the saved configuration is unchanged".into()
@@ -478,7 +809,7 @@ impl Mihomo {
         // the core available without creating a route or enabling the modem.
         if Cmd::new("ip", &["-4", "route", "get", "1.1.1.1"])
             .run()
-            .is_ok_and(|route| route.contains("dev u60sta0"))
+            .is_ok_and(|route| route.contains(&format!("dev {RELAY_IFACE}")))
         {
             if let Err(error) = crate::network_clock::sync_wifi() {
                 // A captive portal must not tear down working IPv4 relay.
@@ -488,7 +819,7 @@ impl Mihomo {
             config
                 .as_mapping_mut()
                 .unwrap()
-                .insert(Yaml::from("interface-name"), Yaml::from("u60sta0"));
+                .insert(Yaml::from("interface-name"), Yaml::from(RELAY_IFACE));
         }
         if let Some(runtime) = runtime {
             for key in ["mode", "log-level"] {
@@ -504,7 +835,22 @@ impl Mihomo {
         let config =
             serde_yaml_ng::to_string(&config).map_err(|_| "Cannot encode managed configuration")?;
         net::write_private(&self.root.join("config.yaml"), config.as_bytes())?;
-        self.check("config.yaml")?;
+        let fingerprint = self.validation_fingerprint(&config, &secret);
+        let reused = fingerprint.is_some()
+            && *self
+                .validated_config
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                == fingerprint;
+        let validated = if reused {
+            eprintln!("[mihomo] validation reused");
+            fingerprint
+        } else {
+            self.check("config.yaml")?;
+            // Only dependencies that stayed the same across the check passed it.
+            let after = self.validation_fingerprint(&config, &secret);
+            fingerprint.filter(|key| after.as_ref() == Some(key))
+        };
         dns::available(1053)?;
         drop(
             std::net::TcpListener::bind(download::PROXY)
@@ -565,16 +911,16 @@ impl Mihomo {
             local_name: local_name.into(),
             runtime,
             local_addresses,
+            rules_checked: None,
+            uplink: Uplink::observe(),
+            stranding: None,
         };
         let (guards, interception): (Vec<_>, Vec<_>) = plan
             .into_iter()
             .partition(|s| s.apply.args.windows(2).any(|w| w == ["-t", "filter"]));
         // Guard DNS and the private TUN addresses before the core can bind.
         // The authenticated controller itself always binds loopback.
-        if let Err(e) = guards
-            .into_iter()
-            .try_for_each(|s| running.network.apply(s))
-        {
+        if let Err(e) = running.network.apply_network(guards) {
             return Err(running.network.rollback().err().unwrap_or(e));
         }
         // sing-tun v0.4.28 still creates an IPv6 oif rule with auto-route off.
@@ -615,37 +961,39 @@ impl Mihomo {
         let result = if !ready {
             Err("Mihomo controller, private download proxy, TUN or dual-stack TCP/UDP DNS did not become ready".into())
         } else {
-            interception
-                .into_iter()
-                .try_for_each(|s| running.network.apply(s))
-                .and_then(|_| {
-                    for (family, destination) in [("-4", "1.1.1.1"), ("-6", "2606:4700:4700::1111")]
-                    {
-                        let route = Cmd::new(
-                            "ip",
-                            &[family, "route", "get", destination, "mark", "0x600"],
-                        )
-                        .run()?;
-                        if !route.contains(&format!("dev {TUN}")) {
-                            return Err(
-                                "Firmware policy routing did not select Mihomo's TUN table".into(),
-                            );
-                        }
+            running.network.apply_network(interception).and_then(|_| {
+                for (family, destination) in [("-4", "1.1.1.1"), ("-6", "2606:4700:4700::1111")] {
+                    let route = Cmd::new(
+                        "ip",
+                        &[family, "route", "get", destination, "mark", "0x600"],
+                    )
+                    .run()?;
+                    if !route.contains(&format!("dev {TUN}")) {
+                        return Err(
+                            "Firmware policy routing did not select Mihomo's TUN table".into()
+                        );
                     }
-                    Ok(())
-                })
+                }
+                Ok(())
+            })
         };
         if let Err(e) = result {
             net::stop_child(&mut running.child);
             let rollback = running.network.rollback();
             return Err(rollback.err().unwrap_or(e));
         }
+        let current = self.validation_fingerprint(&config, &running.secret);
         let mut i = self
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         i.run = Some(running);
         i.error = None;
+        *self
+            .validated_config
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            validated.filter(|key| current.as_ref() == Some(key));
         self.wake.notify_all();
         Ok(())
     }
@@ -657,6 +1005,24 @@ impl Mihomo {
             .operation
             .try_lock()
             .map_err(|_| "A Mihomo operation is in progress; restart it after the uplink change")?;
+        let observed = Uplink::observe();
+        let duplicate = observed.complete()
+            && self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .run
+                .as_mut()
+                .is_some_and(|r| r.uplink == observed && r.alive());
+        if duplicate {
+            eprintln!("[mihomo] duplicate uplink notification; core kept running");
+            return Ok(());
+        }
+        self.restart_locked()
+    }
+
+    /// Caller owns the network and operation locks.
+    fn restart_locked(&self) -> Result<(), String> {
         if let Some(state) = self.capture_runtime() {
             self.disable_locked()?;
             self.resume_runtime(&state)?;
@@ -752,6 +1118,48 @@ fn local_addresses() -> Result<Vec<std::net::IpAddr>, String> {
     addresses.sort_unstable();
     addresses.dedup();
     Ok(addresses)
+}
+
+/// The mangle exemption that keeps traffic to one of the router's own
+/// addresses out of the proxy (`proxy_plan` appends the same rule at start).
+fn exemption(address: &std::net::IpAddr) -> Step {
+    let tool = if address.is_ipv4() {
+        "iptables"
+    } else {
+        "ip6tables"
+    };
+    net::rule(
+        tool,
+        "mangle",
+        "U60_MH",
+        &["-d", &address.to_string(), "-j", "RETURN"],
+        true,
+    )
+}
+
+/// Each family's exemptions from one chain snapshot (`net::sync_exemptions`):
+/// new or externally deleted addresses are inserted ahead of the MARK rules.
+fn sync_local(
+    network: &mut Transaction,
+    local: &[std::net::IpAddr],
+    previous: &[std::net::IpAddr],
+) -> Result<(), String> {
+    for tool in ["iptables", "ip6tables"] {
+        let family = |a: &&std::net::IpAddr| a.is_ipv4() == (tool == "iptables");
+        let current: Vec<_> = local.iter().filter(family).copied().collect();
+        let previous: Vec<_> = previous.iter().filter(family).copied().collect();
+        let present = net::firewall::exclusions(tool, "mangle", "U60_MH", "RETURN")?;
+        net::sync_exemptions(network, &present, &current, &previous, exemption)?;
+    }
+    Ok(())
+}
+
+/// Identifies a configuration by content with the per-start secret masked.
+fn config_fingerprint(config: &str, secret: &str) -> String {
+    format!(
+        "{:x}",
+        Sha256::digest(config.replace(secret, "<secret>").as_bytes())
+    )
 }
 
 fn valid_runtime(runtime: &Value) -> bool {
@@ -861,7 +1269,6 @@ fn config_with_lan_host(
         "routing-mark",
         "authentication",
         "script",
-        "sniffer",
         "tun",
         "geox-url",
         "ss-config",
@@ -1297,6 +1704,262 @@ mod tests {
     use super::*;
 
     #[test]
+    fn uplink_identity_ignores_route_counters_but_tracks_egress() {
+        let a = Uplink::route(
+            r#"[{"dev":"u60sta0","gateway":"192.0.2.1","prefsrc":"192.0.2.2","expires":30}]"#,
+        );
+        let b = Uplink::route(
+            r#"[{"dev":"u60sta0","gateway":"192.0.2.1","prefsrc":"192.0.2.2","expires":10,"cache":[]}]"#,
+        );
+        assert_eq!(a, b);
+        assert_ne!(
+            a,
+            Uplink::route(r#"[{"dev":"rmnet_data0","gateway":"192.0.2.1","prefsrc":"192.0.2.2"}]"#)
+        );
+        assert!(Uplink::route("[]").is_none());
+        let mut links = json!([{ "ifindex": 7, "ifname": "u60sta0", "addr_info": [
+            {"family":"inet","local":"192.0.2.2","prefixlen":24},
+            {"family":"inet6","local":"2001:db8::2","prefixlen":64,"valid_life_time":30},
+            {"family":"inet6","local":"2001:db8::3","prefixlen":64}
+        ] }, {"ifindex":1,"ifname":"lo","addr_info":[]}]);
+        let observe = |links: &Value| Uplink::read([a.clone(), a.clone()], &links.to_string());
+        let before = observe(&links);
+        assert!(before.complete());
+        links[0]["addr_info"][1]["valid_life_time"] = json!(10);
+        links[0]["addr_info"].as_array_mut().unwrap().reverse();
+        links[1]["addr_info"] = json!([{"family":"inet6","local":"fd00::1","prefixlen":128}]);
+        assert_eq!(
+            observe(&links),
+            before,
+            "lifetimes, ordering and non-egress addresses are maintenance only"
+        );
+        assert!(!observe(&links).strands(&before));
+        links[0]["addr_info"].as_array_mut().unwrap().remove(0);
+        assert_ne!(
+            observe(&links),
+            before,
+            "withdrawn secondary sources must invalidate deduplication"
+        );
+        assert!(observe(&links).strands(&before));
+        assert!(
+            !Uplink::read([a.clone(), None], &links.to_string()).complete(),
+            "one unreadable family must disable deduplication"
+        );
+        assert!(!Uplink::read([None, a.clone()], &links.to_string()).complete());
+        assert!(!Uplink::read([a.clone(), a], "[]").complete());
+    }
+
+    #[test]
+    fn only_an_egress_that_strands_connections_outside_the_relay_counts() {
+        let start = cellular("rmnet_data0", 3, "10.1.0.1", &["10.1.0.2", "2001:db8::2"]);
+        assert!(!start.relayed() && !start.strands(&start));
+        assert!(
+            cellular("rmnet_data0", 3, "10.1.0.5", &["10.1.0.6", "2001:db8::2"]).strands(&start),
+            "a re-dial that withdrew the old cellular address strands its connections"
+        );
+        assert!(
+            cellular("rmnet_data0", 3, "10.1.0.1", &["10.1.0.2", "2001:db8:1::7"]).strands(&start),
+            "IPv6 renumbering that removed the old source does too"
+        );
+        assert!(
+            cellular("rmnet_data1", 4, "10.1.0.1", &["10.1.0.2", "2001:db8::2"]).strands(&start),
+            "another interface strands even with the same addresses"
+        );
+        assert!(
+            cellular("rmnet_data0", 9, "10.1.0.1", &["10.1.0.2", "2001:db8::2"]).strands(&start),
+            "so does a recreated interface"
+        );
+        assert!(
+            !cellular("rmnet_data0", 3, "10.1.0.9", &["10.1.0.2", "2001:db8::2"]).strands(&start),
+            "a gateway change keeps connections usable"
+        );
+        let added = cellular(
+            "rmnet_data0",
+            3,
+            "10.1.0.1",
+            &["10.1.0.2", "2001:db8:1::7", "2001:db8::2"],
+        );
+        assert!(
+            !added.strands(&start),
+            "an added address that also became the preferred source keeps the old one usable"
+        );
+        let v4_only = cellular("rmnet_data0", 3, "10.1.0.1", &["10.1.0.2"]);
+        assert!(
+            !v4_only.strands(&start),
+            "an unreadable or lost family is not a move"
+        );
+        assert!(
+            !start.strands(&v4_only),
+            "IPv6 becoming available is not either"
+        );
+        let mut reference = start.clone();
+        reference.adopt(&v4_only);
+        assert_eq!(reference, start, "a lost family keeps its last reference");
+        assert!(
+            cellular("rmnet_data0", 3, "10.1.0.1", &["10.1.0.2", "2001:db8:2::9"])
+                .strands(&reference),
+            "its return on another address strands"
+        );
+        reference.adopt(&added);
+        assert_eq!(reference, added);
+        assert!(
+            start.strands(&reference),
+            "an adopted address is protected like the original ones"
+        );
+        let route = |dev: &str, src: &str| {
+            Uplink::route(&format!(r#"[{{"dev":"{dev}","prefsrc":"{src}"}}]"#))
+        };
+        let link = |index: u64, name: &str, v4: &str, v6: &str| {
+            json!({"ifindex": index, "ifname": name, "addr_info": [
+                {"family":"inet","local":v4,"prefixlen":30},
+                {"family":"inet6","local":v6,"prefixlen":64}
+            ]})
+        };
+        let links = json!([
+            link(7, RELAY_IFACE, "192.0.2.2", "fe80::2"),
+            link(3, "rmnet_data0", "10.1.0.2", "2001:db8::2")
+        ])
+        .to_string();
+        let relayed = Uplink::read(
+            [
+                route(RELAY_IFACE, "192.0.2.2"),
+                route("rmnet_data0", "2001:db8::2"),
+            ],
+            &links,
+        );
+        assert!(
+            relayed.relayed(),
+            "the relay announces its own path changes"
+        );
+    }
+
+    /// One interface carrying `addrs`; each family routes through its first
+    /// address, or is unreadable without one.
+    fn cellular(dev: &str, index: u64, gateway: &str, addrs: &[&str]) -> Uplink {
+        let info: Vec<Value> = addrs
+            .iter()
+            .map(|addr| {
+                let v6 = addr.contains(':');
+                json!({
+                    "family": if v6 { "inet6" } else { "inet" },
+                    "local": addr,
+                    "prefixlen": if v6 { 64 } else { 30 },
+                })
+            })
+            .collect();
+        let links = json!([{"ifindex": index, "ifname": dev, "addr_info": info}]).to_string();
+        let route = |v6: bool| {
+            let src = addrs.iter().find(|addr| addr.contains(':') == v6)?;
+            Uplink::route(&format!(
+                r#"[{{"dev":"{dev}","gateway":"{gateway}","prefsrc":"{src}"}}]"#
+            ))
+        };
+        Uplink::read([route(false), route(true)], &links)
+    }
+
+    #[test]
+    fn a_stranding_egress_restarts_once_settled_and_at_most_once_per_gap() {
+        let cell = |addr: &str| cellular("rmnet_data0", 3, "10.1.0.1", &[addr, "2001:db8::2"]);
+        let t0 = Instant::now();
+        let at = |secs: u64| t0 + Duration::from_secs(secs);
+        let mut uplink = cell("10.1.0.2");
+        let mut stranding = None;
+        assert!(!settle_egress(
+            &mut uplink,
+            &mut stranding,
+            cell("10.1.0.6"),
+            None,
+            at(0)
+        ));
+        assert_eq!(
+            stranding,
+            Some((cell("10.1.0.6"), at(0))),
+            "only starts settling"
+        );
+        assert!(!settle_egress(
+            &mut uplink,
+            &mut stranding,
+            cell("10.1.0.6"),
+            None,
+            at(4)
+        ));
+        assert!(
+            !settle_egress(&mut uplink, &mut stranding, cell("10.1.0.10"), None, at(4)),
+            "a flapping uplink starts settling again"
+        );
+        assert!(!settle_egress(
+            &mut uplink,
+            &mut stranding,
+            cell("10.1.0.10"),
+            None,
+            at(8)
+        ));
+        assert!(settle_egress(
+            &mut uplink,
+            &mut stranding,
+            cell("10.1.0.10"),
+            None,
+            at(9)
+        ));
+        assert_eq!(
+            uplink,
+            cell("10.1.0.2"),
+            "only the restarted core takes a new reference"
+        );
+
+        let mut stranding = Some((cell("10.1.0.6"), at(0)));
+        assert!(
+            !settle_egress(&mut uplink, &mut stranding, cell("10.1.0.2"), None, at(10)),
+            "the old address came back before the change settled"
+        );
+        assert_eq!(stranding, None);
+
+        let last = Some(at(0));
+        assert_eq!(restart_due(at(10), last), at(60));
+        assert_eq!(restart_due(at(70), last), at(75));
+        let mut stranding = None;
+        assert!(!settle_egress(
+            &mut uplink,
+            &mut stranding,
+            cell("10.1.0.6"),
+            last,
+            at(10)
+        ));
+        assert!(
+            !settle_egress(&mut uplink, &mut stranding, cell("10.1.0.6"), last, at(59)),
+            "settled, but the last watchdog restart was under a minute ago"
+        );
+        assert!(settle_egress(
+            &mut uplink,
+            &mut stranding,
+            cell("10.1.0.6"),
+            last,
+            at(60)
+        ));
+
+        let mut stranding = Some((cell("10.1.0.6"), at(0)));
+        let dual = cellular(
+            "rmnet_data0",
+            3,
+            "10.1.0.9",
+            &["10.1.0.2", "10.1.0.3", "2001:db8::2"],
+        );
+        assert!(
+            !settle_egress(&mut uplink, &mut stranding, dual.clone(), None, at(10)),
+            "added addresses and a new gateway only update the reference"
+        );
+        assert_eq!((uplink.clone(), stranding), (dual, None));
+
+        let relay = cellular(RELAY_IFACE, 7, "192.0.2.1", &["192.0.2.2", "2001:db8::2"]);
+        let mut stranding = Some((cell("10.1.0.6"), at(0)));
+        assert!(
+            !settle_egress(&mut uplink, &mut stranding, relay, None, at(10)),
+            "the relay announces its own path changes"
+        );
+        assert_eq!(stranding, None);
+    }
+
+    #[test]
     fn slow_profile_status_does_not_hold_dashboard_runtime_mutex() {
         let m = Arc::new(Mihomo::for_bridge(
             std::env::temp_dir(),
@@ -1396,6 +2059,52 @@ mod tests {
         assert_eq!(v["dns"]["ipv6"].as_bool(), Some(true));
         assert!(managed_config("- not-a-mapping", "x").is_err());
         assert!(managed_config("dns: []", "x").is_err());
+    }
+
+    #[test]
+    fn the_subscriptions_sniffer_is_kept_but_cannot_bind_an_interface() {
+        let s = managed_config(
+            "sniffer: {enable: true, force-dns-mapping: true, parse-pure-ip: true, sniff: {TLS: {ports: [443]}}}\nrules: [MATCH,DIRECT]\n",
+            "private",
+        )
+        .unwrap();
+        let v: Yaml = serde_yaml_ng::from_str(&s).unwrap();
+        assert_eq!(v["sniffer"]["enable"].as_bool(), Some(true));
+        assert_eq!(v["sniffer"]["force-dns-mapping"].as_bool(), Some(true));
+        assert_eq!(v["sniffer"]["sniff"]["TLS"]["ports"][0].as_u64(), Some(443));
+        let none = managed_config("rules: [MATCH,DIRECT]\n", "private").unwrap();
+        assert!(serde_yaml_ng::from_str::<Yaml>(&none).unwrap()["sniffer"].is_null());
+    }
+
+    #[test]
+    fn a_config_fingerprint_ignores_only_the_per_start_secret() {
+        let config = |secret: &str, interface: &str| {
+            format!("secret: {secret}\nlisteners: [{{password: {secret}}}]\ninterface-name: {interface}\n")
+        };
+        let a = config_fingerprint(&config("aaaa", "u60sta0"), "aaaa");
+        assert_eq!(a, config_fingerprint(&config("bbbb", "u60sta0"), "bbbb"));
+        assert_ne!(a, config_fingerprint(&config("aaaa", "rmnet0"), "aaaa"));
+    }
+
+    #[test]
+    fn exemptions_are_the_same_rules_the_proxy_plan_installs() {
+        let address: std::net::IpAddr = "192.168.0.1".parse().unwrap();
+        let planned = proxy_plan(&[address]);
+        assert!(
+            net::foreign_identity(&planned).is_empty(),
+            "prejournaled undos never match another writer's rule"
+        );
+        let installed = planned
+            .iter()
+            .find(|s| {
+                s.apply.args.iter().any(|a| a == "192.168.0.1")
+                    && s.undo.args.contains(&"RETURN".to_owned())
+            })
+            .expect("plan exempts the router's own address");
+        assert_eq!(installed.undo, exemption(&address).undo);
+        let v6: std::net::IpAddr = "2001:db8::1".parse().unwrap();
+        assert_eq!(exemption(&v6).apply.program, "ip6tables");
+        assert_eq!(&exemption(&v6).apply.args[4..6], ["-I", "U60_MH"]);
     }
 
     #[test]
@@ -1731,6 +2440,35 @@ hosts: {interface-name: 192.0.2.1}
         assert_eq!(refreshed["mode"].as_str(), Some("global"));
         assert_eq!(refreshed["log-level"].as_str(), Some("debug"));
         std::thread::sleep(Duration::from_secs(1));
+        let pid = m
+            .inner
+            .lock()
+            .unwrap()
+            .run
+            .as_ref()
+            .unwrap()
+            .child
+            .as_ref()
+            .unwrap()
+            .id();
+        {
+            let _network = m.lock.lock().unwrap();
+            m.uplink_changed_locked().unwrap();
+            m.uplink_changed_locked().unwrap();
+        }
+        assert_eq!(
+            m.inner
+                .lock()
+                .unwrap()
+                .run
+                .as_ref()
+                .unwrap()
+                .child
+                .as_ref()
+                .unwrap()
+                .id(),
+            pid
+        );
         net::write_private(Path::new("/qa-state/cell-ready"), b"1").unwrap();
         for (request, done) in [
             ("wifi", "wifi-ready"),
@@ -1784,14 +2522,38 @@ hosts: {interface-name: 192.0.2.1}
             );
             assert_eq!(config["mode"].as_str(), Some("global"));
             assert_eq!(config["log-level"].as_str(), Some("debug"));
-            let proxies: Value = agent
-                .get(&format!("http://{CONTROLLER}/proxies"))
-                .header("Authorization", &format!("Bearer {}", m.secret().unwrap()))
-                .call()
-                .unwrap()
-                .body_mut()
-                .read_json()
-                .unwrap();
+            // The core exposes its controller/listeners before updateProfile
+            // restores selectors. Observe bounded convergence, without writing
+            // a selection again (which would conceal lost persisted state).
+            let observed = Instant::now();
+            let mut first = None;
+            let proxies: Value = loop {
+                let proxies: Value = agent
+                    .get(&format!("http://{CONTROLLER}/proxies"))
+                    .header("Authorization", &format!("Bearer {}", m.secret().unwrap()))
+                    .call()
+                    .unwrap()
+                    .body_mut()
+                    .read_json()
+                    .unwrap();
+                first.get_or_insert_with(|| {
+                    (
+                        proxies["proxies"]["SelectTest"]["now"].clone(),
+                        proxies["proxies"]["GLOBAL"]["now"].clone(),
+                    )
+                });
+                if (proxies["proxies"]["SelectTest"]["now"] == "TestDirect"
+                    && proxies["proxies"]["GLOBAL"]["now"] == "SelectTest")
+                    || observed.elapsed() >= Duration::from_secs(3)
+                {
+                    break proxies;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            eprintln!(
+                "[qa] selectors stage={request} first={first:?} settled_ms={}",
+                observed.elapsed().as_millis()
+            );
             assert_eq!(proxies["proxies"]["SelectTest"]["now"], "TestDirect");
             assert_eq!(proxies["proxies"]["GLOBAL"]["now"], "SelectTest");
             net::write_private(Path::new(&format!("/qa-state/{done}")), b"1").unwrap();
