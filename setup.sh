@@ -84,8 +84,11 @@ WORKDIR=$(mktemp -d)
 chmod 700 "$WORKDIR"
 umask 077
 FORWARD_PORT=""
+STAGE=""
 cleanup() {
     [ -z "$FORWARD_PORT" ] || adb forward --remove "tcp:$FORWARD_PORT" >/dev/null 2>&1 || true
+    # The staging directory only carries upload payloads; never keep it.
+    [ -z "$STAGE" ] || rcmd "rm -rf '$STAGE'" >/dev/null 2>&1 || true
     rm -rf "$WORKDIR"
 }
 trap cleanup EXIT
@@ -441,7 +444,7 @@ if ! rcmd 'test ! -e /sys/class/net/u60sta0 && test ! -e /sys/class/net/u60mh0';
 fi
 STAGE="/data/zte-agent-install-$(date +%Y%m%d-%H%M%S)-$$"
 rcmd "umask 077; mkdir '$STAGE'; mkdir -p /data/local/tmp"
-ok "Installation backup directory: $STAGE"
+ok "Staging directory: $STAGE (removed when setup exits)"
 
 LOCAL_SHA=$(sha256_file "$BINARY")
 rpush "$BINARY" "$STAGE/agent.new"
@@ -464,13 +467,14 @@ else
     printf '%s' "$AGENT_PASSWORD" | python3 scripts/install-agent.py launcher "$WORKDIR/start.sh" override
 fi
 rpush "$WORKDIR/start.sh" "$STAGE/start.sh"
-rcmd "set -e; sh -n '$STAGE/start.sh'; cp -p /etc/rc.local '$STAGE/rc.local.before'; chmod 600 '$STAGE/rc.local.before'"
+# A consistent snapshot to edit, not a backup: it goes with the staging directory.
+rcmd "set -e; sh -n '$STAGE/start.sh'; cp -p /etc/rc.local '$STAGE/rc.local.current'; chmod 600 '$STAGE/rc.local.current'"
 # rcmd intentionally adds no newline; preserve the boot file byte for byte.
-rcmd "cat '$STAGE/rc.local.before'" >"$WORKDIR/rc.local.before"
-RC_SHA=$(sha256_file "$WORKDIR/rc.local.before")
-[ "$RC_SHA" = "$(rcmd "sha256sum '$STAGE/rc.local.before'" | awk '{print $1}')" ] \
+rcmd "cat '$STAGE/rc.local.current'" >"$WORKDIR/rc.local.current"
+RC_SHA=$(sha256_file "$WORKDIR/rc.local.current")
+[ "$RC_SHA" = "$(rcmd "sha256sum '$STAGE/rc.local.current'" | awk '{print $1}')" ] \
     || fail "Could not preserve rc.local exactly; current agent is untouched."
-python3 scripts/install-agent.py boot "$WORKDIR/rc.local.new" "$WORKDIR/rc.local.before"
+python3 scripts/install-agent.py boot "$WORKDIR/rc.local.new" "$WORKDIR/rc.local.current"
 rpush "$WORKDIR/rc.local.new" "$STAGE/rc.local.new"
 rcmd "sh -n '$STAGE/rc.local.new'; [ \"\$(sha256sum /etc/rc.local | awk '{print \$1}')\" = '$RC_SHA' ]" \
     || fail "rc.local changed during staging; retry without overwriting it."
@@ -497,7 +501,7 @@ for attempt in $(seq 1 30); do
     fi
     sleep 1
 done
-[ "$READY" = true ] || fail "Console not ready; boot hook is unchanged. Backup: $STAGE"
+[ "$READY" = true ] || fail "Console not ready; boot hook is unchanged."
 [ "$(curl --noproxy '*' -sS --max-time 5 -o /dev/null -w '%{http_code}' "$VERIFY_URL/api/device")" = 401 ] \
     || fail "Unauthenticated API was not rejected; boot hook is unchanged."
 rcmd "p=\$(cat /tmp/zte-agent-run/pid); [ \"\$(readlink /proc/\$p/exe)\" = '$REMOTE_SLOT' ]" \
@@ -523,8 +527,9 @@ sh -n /etc/rc.local.zte-agent-new
 mv /etc/rc.local.zte-agent-new /etc/rc.local
 sync"
 ok "Boot hook enabled in rc.local; unrelated boot commands are preserved."
-# Keep only rollback inputs, not upload payloads or install helpers.
-rcmd "rm -f '$STAGE/agent.new' '$STAGE/agent.ready' '$STAGE/supervisor.new' '$STAGE/supervisor.ready' '$STAGE/start.sh' '$STAGE/start.ready' '$STAGE/rc.local.new' '$STAGE/install.sh' '$STAGE/backups.ready'"
+rcmd "rm -rf '$STAGE'"
+STAGE=""
+ok "Staging directory removed; no backup is kept."
 
 # ── Step 9: Optional SSH setup ──────────────────────────────────────
 if [ "$SKIP_SSH" = true ]; then
@@ -639,6 +644,5 @@ else
     echo "  Login:      your explicit agent password (not displayed)"
 fi
 echo "  Auto-start: rc.local -> $STARTUP_SCRIPT"
-echo "  Backup:     $STAGE"
 echo ""
 echo "  Point the iOS/Android companion app at http://$GATEWAY:$AGENT_PORT"

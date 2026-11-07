@@ -13,6 +13,9 @@ spec = importlib.util.spec_from_file_location("install", Path(__file__).with_nam
 install = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(install)
 
+# Files the installer used to keep as rollback inputs; it no longer makes backups.
+BACKUPS = ("agent.before", "start.before.sh", "supervisor.before.sh", "backups.ready")
+
 
 class LauncherHarness:
     """Run the generated shell against files, never real /proc or /data.
@@ -502,7 +505,7 @@ class InstallationTests(unittest.TestCase):
             ], ["kill -TERM 77", "kill -TERM 81", "kill -TERM 78"])
             self.assertTrue(all(path.exists() for path in survivors))
             self.assertEqual(harness.binary.read_text(), "new installed executable\n")
-            self.assertEqual(harness.stage.joinpath("agent.before").read_text(), "old installed executable\n")
+            self.assertEqual([name for name in BACKUPS if harness.stage.joinpath(name).exists()], [])
             self.assertEqual(harness.rc_local.read_bytes(), before)
             self.assertEqual(len(harness.launched()), 1)
 
@@ -572,7 +575,7 @@ class InstallationTests(unittest.TestCase):
                 self.assertEqual(harness.binary.read_text(), "old installed executable\n")
                 self.assertEqual(harness.rc_local.read_bytes(), before)
 
-    def test_install_reports_launcher_failure_and_retry_preserves_backups(self):
+    def test_install_reports_launcher_failure_and_retry_keeps_no_backup(self):
         with tempfile.TemporaryDirectory() as root:
             harness = LauncherHarness(root)
             harness.prepare_install()
@@ -584,8 +587,7 @@ class InstallationTests(unittest.TestCase):
             result = harness.run_install()
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(len(harness.launched()), 1)
-            self.assertEqual(harness.stage.joinpath("agent.before").read_text(), "old installed executable\n")
-            self.assertEqual(harness.stage.joinpath("start.before.sh").read_text(), "# old private launcher\n")
+            self.assertEqual([name for name in BACKUPS if harness.stage.joinpath(name).exists()], [])
 
     def test_install_and_concurrent_launcher_share_lock_without_duplicate_start(self):
         with tempfile.TemporaryDirectory() as root:
@@ -618,19 +620,15 @@ class InstallationTests(unittest.TestCase):
                         process.kill()
                     process.communicate(timeout=5)
 
-    def test_install_rerun_is_noop_and_keeps_private_original_backups(self):
+    def test_install_rerun_is_noop_and_keeps_no_backup(self):
         with tempfile.TemporaryDirectory() as root:
             harness = LauncherHarness(root)
             harness.prepare_install()
-            old_start = harness.startup.read_bytes()
             for _ in range(2):
                 result = harness.run_install()
                 self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(len(harness.launched()), 1)
-            self.assertEqual(harness.stage.joinpath("agent.before").read_text(), "old installed executable\n")
-            self.assertEqual(harness.stage.joinpath("start.before.sh").read_bytes(), old_start)
-            for name in ("agent.before", "start.before.sh"):
-                self.assertEqual(harness.stage.joinpath(name).stat().st_mode & 0o777, 0o600)
+            self.assertEqual([name for name in BACKUPS if harness.stage.joinpath(name).exists()], [])
             self.assertEqual(harness.startup.stat().st_mode & 0o777, 0o700)
             self.assertEqual(harness.binary.stat().st_mode & 0o777, 0o700)
             self.assertNotIn("kill -TERM", harness.calls.read_text())
@@ -719,14 +717,14 @@ class InstallationTests(unittest.TestCase):
             self.assertEqual(harness.startup.read_text(), harness.launcher.read_text())
             self.assertEqual(len(harness.launched()), 1)
 
-    def test_install_replaces_an_existing_supervisor_and_keeps_its_backup(self):
+    def test_install_replaces_an_existing_supervisor_without_a_backup(self):
         with tempfile.TemporaryDirectory() as root:
             harness = LauncherHarness(root)
             harness.prepare_install()
             harness.supervisor.write_text("# previous supervisor\n")
             result = harness.run_install()
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(harness.stage.joinpath("supervisor.before.sh").read_text(), "# previous supervisor\n")
+            self.assertFalse(harness.stage.joinpath("supervisor.before.sh").exists())
             self.assertEqual(harness.supervisor.read_text(), "#!/bin/sh\n# new supervisor\n")
 
     def test_install_refuses_a_wrong_digest_or_version_before_stopping_anything(self):
@@ -790,6 +788,34 @@ adb() { shift; /bin/sh -c "$1"; return 0; }
             )
             self.assertEqual(result.returncode, status)
             self.assertEqual(result.stdout, output)
+
+    def test_setup_removes_the_remote_staging_directory_and_keeps_no_backup(self):
+        setup = Path(__file__).resolve().parents[1].joinpath("setup.sh").read_text()
+        cleanup = setup[setup.index("cleanup() {"):setup.index("\ntrap cleanup EXIT")]
+        stub = """rcmd() { printf '%s\\n' "$*" >>"$CALLS"; }
+adb() { :; }
+"""
+        with tempfile.TemporaryDirectory() as root:
+            calls = Path(root) / "calls"
+            for stage, expected in [
+                ("/data/zte-agent-install-1", "rm -rf '/data/zte-agent-install-1'\n"),
+                ("", ""),
+            ]:
+                workdir = Path(root) / "work"
+                workdir.mkdir()
+                calls.write_text("")
+                result = subprocess.run(
+                    ["bash", "-c", stub + cleanup + "\ncleanup", "test"],
+                    env={**os.environ, "CALLS": str(calls), "STAGE": stage,
+                         "FORWARD_PORT": "", "WORKDIR": str(workdir)},
+                    text=True, capture_output=True,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(calls.read_text(), expected)
+                self.assertFalse(workdir.exists())
+        self.assertNotIn("Backup", setup)
+        for script in (setup, install.installer()):
+            self.assertNotIn(".before", script)
 
     def test_factory_cli_does_not_accept_an_older_download_or_unknown_flags(self):
         setup = Path(__file__).resolve().parents[1] / "setup.sh"

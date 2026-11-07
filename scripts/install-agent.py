@@ -156,23 +156,6 @@ case "$agent_sha" in *[!0-9a-f]*) exit 1 ;; esac
 [ "${#agent_sha}" -eq 64 ]
 case "$agent_version" in ''|*[!0-9A-Za-z.+-]*) exit 1 ;; esac
 [ "$(sha256sum "$stage/agent.new" | awk '{print $1}')" = "$agent_sha" ]
-# Keep the original rollback inputs even if this same stage is retried after
-# a partial install. The marker also records an originally absent launcher.
-if [ ! -f "$stage/backups.ready" ]; then
-    if [ -f /data/zte-agent ]; then
-        cp -p /data/zte-agent "$stage/agent.before"
-        chmod 600 "$stage/agent.before"
-    fi
-    if [ -f /data/local/tmp/start_zte_agent.sh ]; then
-        cp -p /data/local/tmp/start_zte_agent.sh "$stage/start.before.sh"
-        chmod 600 "$stage/start.before.sh"
-    fi
-    if [ -f /data/local/tmp/zte-agent-supervisor.sh ]; then
-        cp -p /data/local/tmp/zte-agent-supervisor.sh "$stage/supervisor.before.sh"
-        chmod 600 "$stage/supervisor.before.sh"
-    fi
-    : >"$stage/backups.ready"
-fi
 # A retry is a no-op only when every artifact matches and the recorded live
 # main is executing this inode, not a deleted older binary or a callback.
 if cmp -s "$stage/agent.new" /data/zte-agent && \
