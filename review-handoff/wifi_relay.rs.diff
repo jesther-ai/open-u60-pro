@@ -1,0 +1,831 @@
+--- a/zte-agent/src/wifi_relay.rs
++++ b/zte-agent/src/wifi_relay.rs
+@@ -5,6 +5,10 @@
+ pub(crate) mod ipv6;
+ pub(crate) mod dns;
+ pub(crate) mod portal;
++mod llstats;
++mod resume;
++mod scan;
++mod width;
+ 
+ use std::fs;
+ use std::net::Ipv4Addr;
+@@ -53,19 +57,23 @@
+     network: Transaction,
+     dns: Transaction,
+     dns_error: Option<String>,
+-    clock_error: Option<String>,
+     supplicant: Option<Child>,
+     dhcp: Option<Child>,
+     dhcp_session: Option<String>,
+     lease: Option<Lease>,
+     selected: Option<Network>,
+     ipv6: ipv6::Upstream,
++    width: Option<LinkWidth>,
+ }
+ 
+ struct Inner {
+     session: Option<Session>,
+     scans: Vec<Network>,
++    /// Frequency and signal of every BSS in the last scan (hidden ones too).
++    neighbours: Vec<(u32, i32)>,
+     error: Option<String>,
++    /// SSID being reconnected after the agent started (`restore`).
++    restoring: Option<String>,
+ }
+ 
+ pub struct WifiRelay {
+@@ -78,7 +86,7 @@
+ 
+ impl WifiRelay {
+     pub fn new(lock: NetworkLock) -> Self {
+-        let inner = Inner { session: None, scans: Vec::new(), error: None };
++        let inner = Inner { session: None, scans: Vec::new(), neighbours: Vec::new(), error: None, restoring: None };
+         let snapshot = Self::snapshot(&inner);
+         Self { lock, inner: Mutex::new(inner), wake: Condvar::new(), snapshot: Mutex::new(snapshot), mihomo: None }
+     }
+@@ -103,13 +111,26 @@
+         self.status_with_clock(&crate::network_clock::WIFI)
+     }
+ 
+-    fn status_with_clock(&self, _clock: &crate::network_clock::WifiClock) -> Value {
++    fn status_with_clock(&self, clock: &crate::network_clock::WifiClock) -> Value {
+         let mut value = self.snapshot.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
++        value["clock_error"] = if value["connected"] == true { json!(clock.error()) } else { Value::Null };
+         value["recovery_required"] = json!(recovery_pending(Path::new(JOURNAL)) && value["connected"] != true);
++        // Reconnected after an agent restart or a reboot (`restore`).
++        value["autostart"] = json!(resume::load(Path::new(JOURNAL)).is_some());
+         saved::annotate(&mut value);
+         value
+     }
+ 
++    fn recheck_clock_with(&self, check: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
++        let _lock = self.lock.try_lock().map_err(|_| "A network operation is in progress; retry after it finishes")?;
++        // The snapshot is published under the network lock, so the uplink
++        // cannot change during this check. Do not hold a status lock over HTTPS.
++        if self.snapshot.lock().unwrap_or_else(std::sync::PoisonError::into_inner)["connected"] != true {
++            return Err("Connect Wi-Fi relay before checking time".into());
++        }
++        check()
++    }
++
+     fn publish(&self, inner: &Inner) {
+         if let Some(core) = &self.mihomo {
+             core.set_subscription_dns(inner.session.as_ref().and_then(|s| s.lease.as_ref()).map(|lease| if lease.dns.is_empty() { vec![lease.gateway] } else { lease.dns.clone() }).unwrap_or_default());
+@@ -124,12 +145,14 @@
+         json!({"connected": s.is_some_and(|s| s.selected.is_some() && s.lease.is_some()),
+             "ssid": s.and_then(|s| s.selected.as_ref()).map(|n| &n.ssid),
+             "frequency": s.and_then(|s| s.selected.as_ref()).map(|n| n.frequency),
++            "width": s.and_then(|s| s.width.as_ref()).map(|w| w.tuner.width()),
+             "address": lease.map(|l| l.ip), "gateway": lease.map(|l| l.gateway), "networks": i.scans,
+             "internet": "not_verified", "ipv6_relay": ipv6["nat66"], "ipv6": ipv6, "cellular_fallback": true,
+-            "autostart": false, "experimental": true, "clock_error": s.and_then(|s| s.clock_error.as_ref()), "error": i.error.as_ref().or_else(|| s.and_then(|s| s.dns_error.as_ref()))})
++            "restoring": i.restoring, "experimental": true, "error": i.error.as_ref().or_else(|| s.and_then(|s| s.dns_error.as_ref()))})
+     }
+ 
+     pub fn recover(&self) -> Result<(), String> {
++        stop_strays()?;
+         let ipv6 = ipv6::recover();
+         let ipv4 = Transaction::recover(&Path::new(JOURNAL).join("network.json"));
+         let dns = Transaction::recover(&Path::new(JOURNAL).join("dns.json"));
+@@ -152,18 +175,7 @@
+     pub fn start(self: &Arc<Self>) {
+         let this = Arc::clone(self);
+         crate::system::spawn_named("relay-watch", move || {
+-            {
+-                let _lock = this.lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+-                // A request may have started the relay before this thread ran.
+-                let idle = this.inner.lock().unwrap().session.is_none();
+-                if idle {
+-                    if let Err(e) = this.recover() {
+-                        let mut i = this.inner.lock().unwrap();
+-                        i.error = Some(e);
+-                        this.publish(&i);
+-                    }
+-                }
+-            }
++            this.recover_idle();
+             loop {
+                 let mut i = this.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                 while !i.session.as_ref().is_some_and(|s| s.selected.is_some()) {
+@@ -196,7 +208,7 @@
+                     let lease = s.lease.as_ref().unwrap();
+                     let resolvers = if lease.dns.is_empty() { vec![lease.gateway] } else { lease.dns.clone() };
+                     let dns = dns::reconcile(&resolvers);
+-                    s.dns_error = dns.and(portal::reconcile_web()).err();
++                    s.dns_error = dns.and(portal::reconcile_web()).and(s.width.as_mut().map_or(Ok(()), tune_width)).err();
+                     let before = s.ipv6.revision();
+                     let tick = s.ipv6.tick();
+                     let changed = before != s.ipv6.revision();
+@@ -219,22 +231,84 @@
+         });
+     }
+ 
++    /// Roll back what a previous process left (crash, update, reboot).
++    pub fn recover_idle(&self) {
++        let _lock = self.lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
++        // A request may have started the relay before this ran.
++        let idle = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner).session.is_none();
++        if idle {
++            if let Err(e) = self.recover() {
++                let mut i = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
++                i.error = Some(e);
++                self.publish(&i);
++            }
++        }
++    }
++
++    pub fn wants_restore(&self) -> bool {
++        resume::load(Path::new(JOURNAL)).is_some()
++    }
++
++    /// After the agent starts: rejoin the network the owner left connected
++    /// (`resume`), retrying while the hotspot, radio or upstream comes up.
++    /// Stops once the owner connects, disconnects or picks another network.
++    pub fn restore(&self) {
++        let root = Path::new(JOURNAL);
++        let Some(target) = resume::load(root) else { return };
++        let show = |restoring: Option<&str>, error: Option<String>| {
++            let mut i = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
++            i.restoring = restoring.map(str::to_owned);
++            if error.is_some() {
++                i.error = error;
++            }
++            self.publish(&i);
++        };
++        show(Some(&target.ssid), None);
++        let mut last = String::new();
++        for (attempt, wait) in RESTORE_WAITS.into_iter().enumerate() {
++            std::thread::sleep(Duration::from_secs(wait));
++            // Rechecked under the network lock by `join`; this skips the scan.
++            if self.active() || resume::load(root).as_ref() != Some(&target) {
++                return show(None, None);
++            }
++            let found = self.scan().and_then(|()| {
++                let i = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
++                resume::pick(&target, &i.scans).map(|n| n.id.clone()).ok_or_else(|| "The network was not found in the scan".to_owned())
++            });
++            match found.and_then(|id| self.join(&id, "", target.ipv6, Origin::Restore(&target))) {
++                Ok(()) => {
++                    eprintln!("[relay] restored after {} attempt(s)", attempt + 1);
++                    return show(None, None);
++                }
++                Err(e) if e == RESTORE_CANCELLED => return show(None, None),
++                Err(e) if e == RESTORE_NO_PASSWORD => {
++                    last = e;
++                    break;
++                }
++                Err(e) => {
++                    eprintln!("[relay] restore attempt {} failed: {e}", attempt + 1);
++                    last = e;
++                }
++            }
++        }
++        show(None, Some(format!("Could not reconnect after the agent restarted: {last}. Scan and reconnect.")));
++    }
++
+     pub fn scan(&self) -> Result<(), String> {
+         let _lock = self.lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+         let idle = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner).session.is_none();
+         let mut temporary = if idle { Some(self.prepare()?) } else { None };
+-        let result: Result<Vec<Network>, String> = (|| {
+-            if wpa("scan", &[])?.lines().last() != Some("OK") {
+-                return Err("Wi-Fi scan was refused".into());
+-            }
+-            std::thread::sleep(Duration::from_secs(6));
+-            Ok(parse_scan(&wpa("scan_results", &[])?))
++        let result: Result<_, String> = (|| {
++            let channels = Cmd::new("iw", &["phy", &radio_phy()?, "channels"]).run()?;
++            let mut ctrl = scan::Ctrl::attach(&Path::new(ROOT).join("ctrl").join(IFACE), Path::new(ROOT))?;
++            let (table, took) = scan::run(&mut ctrl, &scan::plan(&channels))?;
++            Ok((parse_bss(&table, took.as_secs() + 1), neighbours(&table, took.as_secs() + 1)))
+         })();
+         if let Some(s) = &mut temporary {
+             cleanup(s)?;
+         }
+         let mut i = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+-        i.scans = result?;
++        (i.scans, i.neighbours) = result?;
+         i.error = None;
+         self.publish(&i);
+         Ok(())
+@@ -252,12 +326,8 @@
+                 return Err("Turn off Guest WiFi before using relay".into());
+             }
+         }
+-        let phy = fs::canonicalize("/sys/class/net/wlan2/phy80211").map_err(|_| "Enable the 5 GHz main hotspot first")?;
+-        let phy = phy
+-            .file_name()
+-            .and_then(|p| p.to_str())
+-            .filter(|p| p.starts_with("phy") && p[3..].bytes().all(|b| b.is_ascii_digit()))
+-            .ok_or("Cannot identify the active Wi-Fi PHY")?;
++        let phy = radio_phy()?;
++        let phy = phy.as_str();
+         let _ = ap("wlan2", "status", &[]).and_then(|s| {
+             if net::key(&s, "state") == Some("ENABLED") {
+                 Ok(s)
+@@ -272,13 +342,13 @@
+             network: Transaction::new(Path::new(JOURNAL).join("network.json")),
+             dns: Transaction::new(Path::new(JOURNAL).join("dns.json")),
+             dns_error: None,
+-            clock_error: None,
+             supplicant: None,
+             dhcp: None,
+             dhcp_session: None,
+             lease: None,
+             selected: None,
+             ipv6: ipv6::Upstream::new(),
++            width: None,
+         };
+         let result = (|| {
+             session
+@@ -319,6 +389,10 @@
+             if !ready {
+                 return Err("wpa_supplicant did not become ready".into());
+             }
++            // A PONG from another supplicant must not pass for ours.
++            if !session.supplicant.as_mut().is_some_and(|c| matches!(c.try_wait(), Ok(None))) {
++                return Err("wpa_supplicant exited; another process may own the relay interface".into());
++            }
+             let old = wpa("driver", &["GETROAMMODE"])?;
+             let mode = old.split_whitespace().last().filter(|s| matches!(*s, "0" | "1")).ok_or("Cannot determine original roam mode")?;
+             session.wireless.apply(roam_step(mode))?;
+@@ -338,25 +412,53 @@
+         if !confirmed {
+             return Err("Confirm hotspot interruption and possible cellular charges first".into());
+         }
++        self.join(id, password, ipv6, Origin::Owner { remember })
++    }
++
++    fn join(&self, id: &str, password: &str, ipv6: bool, origin: Origin) -> Result<(), String> {
+         let _lock = self.lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
++        let root = Path::new(JOURNAL);
++        match origin {
++            // The owner chose a network: restore none until this one works.
++            Origin::Owner { .. } => resume::clear(root)?,
++            Origin::Restore(target) => {
++                if self.active() || resume::load(root).as_ref() != Some(target) {
++                    return Err(RESTORE_CANCELLED.into());
++                }
++            }
++        }
+         let mut i = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+         let selected = i.scans.iter().find(|n| n.id == id && n.supported).cloned().ok_or("Scan and select a supported network first")?;
++        let neighbours = i.neighbours.clone();
+         let password = if password.is_empty() && selected.security == "wpa2" { saved::password(&selected)?.unwrap_or_default() } else { password.to_owned() };
++        if matches!(origin, Origin::Restore(_)) && selected.security != "open" && password.is_empty() {
++            return Err(RESTORE_NO_PASSWORD.into());
++        }
+         let network_config = wpa_network(&selected, &password)?;
+         let old = i.session.take();
+         self.publish(&i);
+         drop(i);
++        // Publish early failures too, or the page keeps an older attempt's error.
++        let failed = |e: String| {
++            let _ = self.uplink_changed();
++            let mut i = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
++            i.error = Some(e.clone());
++            self.publish(&i);
++            Err(e)
++        };
+         if let Some(mut old) = old {
+-            let restored = cleanup(&mut old);
+-            if let Err(e) = restored { let _ = self.uplink_changed(); return Err(e); }
++            if let Err(e) = cleanup(&mut old) {
++                return failed(e);
++            }
+         }
+         let mut session = match self.prepare() {
+             Ok(session) => session,
+-            Err(e) => { let _ = self.uplink_changed(); return Err(e); }
++            Err(e) => return failed(e),
+         };
+         let result = (|| {
+-            let ap_iface = if selected.frequency < 3000 { "wlan0" } else { "wlan2" };
+-            align_radio(&mut session.wireless, ap_iface, selected.frequency)?;
++            if let Some(hotspot) = aligned_hotspot(selected.frequency) {
++                align_radio(&mut session.wireless, hotspot, selected.frequency)?;
++            }
+             net::write_private(&Path::new(ROOT).join("wpa.conf"), format!("ctrl_interface={ROOT}/ctrl\nupdate_config=0\n{network_config}").as_bytes())?;
+             // Undo must detach STA before restoring the same-radio AP channel,
+             // including a crash between reconfigure and association completion.
+@@ -372,6 +474,7 @@
+             if !linked {
+                 return Err("Wi-Fi association failed; check password and signal".into());
+             }
++            session.width = start_width(&selected.id, &neighbours);
+             let callback = std::env::current_exe().map_err(|e| e.to_string())?;
+             #[cfg(test)]
+             let callback = std::env::var_os("U60_IPV6_QA_CALLBACK").map(std::path::PathBuf::from).unwrap_or(callback);
+@@ -424,7 +527,8 @@
+             if let Some(step) = portal::plan()? {
+                 session.dns.apply(step)?;
+             }
+-            session.clock_error = crate::network_clock::sync_wifi().err();
++            // A new uplink must not reuse the previous network's clock check.
++            let _ = crate::network_clock::recheck_wifi();
+             session.ipv6.start(ipv6)?;
+             session.lease = Some(lease);
+             session.selected = Some(selected.clone());
+@@ -441,8 +545,15 @@
+         let mut i = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+         i.session = Some(session);
+         i.error = self.uplink_changed().err();
+-        if remember {
+-            if let Err(e) = saved::remember(&selected, &password) { i.error = Some(format!("Relay connected, but {e}")); }
++        if let Origin::Owner { remember } = origin {
++            if remember {
++                if let Err(e) = saved::remember(&selected, &password) { i.error = Some(format!("Relay connected, but {e}")); }
++            }
++            // Only a credential the router keeps can be rejoined after a restart.
++            let kept = selected.security == "open" || saved::password(&selected).ok().flatten().is_some_and(|p| p == password);
++            if kept {
++                if let Err(e) = resume::save(root, &selected, ipv6) { i.error = Some(format!("Relay connected, but {e}")); }
++            }
+         }
+         self.publish(&i);
+         self.wake.notify_all();
+@@ -451,6 +562,8 @@
+ 
+     pub fn disconnect(&self) -> Result<(), String> {
+         let _lock = self.lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
++        // Off until the owner connects again, restarts included.
++        let cleared = resume::clear(Path::new(JOURNAL));
+         let session = {
+             let mut i = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+             let session = i.session.take();
+@@ -459,18 +572,103 @@
+         };
+         let result = if let Some(mut s) = session { cleanup(&mut s) } else { self.recover() };
+         let core = self.uplink_changed();
+-        let result = result.and(core);
++        let result = result.and(core).and(cleared);
+         let mut i = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+         i.error = result.as_ref().err().cloned();
+         self.publish(&i);
+         result
+     }
++}
++
++/// Seconds before each restore attempt: about 17 minutes in all, for a boot
++/// (hotspot and DFS checks first) or an upstream that is itself restarting.
++const RESTORE_WAITS: [u64; 10] = [0, 10, 20, 30, 60, 60, 120, 120, 300, 300];
++const RESTORE_CANCELLED: &str = "Restore cancelled by the owner";
++const RESTORE_NO_PASSWORD: &str = "The network's password is no longer remembered";
++
++#[derive(Clone, Copy)]
++enum Origin<'a> {
++    /// A connect request; `remember` saves its password.
++    Owner { remember: bool },
++    /// `restore`: only while this is still the network to restore.
++    Restore(&'a resume::Resume),
++}
++
++/// The radio behind the 5 GHz main hotspot, which also carries the STA.
++fn radio_phy() -> Result<String, String> {
++    let phy = fs::canonicalize("/sys/class/net/wlan2/phy80211").map_err(|_| "Enable the 5 GHz main hotspot first")?;
++    phy.file_name()
++        .and_then(|p| p.to_str())
++        .filter(|p| p.starts_with("phy") && p[3..].bytes().all(|b| b.is_ascii_digit()))
++        .map(str::to_owned)
++        .ok_or_else(|| "Cannot identify the active Wi-Fi PHY".into())
+ }
+ 
+ fn recovery_pending(root: &Path) -> bool {
+     ["network.json", "wireless.json", "dns.json", "ipv6-setup.json", "ipv6-network.json", "ra.json", "ra-runtime.json"].iter().any(|name| root.join(name).exists())
+ }
+ 
++/// A relay helper on our interface with our private paths (`stop_strays`).
++#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
++fn stray(args: &[String]) -> bool {
++    let Some(program) = args.first().and_then(|a| a.rsplit('/').next()) else { return false };
++    let after = |flag: &str| args.windows(2).find(|w| w[0] == flag).map(|w| w[1].as_str());
++    match program {
++        "wpa_supplicant" => after("-i") == Some(IFACE) && after("-c").is_some_and(|c| [format!("{ROOT}/wpa.conf"), format!("{ROOT}/recover.conf")].iter().any(|p| p == c)),
++        "odhcp6c" => args.last().map(String::as_str) == Some(IFACE) && after("-p") == Some(&format!("{ROOT}/odhcp6c.pid")),
++        "udhcpc" => after("-i") == Some(IFACE),
++        _ => false,
++    }
++}
++
++/// Relay helpers a previous agent left running. B31 runs wpa_supplicant in
++/// SELinux domain `wpad.subj` and odhcp6c in `odhcp6c.subj`, and the kernel
++/// clears the parent-death signal on any exec that changes domain (even in
++/// permissive mode), so both outlive the agent. The old supplicant keeps the
++/// control socket: a new one exits at once and every command reaches the old
++/// one; the old odhcp6c keeps calling the new binary. Only callers without a
++/// live session reach here, and our own children are never matched.
++#[cfg(target_os = "linux")]
++fn stop_strays() -> Result<(), String> {
++    let me = std::process::id().to_string();
++    let strays: Vec<libc::pid_t> = fs::read_dir("/proc")
++        .map_err(|_| "Cannot list processes")?
++        .flatten()
++        .filter_map(|entry| {
++            let pid = entry.file_name().to_str()?.parse::<libc::pid_t>().ok()?;
++            let cmdline = fs::read(entry.path().join("cmdline")).ok()?;
++            let args: Vec<String> = cmdline.split(|&b| b == 0).filter(|a| !a.is_empty()).map(|a| String::from_utf8_lossy(a).into_owned()).collect();
++            let status = fs::read_to_string(entry.path().join("status")).ok()?;
++            let parent = status.lines().find_map(|l| l.strip_prefix("PPid:")).map(str::trim);
++            (stray(&args) && parent != Some(me.as_str())).then_some(pid)
++        })
++        .collect();
++    if strays.is_empty() {
++        return Ok(());
++    }
++    eprintln!("[relay] stopping {} helper(s) left by a previous agent", strays.len());
++    // A zombie has an empty command line; its parent (init) reaps it.
++    let alive = |pid: &libc::pid_t| fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|c| !c.is_empty());
++    for (signal, wait) in [(libc::SIGTERM, 10), (libc::SIGKILL, 10)] {
++        for pid in strays.iter().filter(|p| alive(p)) {
++            // SAFETY: plain kill(2) on a pid matched just above.
++            unsafe { libc::kill(*pid, signal) };
++        }
++        for _ in 0..wait {
++            if !strays.iter().any(alive) {
++                return Ok(());
++            }
++            std::thread::sleep(Duration::from_millis(100));
++        }
++    }
++    Err("A previous relay helper is still running; retry".into())
++}
++
++#[cfg(not(target_os = "linux"))]
++fn stop_strays() -> Result<(), String> {
++    Ok(())
++}
++
+ fn wpa_command(action: &str, args: &[&str]) -> Cmd {
+     let mut all = vec!["-p", "/tmp/zte-agent-relay/ctrl", "-i", IFACE, action];
+     all.extend_from_slice(args);
+@@ -507,7 +705,7 @@
+ }
+ 
+ /// Only an owned association journal invokes this. Normal cleanup stops an
+-/// unresponsive supplicant first; after a crash its parent-death signal did so.
++/// unresponsive supplicant first; after a crash `stop_strays` did so.
+ pub(crate) fn detach_station() -> Result<(), String> {
+     if !Path::new(&format!("/sys/class/net/{IFACE}")).exists() {
+         return Ok(());
+@@ -591,6 +789,104 @@
+     routes.and(wireless).and(dns)
+ }
+ 
++/// Upstream width adaptation for one connected session (see `width`).
++struct LinkWidth {
++    tuner: width::Tuner,
++    /// Opaque scan id the settled width is remembered under.
++    network: String,
++    /// LL stats are on: score by delivered bits per receive airtime.
++    airtime: bool,
++    /// Previous tick: time, received bytes and the radio's receive airtime.
++    last: Option<(std::time::Instant, u64, Option<u64>)>,
++}
++
++impl LinkWidth {
++    fn new(network: String, negotiated: u32, start: u32, airtime: bool) -> Self {
++        Self { tuner: width::Tuner::starting_at(negotiated, start), network, airtime, last: None }
++    }
++}
++
++/// Settled widths per network, newest first (`width::remember`).
++const WIDTHS: &str = "widths.json";
++
++/// After association: start at the width settled on last time for this
++/// network, else at the one the scan's neighbours predict.
++fn start_width(network: &str, neighbours: &[(u32, i32)]) -> Option<LinkWidth> {
++    let (primary, negotiated, center) = width::parse_channel(&Cmd::new("iw", &["dev", IFACE, "info"]).run().ok()?)?;
++    let start = width::remembered(&Path::new(JOURNAL).join(WIDTHS), network)
++        .filter(|&w| w <= negotiated)
++        .unwrap_or_else(|| width::predict(primary, negotiated, center, neighbours));
++    let link = LinkWidth::new(network.to_owned(), negotiated, start, llstats::enable(IFACE).is_ok());
++    if link.tuner.width() < negotiated {
++        // Not fatal: the watcher re-applies a width that did not take.
++        let _ = set_width(link.tuner.width());
++    }
++    Some(link)
++}
++
++/// One adaptation step per watcher tick.
++fn tune_width(link: &mut LinkWidth) -> Result<(), String> {
++    let info = Cmd::new("iw", &["dev", IFACE, "info"]).run()?;
++    let (primary, actual, _) = width::parse_channel(&info).ok_or("Cannot read the upstream channel width")?;
++    let expected = link.tuner.width();
++    if actual > link.tuner.widest() || actual < expected {
++        // The link itself changed (AP or reassociation): measure from here.
++        *link = LinkWidth::new(std::mem::take(&mut link.network), actual, actual, link.airtime);
++        return Ok(());
++    }
++    if actual > expected {
++        // A reassociation widened it again.
++        return set_width(expected);
++    }
++    let now = std::time::Instant::now();
++    let bytes: u64 = fs::read_to_string(format!("/sys/class/net/{IFACE}/statistics/rx_bytes"))
++        .ok()
++        .and_then(|b| b.trim().parse().ok())
++        .ok_or("Cannot read upstream traffic counters")?;
++    let airtime = if link.airtime {
++        match llstats::read(IFACE).ok().and_then(|stats| llstats::rx_airtime(&stats, primary)) {
++            Some(ms) => Some(ms),
++            None => {
++                // Never compare the two scores: start this session's
++                // measurement again on the AP's rate.
++                *link = LinkWidth::new(std::mem::take(&mut link.network), link.tuner.widest(), expected, false);
++                return Ok(());
++            }
++        }
++    } else {
++        None
++    };
++    let sample = match (link.last, airtime) {
++        (Some((at, before, Some(before_ms))), Some(ms)) => width::airtime_rate(now.duration_since(at).as_secs_f64(), bytes.saturating_sub(before), ms.saturating_sub(before_ms)),
++        (Some((at, before, _)), None) if width::busy(now.duration_since(at).as_secs_f64(), bytes.saturating_sub(before)) => {
++            width::parse_rx_rate(&Cmd::new("iw", &["dev", IFACE, "station", "dump"]).run()?)
++        }
++        _ => None,
++    };
++    link.last = Some((now, bytes, airtime));
++    let change = link.tuner.tick(now, sample);
++    if let Some(settled) = link.tuner.take_settled() {
++        // Not fatal: the next connection then predicts again.
++        let _ = width::remember(&Path::new(JOURNAL).join(WIDTHS), &link.network, settled);
++    }
++    change.map_or(Ok(()), set_width)
++}
++
++fn set_width(width: u32) -> Result<(), String> {
++    let code = width::chwidth_code(width).ok_or("Unsupported upstream channel width")?;
++    Cmd::new("iwpriv", &[IFACE, "chwidth", code]).run().map(|_| ()).map_err(|_| "Cannot change the upstream channel width".into())
++}
++
++/// The hotspot moved by hand before associating, if any (see `align_radio`).
++fn aligned_hotspot(frequency: u32) -> Option<&'static str> {
++    (frequency < 3000).then_some("wlan0")
++}
++
++/// 2.4 GHz only. On B31 the 5 GHz hotspot comes back from runtime
++/// `disable`/`set`/`enable` only at 160 MHz; 20, 40 and 80 MHz end
++/// `DISABLED`, and restoring 160 MHz costs a 60 s CAC. A 5 GHz upstream
++/// therefore leaves it to the driver (`gWlanMccToSccSwitchMode=3`), which
++/// moves the AP to the STA's channel by CSA without a restart.
+ fn align_radio(tx: &mut Transaction, iface: &str, frequency: u32) -> Result<(), String> {
+     let channel = channel(frequency).ok_or("Only 2.4 GHz and non-DFS 5 GHz upstreams are supported")?;
+     let before = ap(iface, "status", &[])?;
+@@ -767,7 +1063,7 @@
+                 continue;
+             }
+         }
+-        if b[i] == b'\\' && b.get(i + 1) == Some(&b'\\') {
++        if b[i] == b'\\' && matches!(b.get(i + 1), Some(b'\\' | b'"')) {
+             i += 1;
+         }
+         bytes.push(b[i]);
+@@ -776,41 +1072,68 @@
+     String::from_utf8_lossy(&bytes).into_owned()
+ }
+ 
+-pub fn parse_scan(text: &str) -> Vec<Network> {
+-    let mut out: Vec<Network> = Vec::new();
+-    for line in text.lines() {
+-        let fields: Vec<_> = line.splitn(5, '\t').collect();
+-        if fields.len() != 5 {
++/// Fresh entries of the supplicant's `BSS` pages (`====`/`####` after each
++/// entry) as (bssid, MHz, dBm, flags, ssid). Entries older than `max_age`
++/// seconds came from the kernel's cache, not this scan, and are left out.
++fn fresh_bss(text: &str, max_age: u64, mut each: impl FnMut(&str, u32, i32, &str, &str)) {
++    let mut fields = std::collections::HashMap::new();
++    for line in text.lines().chain(["===="]) {
++        if line != "====" && line != "####" {
++            if let Some((key, value)) = line.split_once('=') {
++                fields.insert(key, value);
++            }
+             continue;
+         }
+-        let (Ok(frequency), Ok(signal)) = (fields[1].parse::<u32>(), fields[2].parse::<i32>()) else { continue };
+-        let bssid = fields[0];
+-        if bssid.len() != 17 || !bssid.split(':').all(|p| p.len() == 2 && p.bytes().all(|b| b.is_ascii_hexdigit())) {
+-            continue;
++        let field = |key| fields.get(key).copied().unwrap_or("");
++        let fresh = field("age").parse::<u64>().is_ok_and(|age| age <= max_age);
++        if let (true, Ok(frequency), Ok(signal)) = (fresh, field("freq").parse(), field("level").parse()) {
++            each(field("bssid"), frequency, signal, field("flags"), field("ssid"));
+         }
+-        let ssid = decode_ssid(fields[4]);
+-        if ssid.is_empty() || ssid.len() > 32 || ssid.chars().any(char::is_control) {
+-            continue;
+-        }
+-        let flags = fields[3];
+-        let security = if flags.contains("WPA2-PSK") {
+-            "wpa2"
+-        } else if flags == "[ESS]" || flags == "[WPS][ESS]" {
+-            "open"
+-        } else {
+-            "unsupported"
+-        };
+-        let id = format!("{:x}", Sha256::digest(format!("{bssid}:{frequency}:{ssid}").as_bytes()))[..16].to_owned();
+-        out.push(Network { id, ssid, frequency, signal, security, supported: security != "unsupported" && channel(frequency).is_some(), bssid: bssid.into() });
++        fields.clear();
+     }
++}
++
++/// Networks offered for relay, strongest first.
++pub fn parse_bss(text: &str, max_age: u64) -> Vec<Network> {
++    let mut out: Vec<Network> = Vec::new();
++    fresh_bss(text, max_age, |bssid, frequency, signal, flags, ssid| out.extend(network(bssid, frequency, signal, flags, ssid)));
+     out.sort_by_key(|n| std::cmp::Reverse(n.signal));
+     out.truncate(80);
+     out
+ }
+ 
++/// Every fresh BSS, hidden ones included: what shares the air with a link.
++fn neighbours(text: &str, max_age: u64) -> Vec<(u32, i32)> {
++    let mut out = Vec::new();
++    fresh_bss(text, max_age, |_, frequency, signal, _, _| out.push((frequency, signal)));
++    out.truncate(256);
++    out
++}
++
++fn network(bssid: &str, frequency: u32, signal: i32, flags: &str, ssid: &str) -> Option<Network> {
++    if bssid.len() != 17 || !bssid.split(':').all(|p| p.len() == 2 && p.bytes().all(|b| b.is_ascii_hexdigit())) {
++        return None;
++    }
++    let ssid = decode_ssid(ssid);
++    if ssid.is_empty() || ssid.len() > 32 || ssid.chars().any(char::is_control) {
++        return None;
++    }
++    let security = if flags.contains("WPA2-PSK") {
++        "wpa2"
++    } else if flags == "[ESS]" || flags == "[WPS][ESS]" {
++        "open"
++    } else {
++        "unsupported"
++    };
++    let id = format!("{:x}", Sha256::digest(format!("{bssid}:{frequency}:{ssid}").as_bytes()))[..16].to_owned();
++    Some(Network { id, ssid, frequency, signal, security, supported: security != "unsupported" && channel(frequency).is_some(), bssid: bssid.into() })
++}
++
+ fn wpa_network(n: &Network, password: &str) -> Result<String, String> {
+     let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+-    let mut config = format!("network={{\nssid={}\nbssid={}\nfreq_list={}\n", hex(n.ssid.as_bytes()), n.bssid, n.frequency);
++    // scan_freq keeps the supplicant's own scans to one channel: the driver
++    // drops 5 GHz from multi-channel scans while the hotspot runs 160 MHz.
++    let mut config = format!("network={{\nssid={}\nbssid={}\nfreq_list={f}\nscan_freq={f}\n", hex(n.ssid.as_bytes()), n.bssid, f = n.frequency);
+     match n.security {
+         "open" if password.is_empty() => config.push_str("key_mgmt=NONE\n"),
+         "wpa2" => {
+@@ -916,6 +1239,7 @@
+     let result = match action {
+         "scan" => state.wifi_relay.scan(),
+         "disconnect" => state.wifi_relay.disconnect(),
++        "clock" => state.wifi_relay.recheck_clock_with(crate::network_clock::recheck_wifi),
+         "forget" => {
+             let _lock = state.wifi_relay.lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+             serde_json::from_slice::<Value>(body).map_err(|_| "Invalid request".to_owned())
+@@ -944,28 +1268,78 @@
+     use super::*;
+ 
+     #[test]
++    fn strays_are_only_relay_helpers_on_our_interface_and_paths() {
++        let args = |line: &str| line.split(' ').map(str::to_owned).collect::<Vec<_>>();
++        for helper in [
++            "wpa_supplicant -D nl80211 -i u60sta0 -c /tmp/zte-agent-relay/wpa.conf -qq",
++            "/usr/sbin/wpa_supplicant -D nl80211 -i u60sta0 -c /tmp/zte-agent-relay/recover.conf -qq",
++            "odhcp6c -N try -R -r 23 -s /data/zte-agent -p /tmp/zte-agent-relay/odhcp6c.pid u60sta0",
++            "udhcpc -f -i u60sta0 -s /data/zte-agent -t 5 -T 3 -A 10",
++        ] {
++            assert!(stray(&args(helper)), "{helper}");
++        }
++        for other in [
++            // The firmware's own supplicants and clients, and look-alikes.
++            "wpa_supplicant -D nl80211 -i wlan1 -c /var/run/wpa_supplicant-wlan1.conf",
++            "wpa_supplicant -D nl80211 -i u60sta0 -c /etc/wpa.conf",
++            "odhcp6c -s /lib/netifd/dhcpv6.script -p /var/run/odhcp6c.pid rmnet_data0",
++            "odhcp6c -p /tmp/zte-agent-relay/odhcp6c.pid wlan0",
++            "udhcpc -f -i br-lan -s /usr/share/udhcpc/default.script",
++            "sh -c udhcpc -i u60sta0",
++            "/data/zte-agent",
++            "",
++        ] {
++            assert!(!stray(&args(other)), "{other}");
++        }
++    }
++
++    #[test]
+     fn later_successful_clock_check_clears_relay_warning_without_reconnecting() {
+         let clock = crate::network_clock::WifiClock::new();
+         let relay = WifiRelay::new(Arc::new(Mutex::new(())));
+         let error = "Cannot verify UTC over Wi-Fi HTTPS; check upstream/portal access";
+-        assert!(clock.sync_with(|_| Err(error.into())).is_err());
++        assert!(clock.sync_with(false, |_| Err(error.into())).is_err());
+         *relay.snapshot.lock().unwrap() = json!({
+             "connected":true,"ssid":"W","address":"192.168.2.124",
+             "clock_error":clock.error(),"error":"Unrelated DNS warning"
+         });
+         assert_eq!(relay.status_with_clock(&clock)["clock_error"], error);
+ 
+-        clock.sync_with(|_| Ok(())).unwrap();
++        clock.sync_with(false, |_| Ok(())).unwrap();
+         let status = relay.status_with_clock(&clock);
+         assert!(status["clock_error"].is_null(), "A later verified check must replace the connect-time warning");
+         assert_eq!(status["connected"], true);
+         assert_eq!(status["ssid"], "W");
+         assert_eq!(status["error"], "Unrelated DNS warning");
+ 
+-        assert!(clock.sync_with(|_| Err("Clock sources disagree".into())).is_err());
++        assert!(clock.sync_with(false, |_| Err("Clock sources disagree".into())).is_err());
+         assert_eq!(relay.status_with_clock(&clock)["clock_error"], "Clock sources disagree");
+         relay.snapshot.lock().unwrap()["connected"] = json!(false);
+         assert!(relay.status_with_clock(&clock)["clock_error"].is_null(), "No stale warning while relay is off");
++    }
++
++    #[test]
++    fn clock_recheck_requires_a_stable_connected_relay_without_restarting_it() {
++        let clock = crate::network_clock::WifiClock::new();
++        let relay = WifiRelay::new(Arc::new(Mutex::new(())));
++        assert_eq!(relay.recheck_clock_with(|| panic!("Must not probe while disconnected")).unwrap_err(), "Connect Wi-Fi relay before checking time");
++        *relay.snapshot.lock().unwrap() = json!({"connected":true,"ssid":"W","address":"192.168.2.124"});
++        let before = relay.snapshot.lock().unwrap().clone();
++        let network = relay.lock.lock().unwrap();
++        assert!(relay.recheck_clock_with(|| panic!("Must not race a network operation")).unwrap_err().contains("network operation"));
++        drop(network);
++        for result in [Err("Upstream unavailable".to_owned()), Ok(())] {
++            assert_eq!(relay.recheck_clock_with(|| {
++                assert!(relay.lock.try_lock().is_err(), "Keep the current uplink stable");
++                assert!(relay.inner.try_lock().is_ok(), "Do not hold relay state during HTTPS");
++                clock.sync_with(true, |_| {
++                    assert_eq!(relay.status_with_clock(&clock)["ssid"], "W", "Status reads stay responsive");
++                    result.clone()
++                })
++            }), result);
++            assert_eq!(*relay.snapshot.lock().unwrap(), before, "No reconnect, cleanup or route changes");
++            assert_eq!(relay.status_with_clock(&clock)["clock_error"], json!(result.err()));
++        }
+     }
+ 
+     #[test]
+@@ -1019,20 +1393,59 @@
+         net::write_private(&root.join("cleaned"), b"1").unwrap();
+     }
+ 
++    fn bss(entries: &[(&str, u32, i32, u64, &str, &str)]) -> String {
++        entries
++            .iter()
++            .enumerate()
++            .map(|(id, (bssid, freq, level, age, flags, ssid))| format!("id={id}\nbssid={bssid}\nfreq={freq}\nlevel={level}\nage={age}\nflags={flags}\nssid={ssid}\n====\n"))
++            .collect()
++    }
++
+     #[test]
+     fn scan_filters_and_keeps_selection_opaque() {
+-        let n = parse_scan("bssid / frequency / signal level / flags / ssid\n02:11:22:33:44:55\t2427\t-43\t[ESS]\tJinJiangRewards\n02:11:22:33:44:66\t5500\t-30\t[WPA2-PSK-CCMP][ESS]\tDFS\n02:11:22:33:44:77\t5180\t-60\t[SAE][ESS]\tWPA3\n");
+-        assert_eq!(n.len(), 3);
++        let n = parse_bss(&bss(&[
++            ("02:11:22:33:44:55", 2427, -43, 0, "[ESS]", "JinJiangRewards"),
++            ("02:11:22:33:44:66", 5500, -30, 1, "[WPA2-PSK-CCMP][ESS]", "DFS"),
++            ("02:11:22:33:44:77", 5180, -60, 2, "[SAE][ESS]", "WPA3"),
++            ("02:11:22:33:44:88", 5220, -40, 9, "[WPA2-PSK-CCMP][ESS]", "Cached"),
++            ("02:11:22:33:44:99", 5240, -41, 0, "[WPA2-PSK-CCMP][ESS]", "Say \\\"hi\\\" \\\\o/"),
++        ]), 2);
++        assert_eq!(n.len(), 4, "the entry older than this scan is left out");
+         assert!(!n[0].supported);
+         let hotel = n.iter().find(|n| n.ssid == "JinJiangRewards").unwrap();
+         assert!(hotel.supported);
+         assert!(!serde_json::to_string(hotel).unwrap().contains("02:11:22:33:44:55"));
+         assert_eq!(hotel.id.len(), 16);
++        assert!(n.iter().any(|n| n.ssid == r#"Say "hi" \o/"# && n.supported));
+     }
+ 
+     #[test]
++    fn only_the_2ghz_hotspot_is_realigned_by_hand() {
++        assert_eq!(aligned_hotspot(2412), Some("wlan0"));
++        assert_eq!(aligned_hotspot(2472), Some("wlan0"));
++        // The 5 GHz hotspot does not come back from runtime reconfiguration
++        // below 160 MHz; the driver's SCC switch moves it instead.
++        for frequency in [5180, 5220, 5745, 5825] {
++            assert_eq!(aligned_hotspot(frequency), None);
++        }
++    }
++
++    #[test]
++    fn association_scans_only_the_upstream_channel() {
++        // freq_list only limits selection; without scan_freq the supplicant's
++        // own scans are full scans, which lose 5 GHz while the hotspot runs
++        // 160 MHz, so the upstream was never found.
++        for (freq, flags) in [(5220, "[WPA2-PSK-CCMP][ESS]"), (2412, "[ESS]")] {
++            let n = parse_bss(&bss(&[("02:11:22:33:44:55", freq, -40, 0, flags, "Hotel")]), 0).remove(0);
++            let config = wpa_network(&n, if n.security == "wpa2" { "password" } else { "" }).unwrap();
++            assert!(config.lines().any(|l| l == format!("scan_freq={freq}")), "{config}");
++            assert!(config.lines().any(|l| l == format!("freq_list={freq}")));
++        }
++    }
++
++    #[test]
+     fn passwords_never_become_supplicant_directives() {
+-        let mut n = parse_scan("02:11:22:33:44:55\t2427\t-40\t[ESS]\tHotel").remove(0);
++        let mut n = parse_bss(&bss(&[("02:11:22:33:44:55", 2427, -40, 0, "[ESS]", "Hotel")]), 0).remove(0);
+         assert!(wpa_network(&n, "").unwrap().contains("key_mgmt=NONE"));
+         n.security = "wpa2";
+         let c = wpa_network(&n, "hello;\"$password").unwrap();

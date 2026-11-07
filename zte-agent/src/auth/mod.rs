@@ -9,6 +9,7 @@
 
 mod limiter;
 mod rng;
+pub mod startup;
 mod table;
 
 use std::fmt;
@@ -49,6 +50,9 @@ impl Kind {
 /// Internal handle for a session; never sent to a client.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SessionId(u64);
+
+/// The local token's principal; the session table starts its ids at 1.
+const LOCAL: SessionId = SessionId(0);
 
 #[cfg(test)]
 impl SessionId {
@@ -145,6 +149,13 @@ pub struct Principal {
     csrf: [u8; 32],
 }
 
+impl Principal {
+    /// Authenticated by the local token (`AuthState::issue_local`).
+    pub fn is_local(&self) -> bool {
+        self.id == LOCAL
+    }
+}
+
 impl fmt::Debug for Principal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Principal")
@@ -193,6 +204,8 @@ pub struct AuthState {
     revoke_hook: OnceLock<RevokeHook>,
     /// Per-process HMAC key for login form tokens, filled on first use.
     form_key: OnceLock<[u8; 32]>,
+    /// Digest of the local token, set once at startup.
+    local: OnceLock<[u8; 32]>,
 }
 
 impl AuthState {
@@ -216,6 +229,7 @@ impl AuthState {
             epoch: AtomicU64::new(0),
             revoke_hook: OnceLock::new(),
             form_key: OnceLock::new(),
+            local: OnceLock::new(),
         }
     }
 
@@ -225,10 +239,9 @@ impl AuthState {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Set the agent password (once, at startup). An empty one is no
-    /// password: the web UI then explains how to set one instead of showing
-    /// a login form anyone could pass. Changing it needs a restart, which
-    /// also ends every session (they live in RAM only).
+    /// Test fixtures may leave auth unconfigured to exercise defensive routes.
+    /// Production initializes it through `startup::configure`, failing closed.
+    #[cfg(test)]
     pub fn set_password(&self, password: &str) {
         if password.is_empty() {
             eprintln!("[auth] ZTE_AGENT_PASSWORD is empty: running without an agent password");
@@ -371,6 +384,23 @@ impl AuthState {
             kind,
             csrf: e.csrf,
         })
+    }
+
+    /// A token for scripts run as root on the router itself
+    /// (`startup::write_local_token`): one per process, no expiry, not in the
+    /// session table, so revoking sessions keeps it. The listener accepts it
+    /// from loopback peers only.
+    pub fn issue_local(&self) -> Result<Secret, &'static str> {
+        let mut token = [0u8; 32];
+        self.rng.fill(&mut token).map_err(|_| "no randomness")?;
+        self.local.set(local_digest(&token)).map_err(|_| "already issued")?;
+        Ok(Secret(hex(&token)))
+    }
+
+    pub fn authenticate_local(&self, token: &str) -> Option<Principal> {
+        let stored = self.local.get()?;
+        let token = parse_hex::<32>(token)?;
+        bool::from(local_digest(&token).ct_eq(stored)).then_some(Principal { id: LOCAL, kind: Kind::Bearer, csrf: [0; 32] })
     }
 
     /// Bearer check (the listener uses `authenticate` to keep the principal).
@@ -572,6 +602,13 @@ impl AuthState {
 fn digest(kind: Kind, token: &[u8; 32]) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(kind.tag());
+    h.update(token);
+    h.finalize().into()
+}
+
+fn local_digest(token: &[u8; 32]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(b"local\0");
     h.update(token);
     h.finalize().into()
 }
@@ -904,6 +941,36 @@ mod tests {
         assert!(!a.validate(cookie.token.expose()));
         assert!(a.validate(bearer.token.expose()));
         assert!(a.authenticate(Kind::Browser, cookie.token.expose()).is_some());
+    }
+
+    #[test]
+    fn local_token_is_one_per_process_and_not_a_session() {
+        let (clock, a) = auth();
+        assert!(a.authenticate_local(&"0".repeat(64)).is_none(), "nothing before issuing");
+        let local = a.issue_local().unwrap();
+        assert!(is_lower_hex(local.expose(), 64));
+        let p = a.authenticate_local(local.expose()).unwrap();
+        assert!(p.is_local());
+        assert!(!login(&a, Kind::Bearer, peer(40, 1)).id.eq(&p.id));
+        assert!(a.issue_local().is_err(), "never replaced while running");
+        // Not a bearer token or a cookie, and not the reverse either.
+        assert!(!a.validate(local.expose()));
+        assert!(a.authenticate(Kind::Browser, local.expose()).is_none());
+        let bearer = login(&a, Kind::Bearer, peer(40, 2));
+        assert!(a.authenticate_local(bearer.token.expose()).is_none());
+        assert!(a.authenticate_local(&local.expose().to_ascii_uppercase()).is_none());
+        // Never expires and survives revoking every session.
+        clock.advance(30 * 24 * HOUR);
+        a.revoke_all();
+        assert!(a.authenticate_local(local.expose()).is_some());
+        assert_eq!(a.touch_session(p.id), SessionCheck::Revoked);
+    }
+
+    #[test]
+    fn local_token_needs_entropy() {
+        let a = AuthState::with_parts(FakeClock::at_secs(1), Box::new(FailRng), AuthConfig::default());
+        assert!(a.issue_local().is_err());
+        assert!(a.authenticate_local(&"0".repeat(64)).is_none());
     }
 
     #[test]

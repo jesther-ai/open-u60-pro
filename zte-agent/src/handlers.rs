@@ -28,6 +28,10 @@ pub struct AppState {
     pub charge_limit: Arc<ChargeLimitEnforcer>,
     pub sms_forward: Arc<SmsForwarder>,
     pub tailscale: Arc<crate::tailscale::TailscaleManager>,
+    pub network_lock: crate::net_tools::NetworkLock,
+    pub cellular_control: crate::modem_ext::CellularControl,
+    pub mihomo: Arc<crate::mihomo::Mihomo>,
+    pub wifi_relay: Arc<crate::wifi_relay::WifiRelay>,
     pub ttl: Arc<crate::ttl::TtlManager>,
     pub wireguard: Arc<crate::wireguard::WireGuardManager>,
     pub ota: Arc<crate::ota::OtaManager>,
@@ -51,9 +55,15 @@ pub struct AppState {
 impl AppState {
     pub fn new() -> Self {
         let live_activity = Arc::new(crate::live_activity::LiveActivity::new());
+        let network_lock = Arc::new(std::sync::Mutex::new(()));
+        let mihomo = Arc::new(crate::mihomo::Mihomo::new(Arc::clone(&network_lock)));
         let dashboard = Arc::new(crate::dashboard::Dashboard::default());
         let ota = crate::ota::OtaManager::system(Arc::downgrade(&dashboard));
         Self {
+            wifi_relay: Arc::new(crate::wifi_relay::WifiRelay::with_core(Arc::clone(&network_lock), Arc::clone(&mihomo))),
+            mihomo,
+            network_lock,
+            cellular_control: crate::modem_ext::CellularControl::default(),
             client_details: crate::client_details::ClientMonitor::default(),
             dashboard,
             tls: Arc::new(crate::tls::Tls::router(Arc::clone(&live_activity))),

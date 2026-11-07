@@ -155,9 +155,14 @@ async fn enter_pin_sends_once_and_never_echoes() {
     r.assert_secure_html(503);
     let html = r.text();
     assert!(html.contains("<p class=\"msg err\" role=\"alert\">Failed: ubus call zwrt_zte_mdm.api sim_verify_pin_puk failed: &lt;x&gt;</p>"), "{html}");
-    assert!(!html.contains("5678") && r.input("once") != token);
+    // Random CSRF/once/CSP values can contain four PIN digits by coincidence.
+    // Remove only those complete tokens, not arbitrary matching text or fields.
+    let nonce = r.header("content-security-policy").unwrap().split("'nonce-").nth(1).unwrap().split('\'').next().unwrap();
+    let random = [r.input("csrf"), r.input("once"), nonce.to_owned()];
+    let without_random = |text: &str| random.iter().fold(text.to_owned(), |text, value| text.replace(value, "[random]"));
+    assert!(!without_random(&html).contains("5678") && r.input("once") != token);
     for h in r.headers.values() {
-        assert!(!h.to_str().unwrap_or("").contains("5678"));
+        assert!(!without_random(h.to_str().unwrap_or("")).contains("5678"));
     }
     // A replay of the failed post: the same failure, nothing sent again.
     let r = post(&c, PIN, peer(151, 5), &cookie, &format!("csrf={csrf}&once={token}&confirm=1&left=1&pin=5678")).await;

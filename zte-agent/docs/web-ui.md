@@ -4,6 +4,39 @@ This design describes the retired interface. It is no longer served in productio
 
 # Web UI: `/ui/`
 
+## Experimental Web-Only Network Extensions
+
+Router now also offers a Mihomo/Clash start-stop switch and its local Zashboard
+entry (shown only while running). The Mihomo page adds subscriptions with manual
+or interval refresh, file/paste import, profile selection and global Merge/JS
+extensions (bounded server-side QuickJS, no browser execution). Add/Edit uses a
+native modal with visible subscription URL, source type, name and update interval;
+Delete asks for confirmation. Local file/paste and no-JavaScript forms remain
+supported. The existing nonce-scoped Datastar initializer adds spinners and
+duplicate-submit prevention to profile downloads, Clash switching and Relay
+scan/connect. Failed editor requests retain inputs; network interruptions require
+checking the current state, not automatic retries. A sixth browser tab, Relay, manages Wi-Fi
+upstreams independently. These Rust-backed extensions deliberately do not alter
+the iOS/Android interfaces. The mobile dock names only the current tab to avoid
+six crowded labels; desktop retains all labels. Relay has selectable upstream
+cards, a secondary Scan button and a primary Connect button, with compatibility
+notes behind a disclosure. Zashboard opens its proxy page directly, automatically
+selecting the current U60's same-origin backend; Setup, if opened, is prefilled
+with that address/port/path and needs no core secret in the browser. See
+[network-extensions.md](network-extensions.md)
+for security, scope, routes, recovery and required device acceptance; the
+five-app-tab descriptions below refer to the original companion-app layout.
+
+Global Merge/Script displays its saved content in the authenticated no-store
+editor and stays expanded after saving. Enhanced saves show inline success or a
+sanitized failure next to the button without leaving the page; failed edits are
+retained, and renewed form tokens allow another edit. No-JS failure responses also
+retain extension text. The network spinner is excluded from the list row's
+stretching label rule so it remains round, rather than rotating as a wide ellipse.
+The Router Clash switch keeps its stable knob and shows a separate circular
+indicator plus Starting/Stopping text during requests. Remembered Wi-Fi scan
+results carry the shared green Saved badge; unsaved entries have no badge.
+
 The agent serves a browser UI on the same listener as the JSON API (port 9090) and, once the owner turns it on, over HTTPS on port 9443 with the router's own certificate authority ([LAN HTTPS](#lan-https)). It is a copy of the iOS app, tab by tab (Dashboard, SMS, Tools, Router, Settings), with the same screens, words and flows: the dashboard with its USB-C card and its sheets (Connection & signal, Live traffic, Battery Details, CPU & temperatures, CPU & Memory, Processes, Wi-Fi & devices with Share Wi-Fi), Network Mode, the Tools list with Automations (New / Edit Automation), Speed Test, Enable ADB, USB Mode, Band Lock, AT Terminal, Device Info, Connected Devices, the app's placeholders for its shell tools and notes for the two tools that stay in the app (LAN Speed Test, Config Decrypt/Encrypt), Router › Mobile Network (mobile data, airplane mode, connection mode, data roaming, network selection with its scan and manual registration, and the app's "Reboot Required"), Cell Lock (with the neighbour scan), Smart Tower Connect, Signal Detection, SIM Card (with its PIN, PUK and unlock-code sheets), eSIM Profiles (switch, rename, delete, operator receipts, the chip card, and Add eSIM from a photo of the QR code or the code), SIM Services (USSD and the SIM Toolkit), WiFi, Guest WiFi, APN (with New / Edit APN and Auto APN), LAN / DHCP, DNS (with the DoH cache inspector), Firewall (with New Port Forward), Telemetry Blocker, VPN Passthrough, QoS and Device Controls (charge limit, Power-save Mode, Fast Boot, Auto Sleep with its idle timeout, Reboot Router and Factory Reset with the router password), SMS › Messages with its conversations (open, reply, delete) and New Message, SMS Forwarding (its switches, rules, New Rule / Edit Rule with Test Destination, Forward Log with Retry and Clear; also under Tools), and Settings (Session with Log out, the Polling refresh interval, the Appearance theme, HTTPS & Install as App with Install on Your Devices, About, Legal). What the web leaves out is listed under [Not on the web](#not-on-the-web). For users, see the README's [Web UI](../README.md#web-ui) section; this page is for contributors.
 
 - Server-rendered HTML ([maud](https://maud.lambda.xyz/)): every interpolated value is escaped, and nothing under `src/web` uses raw HTML (a test checks this).
@@ -11,6 +44,23 @@ The agent serves a browser UI on the same listener as the JSON API (port 9090) a
 - Everything works without JavaScript. [Datastar](https://data-star.dev/) 1.0.4, vendored and served by the agent, is an optional live layer.
 - Sessions live in RAM only: an agent restart logs every browser out.
 - Screens and actions are tables (`src/web/screen.rs`, `action.rs`, the tabs in `src/web/tabs/`), drawn with shared primitives (`kit.rs`); one route table (`routes.rs`) serves them all.
+
+## Default Login Password
+
+`auth::startup` resolves the login verifier before services or HTTP listeners start.
+A nonempty `ZTE_AGENT_PASSWORD` takes priority. When unset, B31's `zwrt_web`
+configuration must identify exactly one `admin` user with `password_type=1` and a
+64-hex SHA-256 verifier of a nonempty password. The section index is not assumed.
+The verifier is reused directly; the user still enters the original password,
+not the hex digest. No factory password is copied to an agent configuration or log.
+Missing, ambiguous, empty or unsupported credentials stop startup; there is no
+unauthenticated fallback. Unsupported firmware needs an explicit password.
+
+The verifier is read once. Restart the agent after an official password change;
+this also invalidates all in-memory agent sessions. Existing start scripts that
+export `ZTE_AGENT_PASSWORD` retain their override until it is removed and the
+variable is unset. Browser/bearer tokens, login rate limiting and Mihomo's
+independent internal secret are unchanged. No factory admin setting is written.
 
 ## Navigation
 
@@ -189,7 +239,7 @@ One middleware (`guard` in `src/web/mod.rs`) runs first on every `/`, `/ui` and 
 
 1. **Host allowlist** (DNS-rebinding defence): an IP literal, a name in `ZTE_AGENT_UI_HOSTS`, the LAN HTTPS name (`u60.home.arpa`) only over the HTTPS listener (which runs only while HTTPS is on: another network's DNS can answer for a `home.arpa` name too, so over http it would be a rebinding target, but no one else can present the router's certificate for it), and, only from loopback peers (Tailscale clients), `localhost` and the router's Tailscale names. Otherwise `403 Host not allowed`; no `Host` is `400 Missing Host`. The API applies the same rule.
 2. A fresh CSP nonce for every HTML response.
-3. Without an agent password, every page is the "Set an agent password" page (`403`); assets and the manifest still load.
+3. An unconfigured auth state renders the "Set an agent password" page (`403`); assets and the manifest still load. This defensive path is tested, but production now refuses startup without a verifier (see [Default Login Password](#default-login-password)).
 4. Security headers on every response:
    - `X-Frame-Options: DENY`, `Referrer-Policy: same-origin`, `X-Content-Type-Options: nosniff`, `Cross-Origin-Resource-Policy: same-origin`;
    - HTML: `Content-Security-Policy: default-src 'none'; script-src 'nonce-…'; style-src 'self'; img-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'; manifest-src 'self'` and `Cross-Origin-Opener-Policy: same-origin`;
@@ -404,13 +454,13 @@ Settings › Appearance (owner decision 55) has to colour what the browser and t
 
 ## Privacy
 
-- Never rendered: IMEI (Device Info shows its last 4 digits, "…0042"; the read keeps only those, so the whole number never reaches a renderer; owner decision, the app shows it whole), IMSI and MSISDN (the router's own number) except on SIM Card as below, full ICCIDs, full MAC addresses (the `clients` topic reads MACs; only the renderers mask them). The dashboard shows only how many devices are connected. Device Info does not read the SIM (the app reads it and shows none of it).
+- Never rendered: IMEI (Device Info shows its last 4 digits, "…0042"; the read keeps only those, so the whole number never reaches a renderer; owner decision, the app shows it whole), IMSI and MSISDN (the router's own number) except on SIM Card as below, full ICCIDs. Full MAC addresses are shown only on the authenticated Wi-Fi & devices and fixed-client-IP pages (and reservation API), at the owner's request; other device lists retain masking. The dashboard shows only how many devices are connected. Device Info does not read the SIM (the app reads it and shows none of it).
 - SIM Card (owner decision; the app shows them whole): the ICCID and MSISDN as their last 4 digits ("…4242"), the IMSI as its network and last 4 digits ("001/01 …4242": the card's MCC and MNC when they lead it, which the page shows on its own row anyway, else the first 3 and 2 digits). The `sim` topic carries the whole values; only these renderers see them, also in the stream frames. PINs, PUKs and unlock codes are only in POST bodies: never in a URL, a page, a log or the token store (its digest is keyed); a sheet shown again has empty fields. The agent passes them to `ubus` on its command line (visible in `/proc` for the call's duration), and the firmware's `zte_topsw_mdm` has format strings that print a PIN, PUK and NCK to its log (`mdm.str`; not checked on the device): both outside the web UI.
 - Add eSIM: activation and confirmation codes are only in the post's body (multipart) and the agent's request: never drawn into a page (the fields are always empty), put in a URL, a fragment, a result line or a log, and never kept (no draft; the token store keeps an HMAC of them with the process's key). Uploaded photos are held in RAM only while read and decoded, then dropped; never stored or logged (the decoding process gets them over a pipe, its stderr is discarded and it writes only its answer). An operator's error is shown without any word shaped like an activation code.
 - eSIM Profiles: ICCIDs as their last 4 digits ("…1234"); profiles are named in URLs and forms by an opaque key (an HMAC of the ICCID with a per-process key, 16 hex; the full ICCID only goes to the agent's handlers in-process); the EID masked ("•••• •••• •••• …1234") unless the page was asked for it (`?eid=1`, an explicit GET; never in a fragment, a stream frame, a URL or a log). Profile names, providers and nicknames are shown as the app does. The names of the last list read are kept in RAM (by ICCID) so a switch's live card can name its target.
 - SIM Services: USSD answers and toolkit texts can hold balances, numbers or voucher codes: shown as they are (the plan's "none": the app shows them, and a masked voucher could not be used), on signed-in `no-store` pages only, kept in RAM for the session that asked (10 minutes, dropped on logout), never in a URL (`?u=` is the post's used token), a log or `<title>`. A text typed for the SIM is only posted (a hidden one in a password field). A USSD code that carries a SIM PIN or PUK is refused and never shown again.
-- Connected Devices shows what Wi-Fi & devices shows (the same rows' data and masking: name, IPv4, the MAC's last 2 octets, no IPv6). Its search is posted to the page, as Messages' (so its text, which may be a device name, is in no URL, the history or `next`; a `q` in the URL is ignored), and matches only what is shown: the masked name and MAC and the IPv4 address (a search for hidden octets finds nothing). A failed read is the first row ("Couldn't update: …"), as the app's red row; the network icon is secondary grey.
-- Wi-Fi & devices lists each device's name (DHCP host name, else the host-hint name) and IPv4 address, with the MAC masked to its last 2 octets (`••:••:••:••:3a:7f`; the app shows it whole) and no IPv6 address (owner decision). A name that spells 3 or more octets of the device's MAC (6+ hex digits, or octets joined by `:` or `-`, as in `shellyplus1pm-02032ab12345`) has those characters masked too. The list is live, so these also travel in its stream frames; never in URLs or fragment ids.
+- Tools > Connected Devices retains its masked name, IPv4, the MAC's last 2 octets and no IPv6. Its search is posted to the page, as Messages' (so its text, which may be a device name, is in no URL, the history or `next`; a `q` in the URL is ignored), and matches only what is shown: the masked name and MAC and the IPv4 address (a search for hidden octets finds nothing). A failed read is the first row ("Couldn't update: …"), as the app's red row; the network icon is secondary grey.
+- Wi-Fi & devices lists each device's name (DHCP host name, else the host-hint name), full MAC and IPv4 address, with no IPv6 address. The owner requested unmasked MACs on this page on 2026-10-27; names containing MAC octets are also kept intact. The list is live, so these also travel in its authenticated stream frames; never in URLs or fragment ids. Fixed client IPs likewise displays full saved MACs, while keeping opaque deletion IDs. Both pages remain authenticated and `no-store`.
 - Wi-Fi passwords appear only on Share Wi-Fi: as text only after "Show password" (`?show=1`), and in the join QR code, which the page always shows (as the app's card). The page is never live, `no-store` like every page, and the password is never in a URL, a log or another page; the shown password is marked `translate="no"`. The Wi-Fi card's read drops the keys before rendering. Known limit: `no-store` does not reliably keep a page out of a browser's back-forward cache (WebKit may keep it), so on a shared device Back after logging out can show a Share Wi-Fi page from memory; close the tab. (`Clear-Site-Data` would not help: browsers honour it only in secure contexts, and the agent speaks plain HTTP.)
 - Processes shows process names and PIDs (as the app).
 - SMS pages show the numbers you exchange messages with and the message text, unmasked as in the app (owner decision), on signed-in SMS pages only: never in `<title>` (a conversation's is "Conversation"; the number is its heading), a URL or query string (conversations by opaque key; the search is a POST to Messages, so its text is in the page only: the storage items then post the search form to the other store's page, and links, the stream and `next` carry no search; a `q` typed into the URL is ignored, and the login drops it), a live fragment id or stream frame, or a log. Rendered times use the router's own time zone everywhere, at each message's date (so a winter message keeps its winter time in summer; list labels count from the router clock, in the app's abbreviated words: "5 min. ago", "1 mo. ago", "in 2 min." for a time ahead of it; the date while the router clock is unset).
@@ -448,3 +498,23 @@ Settings › Appearance (owner decision 55) has to colour what the browser and t
 - A live stream with curl needs `-H 'Datastar-Request: true'`, the session cookie and the page key from the page's `data-init`. Never paste a session cookie or token into shared logs.
 - DNS-rebinding check: `curl -H 'Host: evil.example' http://192.168.0.1:9090/ui/login` must give `403`.
 - LAN HTTPS: `tls::x509::tests` (every certificate field parsed back; the chain verified with rustls/webpki for the address and the name, and refused for names and addresses outside the constraints, also with a root that has none; the router's narrow scope and a name-only CA; the scope read back), `tls::tests` (temporary directories, fake clocks, a fake LAN address and a fake dnsmasq: files and modes, the hosts line and SIGHUP, forged certificates from the stored issuing key refused, start, repair of the directory and key modes, a lost or mismatched server pair issued again from the same CA (old dates, verified clock, or kept for Turn On), renewal only on the verified clock and never past the CA, a new LAN address (name only, same dates, the line cleared once back), Turn On again after a failed bind, reset, the API answer, the profile), `tls::hosts` (the temporary file new and outside the directory, a planted link not followed), `router::tests` (a LAN apply moves HTTPS), `httpd::mobile` (each listener's fail-open flag), `httpd::tls::tests` (the listener on 127.0.0.1 with a rustls client that trusts only the generated root: TLS 1.2 and 1.3, ALPN, the chain, the local name only over HTTPS, the cookie and origin rules per origin, hot swap, lazy renewal before a handshake, reset and resumed sessions, reset ending a live stream and a keep-alive connection while its own reply gets through, a failed bind and Try Again, a listener that ends by itself without a busy loop, the mobile-side check before the handshake, shared caps, a live stream over TLS) and `web::tests::https` (Settings, the questions and their single-use posts, a kept CA, Try Again, the install page, the downloads' types, the hints, `GET /api/https`). On the router: `openssl s_client -connect 192.168.0.1:9443 -servername u60.home.arpa -showcerts </dev/null` shows the two certificates.
+
+
+### Per-network relay bandwidth (2026-11-03)
+
+`/ui/relay` offers Keep negotiated bandwidth (default) or Auto tuning.
+The full-width selector sits immediately above Connect to Wi-Fi and defaults
+to the selected network's saved choice; scan cards
+show that choice. The current connection and saved networks have preselected
+selectors and Apply forms. Applying a different active choice reconnects through
+the ordinary relay lifecycle and explicitly warns about interruption; inactive
+choices are only saved. Both routes use the same CSRF/session/once-job protection.
+
+`POST /api/wifi-relay/connect` accepts optional `width_mode: "off" | "auto"`;
+null/omitted loads the saved choice. `POST /api/wifi-relay/tuning` accepts
+`{id, width_mode, confirmed:true}`, where id is the persistent SSID/security ID.
+Status exposes current `width_mode`, `network_id`, `saved_network_id`, plus each
+scan/saved network's choice. Old credential records default to off. Preferences
+are saved even without passwords; remembered metadata distinguishes them.
+Changing a password-unsaved active WPA2 network requires re-entering its password
+in the connection form. Forget deletes the preference and saved credential.

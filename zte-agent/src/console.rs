@@ -25,7 +25,7 @@ pub fn router() -> Router<Ctx> {
         .route("/console/a/{file}", get(serve))
 }
 
-async fn serve(State(ctx): State<Ctx>, req: Request) -> Response {
+pub(crate) fn host_allowed(ctx: &Ctx, req: &Request) -> bool {
     let loopback = req
         .extensions()
         .get::<Peer>()
@@ -34,10 +34,14 @@ async fn serve(State(ctx): State<Ctx>, req: Request) -> Response {
         .extensions()
         .get::<crate::httpd::tls::Secure>()
         .is_some();
-    if !api::header(req.headers(), "host").is_some_and(|host| {
+    api::header(req.headers(), "host").is_some_and(|host| {
         ctx.hosts
             .allows_via(host, loopback, secure, &|| ctx.ts.get())
-    }) {
+    })
+}
+
+async fn serve(State(ctx): State<Ctx>, req: Request) -> Response {
+    if !host_allowed(&ctx, &req) {
         let mut reply = Response::new(Body::from("Host not allowed"));
         *reply.status_mut() = StatusCode::FORBIDDEN;
         return reply;
@@ -156,6 +160,10 @@ fn legacy_destination(path: &str) -> &'static str {
         "/console/#network/lan"
     } else if route.starts_with("router/firewall") {
         "/console/#network/firewall"
+    } else if route.starts_with("relay") {
+        "/console/#network/relay"
+    } else if route.starts_with("router/mihomo") || route.starts_with("mihomo") {
+        "/console/#network/mihomo"
     } else if route.starts_with("router/qos") {
         "/console/#network/qos"
     } else if route.starts_with("router/wifi") || route.starts_with("wifi") {
@@ -317,6 +325,26 @@ fn asset(path: &str) -> Option<(&'static str, &'static str)> {
             "text/javascript; charset=utf-8",
             include_str!("../ui/wireguard.js"),
         )),
+        "/console/a/relay-model.js" => Some((
+            "text/javascript; charset=utf-8",
+            include_str!("../ui/relay-model.js"),
+        )),
+        "/console/a/relay.js" => Some((
+            "text/javascript; charset=utf-8",
+            include_str!("../ui/relay.js"),
+        )),
+        "/console/a/mihomo-model.js" => Some((
+            "text/javascript; charset=utf-8",
+            include_str!("../ui/mihomo-model.js"),
+        )),
+        "/console/a/mihomo.js" => Some((
+            "text/javascript; charset=utf-8",
+            include_str!("../ui/mihomo.js"),
+        )),
+        "/console/a/mihomo-proxies.js" => Some((
+            "text/javascript; charset=utf-8",
+            include_str!("../ui/mihomo-proxies.js"),
+        )),
         "/console/a/data-usage.js" => Some((
             "text/javascript; charset=utf-8",
             include_str!("../ui/data-usage.js"),
@@ -405,6 +433,11 @@ mod tests {
             ("/console/a/dns-cache.js", 200),
             ("/console/a/wireguard-model.js", 200),
             ("/console/a/wireguard.js", 200),
+            ("/console/a/relay-model.js", 200),
+            ("/console/a/relay.js", 200),
+            ("/console/a/mihomo-model.js", 200),
+            ("/console/a/mihomo.js", 200),
+            ("/console/a/mihomo-proxies.js", 200),
             ("/console/a/update.js", 200),
             ("/console/a/data-usage.js", 200),
             ("/ui/login", 303),
@@ -465,6 +498,8 @@ mod tests {
                 "/console/",
             ),
             ("/ui/router/esim?iccid=private", "/console/#network/esim"),
+            ("/ui/relay", "/console/#network/relay"),
+            ("/ui/router/mihomo?add=1&token=private", "/console/#network/mihomo"),
             ("/ui/battery", "/console/#tools/battery"),
             ("/ui/settings/https", "/console/#settings/https"),
         ] {

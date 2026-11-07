@@ -2,6 +2,70 @@
 
 zte-agent is licensed under the [MIT License](LICENSE). The binary built from this repository also contains the components below. This file accompanies every release of the `zte-agent` binary.
 
+## Profile JavaScript runtime (MIT)
+
+Global profile scripts execute in QuickJS through `rquickjs` 0.14.0, not Node.js.
+The runtime is linked into the Rust agent with no module loader or host I/O.
+Sources: https://github.com/DelSkayn/rquickjs and https://github.com/quickjs-ng/quickjs.
+The profile pipeline is an independent implementation of the documented
+`main(config, profileName)` contract; no Clash Verge source code is vendored.
+
+### rquickjs
+
+```
+MIT License
+
+Copyright (c) 2020 Mees Delzenne
+Copyright (c) 2025 Rquickjs Contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+### QuickJS
+
+```
+The MIT License (MIT)
+
+Copyright (c) 2017-2026 Fabrice Bellard
+Copyright (c) 2017-2024 Charlie Gordon
+Copyright (c) 2023-2026 Ben Noordhuis
+Copyright (c) 2023-2026 Saúl Ibarra Corretgé
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+```
+
 ## euicc (LGPL-2.1-only)
 
 The `euicc/` directory is a Rust translation of libeuicc, the eSIM library of [lpac](https://github.com/estkme-group/lpac) (commit `c7c8d4f`). It is linked into `zte-agent`.
@@ -219,6 +283,44 @@ NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
+## Optional Network Programs (Not Linked Into zte-agent)
+
+The web-only network extension can download these separately version-pinned
+upstream artifacts at the user's request. No artifact is embedded in the agent
+or automatically installed at boot:
+
+- **Mihomo 1.19.33**, GPL-3.0, distributed by
+  [MetaCubeX](https://github.com/MetaCubeX/mihomo/releases/tag/v1.19.33).
+  [Corresponding upstream source](https://github.com/MetaCubeX/mihomo/tree/v1.19.33)
+  and [license](https://github.com/MetaCubeX/mihomo/blob/v1.19.33/LICENSE).
+  The installer stores the verified license and source location beside the
+  independently executed core. If redistributing a bundled core, satisfy its
+  GPL source/license obligations; the MIT license of this repository does not
+  replace that license.
+- **Zashboard 3.29.1**, MIT, Copyright 2024 Zephyruso,
+  [release](https://github.com/Zephyruso/zashboard/releases/tag/v3.29.1),
+  [source](https://github.com/Zephyruso/zashboard/tree/v3.29.1) and
+  [license](https://github.com/Zephyruso/zashboard/blob/v3.29.1/LICENSE).
+  The installer retains the dashboard's third-party notices and a verified
+  copy of its MIT notice. A SHA-256 CSP permission covers only the pinned
+  release's favicon theme script; the service-worker registration is disabled
+  by the device-local serving adapter. That adapter verifies the original
+  index/main-module hashes and adapts the served main module to select the
+  router's same-origin backend, prefill Setup and support unavailable browser
+  storage. The downloaded upstream files remain unchanged on disk; the
+  adapter/bootstrap source is in `zte-agent/src/web/mihomo/`.
+- Optional GeoSite/GeoIP/ASN databases are downloaded separately from
+  [MetaCubeX/meta-rules-dat](https://github.com/MetaCubeX/meta-rules-dat), whose
+  repository is GPL-3.0 and lists its underlying data sources and licenses.
+  These current-release data files are not embedded or redistributed in this
+  repository. The runtime records the official download URL, checksum and
+  source/license reference beside each database. A release-side checksum is an
+  integrity check, not an independent signature or a fixed-version guarantee.
+
+Wi-Fi relay control was independently implemented in Rust with public
+nl80211/hostapd/wpa interfaces and local device probe observations. No source
+from the GPL-licensed u60-pro-enhanced project is included in this integration.
+
 ## Rust crates
 
 zte-agent links these crates from crates.io (for the router target), each under the license shown. Each crate's license text and copyright notices are in its published source.
@@ -238,7 +340,7 @@ zte-agent links these crates from crates.io (for the router target), each under 
 | cfg-if | 1.0.4 | MIT OR Apache-2.0 |
 | const-oid | 0.9.6 | Apache-2.0 OR MIT |
 | cpufeatures | 0.2.17 | MIT OR Apache-2.0 |
-| crc32fast | 1.5.0 | MIT OR Apache-2.0 |
+| crc32fast | 1.5.3 | MIT OR Apache-2.0 |
 | crypto-bigint | 0.5.5 | Apache-2.0 OR MIT |
 | crypto-common | 0.1.7 | MIT OR Apache-2.0 |
 | der | 0.7.10 | Apache-2.0 OR MIT |
@@ -292,7 +394,7 @@ zte-agent links these crates from crates.io (for the router target), each under 
 | jpeg-decoder | 0.3.2 | MIT OR Apache-2.0 |
 | libc | 0.2.182 | MIT OR Apache-2.0 |
 | litemap | 0.8.1 | Unicode-3.0 |
-| log | 0.4.29 | MIT OR Apache-2.0 |
+| log | 0.4.34 | MIT OR Apache-2.0 |
 | lru | 0.18.5 | MIT |
 | matchit | 0.8.4 | MIT AND BSD-3-Clause |
 | maud | 0.27.0 | MIT OR Apache-2.0 |
@@ -331,14 +433,14 @@ zte-agent links these crates from crates.io (for the router target), each under 
 | serde_urlencoded | 0.7.1 | MIT/Apache-2.0 |
 | sha2 | 0.10.9 | MIT OR Apache-2.0 |
 | signature | 2.2.0 | Apache-2.0 OR MIT |
-| simd-adler32 | 0.3.8 | MIT |
+| simd-adler32 | 0.3.10 | MIT |
 | slab | 0.4.12 | MIT |
 | smallvec | 1.15.1 | MIT OR Apache-2.0 |
 | socket2 | 0.6.5 | MIT OR Apache-2.0 |
 | spki | 0.7.3 | Apache-2.0 OR MIT |
 | stable_deref_trait | 1.2.1 | MIT OR Apache-2.0 |
 | subtle | 2.6.1 | BSD-3-Clause |
-| syn | 2.0.117 | MIT OR Apache-2.0 |
+| syn | 3.0.5 | MIT OR Apache-2.0 |
 | sync_wrapper | 1.0.2 | Apache-2.0 |
 | synstructure | 0.13.2 | MIT |
 | tinystr | 0.8.2 | Unicode-3.0 |
@@ -373,3 +475,9 @@ zte-agent links these crates from crates.io (for the router target), each under 
 | zerovec | 0.11.5 | Unicode-3.0 |
 | zerovec-derive | 0.11.2 | Unicode-3.0 |
 | zmij | 1.0.21 | MIT |
+| bumpalo | 3.20.3 | MIT OR Apache-2.0 |
+| futures-macro | 0.3.34 | MIT OR Apache-2.0 |
+| serde_yaml_ng | 0.10.0 | MIT |
+| unsafe-libyaml | 0.2.11 | MIT |
+| zip | 2.6.1 | MIT |
+| zopfli | 0.8.4 | Apache-2.0 |

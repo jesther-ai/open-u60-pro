@@ -119,6 +119,8 @@ fn compute_dhcp_end(base_ip: &str, netmask: &str, start: &str, limit: &str) -> S
 }
 
 pub fn router_lan_set(state: &AppState, body: &[u8]) -> (u16, Value) {
+    let Ok(_network) = state.network_lock.try_lock() else { return (409, json!({"ok":false,"error":"A network operation is in progress; retry after it finishes"})); };
+    if state.wifi_relay.owns_network() || state.mihomo.owns_network() { return (409, json!({"ok":false,"error":"Stop or recover Wi-Fi relay and Mihomo before changing LAN settings"})); }
     lan_set_with(state, body, |params| ubus::call("zwrt_router.api", "router_set_lan_para", Some(params)))
 }
 

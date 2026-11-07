@@ -94,6 +94,7 @@ pub fn page(pd: &PageData) -> Markup {
     let dhcp = f.map_or(truthy(&d["dhcp_enable"]), |f| f.value("dhcp") == Some("1"));
     html! {
         (form_error(pd))
+        p.actions { a.btn href=(super::reservations::PATH) { "Fixed client IPs (MAC reservations)" } }
         form.rf.lnf method="post" action=(APPLY) autocomplete="off" {
             (pd.csrf())
             (once_field(&pd.once()))

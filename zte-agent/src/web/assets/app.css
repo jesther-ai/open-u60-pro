@@ -1,6 +1,4 @@
-/* zte-agent web UI, mobile first: a copy of the iOS app's look (system
-   font, grouped background, inset-grouped lists, cards, a floating tab
-   bar). No inline styles (CSP). */
+/* Mobile-first iOS UI. No inline styles (CSP). */
 
 :root {
   color-scheme: light dark;
@@ -22,8 +20,7 @@
   --purple: #8944ab;
   --teal: #00666b;
   --tint-teal: rgba(0, 102, 107, .1);
-  /* Fills under white text and the input outline: the same in dark mode
-     (white on the dark-mode accent and red would be under 3:1). */
+  /* Fixed button fills retain white-text contrast in dark mode. */
   --btn: #0064d2;
   --btn-danger: #c20018;
   --field-border: #8e8e93;
@@ -64,15 +61,14 @@ html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
 body { margin: 0; min-height: 100vh; background: var(--bg); color: var(--fg); }
 [hidden] { display: none !important; }
 a { color: var(--accent); }
-:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+:focus-visible, input:focus-visible + .sw, .chips input:focus-visible + span, .fbtn:focus-within { outline: 3px solid var(--accent); outline-offset: 2px; }
 p, h1, h2 { margin: 0; }
 
 .skip { position: absolute; left: -999px; top: 0; }
 .skip:focus { left: .5rem; top: .5rem; z-index: 3; background: var(--card); padding: .5rem 1rem; border-radius: 8px; }
-.sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+.sr, .tabs a:not([aria-current]) span { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
 
-/* Nav bar: lead, centred title, trail (a standalone window has no browser
-   controls, so every page carries its way back). */
+/* Every page retains back navigation in standalone mode. */
 .bar {
   position: sticky; top: 0; z-index: 2;
   display: grid; grid-template-columns: minmax(4.5rem, 1fr) minmax(0, max-content) minmax(4.5rem, 1fr); align-items: center; gap: .5rem;
@@ -85,25 +81,28 @@ p, h1, h2 { margin: 0; }
 .lead > * { min-width: 0; }
 .trail { justify-content: flex-end; }
 .brand { grid-column: 2; font-weight: 600; }
-/* Both sides keep the same width (at least 4.5rem), so the title stays
-   centred; a long way back is cut short ("‹ Connecti…"), a long title too. */
+/* Equal sides centre the title; long navigation labels truncate. */
 .nl { display: block; line-height: 44px; padding: 0 .25rem; text-decoration: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .back::before { content: "\2039"; content: "\2039" / ""; font-size: 1.7rem; line-height: 1; vertical-align: -.1em; margin-right: .3rem; }
 
 /* Tab bar: floating at the bottom on phones, under the nav bar when wide. */
 .tabs {
   position: fixed; z-index: 2; left: 50%; transform: translateX(-50%);
-  bottom: calc(.5rem + env(safe-area-inset-bottom)); width: min(calc(100% - 1.5rem), 30rem);
-  display: grid; grid-template-columns: repeat(5, 1fr); padding: .3rem;
-  border-radius: 999px; border: 1px solid var(--sep); background: var(--card);
+  bottom: calc(.65rem + env(safe-area-inset-bottom)); width: min(calc(100% - 1rem), 32rem);
+  display: flex; align-items: center; padding: .3rem;
+  border-radius: 22px; border: 1px solid var(--sep); background: var(--card);
   box-shadow: 0 6px 24px rgba(0, 0, 0, .14);
 }
 .tabs a {
-  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: .1rem;
-  min-height: 3.2rem; border-radius: 999px; color: var(--fg); text-decoration: none; font-size: .7rem; font-weight: 600;
+  display: flex; flex: 1; min-width: 44px; align-items: center; justify-content: center; gap: .4rem;
+  min-height: 48px; border-radius: 17px; color: var(--muted); text-decoration: none; font-size: .8rem; font-weight: 600;
 }
-.tabs .i { width: 1.65rem; height: 1.65rem; }
-.tabs [aria-current] { color: var(--accent); background: var(--tint-gray); }
+.tabs .i { width: 1.4rem; height: 1.4rem; }
+.tabs [aria-current] { flex: 0 0 auto; padding: 0 .75rem; color: var(--accent); background: var(--tint-blue); }
+@media (max-width: 389px) {
+  .tabs a { min-width: 0; flex: 1; }
+  .tabs [aria-current] { flex: 1.6; flex-direction: column; gap: .05rem; padding: .3rem .1rem; font-size: .63rem; }
+}
 main {
   width: 100%; max-width: 46rem; margin: 0 auto;
   padding: .75rem max(1rem, env(safe-area-inset-right)) calc(var(--tabs-h) + 1.5rem + env(safe-area-inset-bottom))
@@ -112,7 +111,9 @@ main {
 @media (min-width: 700px) {
   body { display: flex; flex-direction: column; }
   .bar { order: -2; }
-  .tabs { order: -1; position: sticky; top: 3.5rem; transform: none; left: auto; bottom: auto; margin: .25rem auto 0; }
+  .tabs { order: -1; position: sticky; top: 3.5rem; transform: none; left: auto; bottom: auto; margin: .25rem auto 0; width: min(calc(100% - 2rem), 46rem); }
+  .tabs a, .tabs [aria-current] { flex: 1; padding: 0 .5rem; }
+  .tabs a:not([aria-current]) span { position: static; width: auto; height: auto; overflow: visible; clip-path: none; }
   main { padding-bottom: 2rem; }
 }
 
@@ -125,7 +126,7 @@ main {
 .i .f + path { stroke: var(--card); stroke-width: 2.2; }
 
 /* Cards (a whole card can be a link, with a chevron) */
-.dash { display: grid; gap: .75rem; }
+.dash, #banners, .esim, .eform, .eprog { display: grid; gap: .75rem; }
 .pair { display: grid; grid-template-columns: 1fr 1fr; gap: .75rem; }
 @media (max-width: 359px) { .pair { grid-template-columns: 1fr; } }
 .cards { display: grid; gap: .75rem; grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr)); margin-top: .75rem; }
@@ -137,10 +138,7 @@ a.card { color: inherit; text-decoration: none; }
 a.card .ch::after { content: "\203A"; content: "\203A" / ""; color: var(--muted); font-size: 1.3rem; font-weight: 400; line-height: 1; }
 .big { font-size: 1.4rem; font-weight: 700; line-height: 1.2; }
 .big, .metrics, .kv dd, .num, .agebadge, .v, .st, .rl { font-variant-numeric: tabular-nums; }
-/* Rolling digits (live updates only, `web::roll`; the app's numericText
-   transition): a changed digit is a new <i> that rolls in, up (data-u) or
-   down (data-d), with the digit it replaces leaving as ::before; the
-   column is clipped to the line. */
+/* web::roll: new digits enter up/down; ::before carries the leaving digit. */
 .rl { display: inline-block; clip-path: inset(0 -.3em); -webkit-user-select: none; user-select: none; }
 .rl i { display: inline-block; position: relative; font-style: normal; }
 .rl [data-u] { animation: ru .4s ease-in-out; }
@@ -190,7 +188,6 @@ details:has(>#hl-all:empty) { display: none; }
 .q-poor, .c-red { color: var(--red); }
 
 /* Banners */
-#banners { display: grid; gap: .75rem; }
 #banners:empty { display: none; }
 .banner { display: flex; align-items: center; gap: .75rem; padding: .75rem; border-radius: 12px; border: 1px solid; }
 .banner .i { width: 1.7rem; height: 1.7rem; }
@@ -211,7 +208,7 @@ details:has(>#hl-all:empty) { display: none; }
 .list > li { position: relative; }
 .list > li + li::before { content: ""; position: absolute; top: 0; left: 1rem; right: 0; border-top: 1px solid var(--sep); }
 .it { display: flex; align-items: center; gap: .75rem; min-height: 44px; padding: .55rem 1rem; color: inherit; text-decoration: none; }
-.it > span:first-of-type { flex: 1; }
+.it > span:first-of-type:not(.net-spin) { flex: 1; }
 .it .i { color: var(--accent); }
 a.it::after, button.it::after { content: "\203A"; content: "\203A" / ""; color: var(--muted); font-size: 1.4rem; line-height: 1; }
 .it .v { color: var(--muted); text-align: right; flex: 0 1 auto; }
@@ -246,15 +243,11 @@ a.it::after, button.it::after { content: "\203A"; content: "\203A" / ""; color: 
 .sw[aria-checked="true"]::after { transform: translateX(20px); }
 [aria-disabled] { opacity: .4; cursor: default; }
 
-/* Live status: snapshot (no JS) or live (Datastar). In the page a row of
-   its own, as tall as its links even when empty, so the cards never move;
-   in the nav bar (.ps) a capsule. */
+/* Reserve live-status height to prevent card movement; .ps is the nav capsule. */
 #live-status { font-size: .85rem; color: var(--muted); flex-basis: 100%; min-height: 44px; }
 #live-status a { display: inline-flex; align-items: center; min-height: 44px; padding: 0 .35rem; font-weight: 600; text-decoration: none; }
 .snap a::before { content: "\21BB"; content: "\21BB" / ""; margin-right: .3rem; }
-/* Age labels (after 1 and 5 min) and the watchdog warning take no room
-   until shown. inline-flex keeps them on the text baseline (an
-   overflow-hidden inline-block sits on its bottom edge, too low). */
+/* Hidden ages/watchdog take no space; inline-flex preserves the text baseline. */
 .ages > span, .on > span { display: inline-flex; align-items: baseline; overflow: hidden; overflow: clip; white-space: pre; }
 .ages > span, .on .lost { max-width: 0; visibility: hidden; }
 .age1 { animation: show 0s 60s forwards, hide 0s 300s forwards; }
@@ -265,8 +258,7 @@ a.it::after, button.it::after { content: "\203A"; content: "\203A" / ""; color: 
 .live:not(.ps) .ok::before, .ps b::before, .ps .lost a::before {
   content: ""; display: inline-block; width: .6rem; height: .6rem; margin-right: .35rem; border-radius: 50%; background: currentColor;
 }
-/* Watchdog: 15 s after the last heartbeat "Live" goes and the warning shows
-   (each heartbeat class restarts the animations). */
+/* Heartbeats restart the 15-second live/warning timer. */
 .live .lost { color: var(--orange); }
 .on > span { animation: 0s 15s forwards; }
 .hb-o .lost { animation-name: lost-o; }
@@ -288,8 +280,7 @@ a.it::after, button.it::after { content: "\203A"; content: "\203A" / ""; color: 
 .ps .lost a, .ps .off b { color: var(--red); background: var(--tint-red); }
 .ps.snap a { color: var(--muted); background: var(--tint-gray); font-weight: 600; }
 .agebadge { font-size: .75rem; color: var(--muted); padding: .35rem .65rem; border-radius: 999px; background: var(--tint-gray); white-space: nowrap; }
-/* Live only: a snapshot's age would never move; in its place, how old the
-   snapshot is (after 1 min). */
+/* Snapshot age replaces live ages after one minute. */
 body:has(#live-status.snap) #age, body:not(:has(#live-status.snap)) .sa { display: none; }
 .sa { visibility: hidden; animation: show 0s 60s forwards; }
 #live-note:empty { display: none; }
@@ -404,8 +395,7 @@ select { min-height: 44px; max-width: 60%; font: inherit; color: var(--accent); 
 .pw .mono, .fp { overflow-wrap: anywhere; }
 .qr { display: block; width: min(180px, 100%); height: auto; margin: 1rem auto .5rem; }
 
-/* USB-C card (the app's USB Mode sheet): shown while its fragment is on;
-   "Fast Charging" only while fast charging is off */
+/* USB-C: offer Fast Charging only while off. */
 .usbc { text-align: center; }
 .usbc:has(> #card-usb:not(.on)), #card-usb:not(.on) ~ *, .pb ~ .fc { display: none; }
 #card-usb > .i { width: 3rem; height: 3rem; color: var(--accent); fill: currentColor; }
@@ -420,7 +410,7 @@ select { min-height: 44px; max-width: 60%; font: inherit; color: var(--accent); 
 .ic .i { width: 1.5rem; height: 1.5rem; }
 .srch { display: flex; align-items: center; gap: .5rem; margin-bottom: .75rem; }
 .srch input { flex: 1; min-width: 0; }
-.cv { width: 100%; border: 0; background: none; font: inherit; text-align: left; cursor: pointer; }
+.cv, .bt { width: 100%; border: 0; background: none; font: inherit; text-align: left; cursor: pointer; }
 .cvb { display: grid; gap: .15rem; min-width: 0; }
 .l1, .l2 { display: flex; align-items: baseline; gap: .5rem; min-width: 0; }
 .nm, .pv { flex: 1; min-width: 0; overflow: hidden; }
@@ -435,8 +425,7 @@ select { min-height: 44px; max-width: 60%; font: inherit; color: var(--accent); 
   flex: none; align-self: center; min-width: 1.4rem; padding: .1rem .4rem; border-radius: 999px;
   background: var(--btn); color: #fff; font-size: .7rem; font-weight: 700; text-align: center;
 }
-/* The bubbles scroll in a box that starts at its end: every load of a
-   conversation shows its newest message, a reload too. */
+/* Conversations load scrolled to their newest message. */
 .sc { display: flex; flex-direction: column-reverse; overflow-y: auto; max-height: max(14rem, calc(100vh - 17rem)); max-height: max(14rem, calc(100dvh - 17rem)); }
 .bb { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: .5rem; }
 .b { display: flex; flex-direction: column; align-items: flex-start; max-width: 80%; }
@@ -468,19 +457,17 @@ select { min-height: 44px; max-width: 60%; font: inherit; color: var(--accent); 
 .snd { justify-content: center; color: var(--accent); font-weight: 600; }
 button.snd::after { content: none; }
 
-/* SMS Forwarding: switches submitted with a form, rule rows, the rule
-   form (each type's fields shown by CSS; without :has() all show) */
+/* SMS forwarding: type-specific fields; no :has() shows all. */
 .tl { display: flex; align-items: center; gap: .75rem; width: 100%; cursor: pointer; }
 .tl > span:first-child { flex: 1; }
 input:checked + .sw { background: var(--btn); }
 input:checked + .sw::after { transform: translateX(20px); }
-input:focus-visible + .sw, .chips input:focus-visible + span { outline: 3px solid var(--accent); outline-offset: 2px; }
 .fr { align-items: center; gap: .25rem; scroll-margin-top: 4.5rem; }
 .fr .it::after { content: none; }
 .fr .nm, .lg .nm { white-space: normal; overflow-wrap: anywhere; }
 .rs { font-size: .8rem; color: var(--muted); overflow-wrap: anywhere; }
 .rd { font-size: .75rem; }
-.bt { width: 100%; border: 0; background: none; font: inherit; color: var(--accent); text-align: left; cursor: pointer; }
+.bt { color: var(--accent); }
 .it.bt::after { content: none; }
 .it.bt .i { color: inherit; }
 .fld { flex-direction: column; align-items: stretch; gap: .2rem; }
@@ -489,11 +476,57 @@ input:focus-visible + .sw, .chips input:focus-visible + span { outline: 3px soli
   width: 100%; min-width: 0; min-height: 2rem; padding: 0; font: inherit; color: var(--fg); background: none; border: 0; border-radius: 0;
 }
 .rf [aria-invalid] { box-shadow: inset 0 -2px var(--red); }
+/* Networking. */
+.net-yaml { width: 100%; min-width: 0; padding: .5rem; border: 1px solid var(--field-border); border-radius: 8px; background: var(--card); color: var(--fg); font: .85rem/1.4 ui-monospace, monospace; resize: vertical; }
+.relay-page{display:grid;grid-template-columns:minmax(0,1fr);gap:1rem;}
+.relay-page form,.relay-page section,.relay-connect>*{min-width:0;}
+.relay-hero,.relay-panel{padding:1.25rem;border:1px solid var(--sep);border-radius:20px;background:var(--card);}
+.relay-hero{background:radial-gradient(ellipse at 100% 0,var(--tint-blue),transparent 75%),var(--card);}
+.relay-head,.relay-path{display:flex;align-items:center;justify-content:space-between;}
+.relay-head{gap:.75rem;}
+.relay-glyph{display:grid;place-items:center;width:48px;height:48px;border-radius:15px;background:var(--card);color:var(--accent);}
+.relay-state{display:flex;align-items:center;gap:.4rem;padding:.35rem .65rem;border-radius:999px;font-size:.75rem;background:var(--tint-gray);color:var(--muted);}
+.relay-state::before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor;}
+.relay-state.on{color:var(--green);background:var(--tint-green);}
+.relay-hero h2{margin:1rem 0 .4rem;font-size:1.6rem;letter-spacing:-.035em;overflow-wrap:anywhere;}
+.relay-hero>p,.relay-copy{color:var(--muted);font-size:.85rem;}
+.relay-path{margin-top:1.4rem;padding-top:1rem;border-top:1px solid var(--sep);font-size:.75rem;color:var(--muted);}
+.relay-hop{display:grid;justify-items:center;gap:.35rem;}
+.relay-path>.i,.relay-primary>.i{transform:rotate(90deg);}
+.relay-panel h2{font-size:1rem;margin-bottom:.2rem;}
+.relay-btn{display:inline-flex;align-items:center;justify-content:center;gap:.5rem;min-height:48px;padding:.65rem 1rem;border:1px solid transparent;border-radius:13px;font:inherit;font-size:.9rem;font-weight:600;text-decoration:none;cursor:pointer;}
+.relay-secondary,.relay-stop{border-color:var(--sep);background:var(--card);}
+.relay-secondary{color:var(--accent);}
+.relay-primary{width:100%;justify-content:space-between;color:#fff;background:var(--btn);}
+.relay-stop{width:100%;color:var(--red);margin-top:1rem;}
+.relay-panel>.relay-btn{width:100%;margin:1rem 0;}
+.relay-caution,.relay-private{display:flex;gap:.5rem;color:var(--muted);font-size:.75rem;}
+.relay-connect{display:grid;grid-template-columns:minmax(0,1fr);gap:.8rem;margin-top:1rem;}
+.relay-bandwidth{display:grid;gap:.4rem;min-width:0;}
+.relay-bandwidth label{margin:0;font-size:.85rem;}
+.relay-bandwidth select{width:100%;max-width:100%;min-width:0;min-height:48px;padding:.6rem .75rem;border:1px solid var(--field-border);border-radius:12px;text-align:left;background:var(--card);}
+.relay-bandwidth small{color:var(--muted);font-size:.75rem;}
+.relay-networks{min-width:0;display:grid;gap:.5rem;border:0;margin:0;padding:0;max-height:22rem;overflow:auto;}
+.relay-network{display:flex;align-items:center;gap:.65rem;padding:.8rem;border:1px solid var(--sep);border-radius:13px;cursor:pointer;}
+.relay-network:has(:checked){border-color:var(--accent);background:var(--tint-blue);}
+.relay-network:has(:disabled){opacity:.5;cursor:not-allowed;}
+.relay-network>input{order:3;width:18px;height:18px;flex:none;margin:0;accent-color:var(--btn);}
+.relay-network-name{flex:1;min-width:0;}
+.relay-network-name strong{display:block;overflow-wrap:anywhere;font-size:.9rem;font-weight:600;}
+.relay-network-name small,.relay-password small{display:block;font-size:.75rem;font-weight:400;color:var(--muted);}
+.relay-password{font-size:.85rem;}
+.relay-input{width:100%;min-width:0;min-height:48px;padding:.7rem .8rem;border:1px solid var(--field-border);border-radius:12px;background:var(--card);color:var(--fg);font:inherit;}
+.relay-consent{display:flex;gap:.6rem;padding:.25rem 0;font-size:.8rem;font-weight:400;color:var(--muted);}
+.relay-consent input{width:19px;height:19px;flex:none;margin:0;accent-color:var(--btn);}
+.relay-address{display:flex;flex-wrap:wrap;justify-content:space-between;gap:.4rem;margin-top:1.2rem;font-size:.75rem;color:var(--muted);}
+.relay-empty{text-align:center;padding:2rem 0 1rem;color:var(--muted);font-size:.85rem;}
+.relay-notes{font-size:.8rem;color:var(--muted);padding:0 .25rem;}
+.relay-notes p + p{margin-top:.65rem;}
 .hr { flex-wrap: wrap; gap: .5rem; }
 .hr input { flex: 1 1 0; }
 .hr input + input { border-left: 1px solid var(--sep); padding-left: .5rem; }
 .hr .ferr { flex-basis: 100%; margin: 0; }
-.chips { margin: 0; padding: 0; border: 0; min-width: 0; }
+.chips, .mnf { margin: 0; padding: 0; border: 0; min-width: 0; }
 .chips legend { margin-bottom: .35rem; }
 .chips div { display: grid; grid-template-columns: repeat(3, 1fr); gap: .4rem; }
 .c2 div { grid-template-columns: 1fr 1fr; }
@@ -516,9 +549,7 @@ input:focus-visible + .sw, .chips input:focus-visible + span { outline: 3px soli
 .lg .er { color: var(--red); }
 .lg .tm { flex: 1; }
 .lg .btn { background: #b04f00; }
-/* Tools: signal bars, device rows, automation rows (a dot for the last
-   run) and form (each schedule's fields shown by CSS; without :has() all
-   show) */
+/* Tools and schedule-specific automation fields. */
 .it .tn .i { color: inherit; }
 .dn { font-weight: 500; overflow-wrap: anywhere; }
 .dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--green); }
@@ -530,9 +561,7 @@ input:focus-visible + .sw, .chips input:focus-visible + span { outline: 3px soli
   .af:has(#st-once:checked) .k-r, .af:has(#st-recurring:checked) .k-o, .af:has(option[value=reboot]:checked) .k-x, .af:has(#restore:not(:checked)) .k-t { display: none; }
   .af:has(#st-recurring:checked):not(:has([name=days]:checked)) .snd { opacity: .4; }
 }
-/* Speed Test (Start or Stop shown by the progress row's class), Enable
-   ADB, Band Lock (5 chips a row), AT Terminal (the history scrolls in a
-   box, so the field stays in view) */
+/* Speed Test, ADB, Band Lock, and scrollable AT history. */
 #st-run:not(.run), #st-run.run ~ .go, #st-run:not(.run) ~ .halt,
 #sd-run:not(.run), #sd-run.run ~ .go, #sd-run:not(.run) ~ .halt { display: none; }
 #st-run:not(.run) + li::before, #sd-run:not(.run) + li::before { content: none; }
@@ -561,9 +590,7 @@ body:has(#srv [value=""]:checked) .go .snd, .bl:not(:has(:checked)) .snd { opaci
 .ath .er, .ath .er pre { color: var(--red); }
 .to { margin-top: .75rem; }
 .to input { width: 4.5rem; min-height: 2.25rem; }
-/* Router: Mobile Network's Apply form (the scan's rows only under Manual;
-   without :has() all show), networks, cell and sweep rows */
-.mnf { margin: 0; padding: 0; border: 0; min-width: 0; }
+/* Mobile Network: scans under Manual; no :has() shows all. */
 .mnf > .group:first-child, .req > .group:first-child { margin-top: 1.25rem; }
 .mnf:disabled .list { opacity: .5; }
 .it .c-green .i, .it .c-red .i { color: inherit; }
@@ -578,9 +605,7 @@ body:has(#srv [value=""]:checked) .go .snd, .bl:not(:has(:checked)) .snd { opaci
   /* Apply dimmed while every choice is the router's (data-i), as the app's */
   .mn:not(:has([data-i]:not(:checked), #roam:not([data-i]):checked)) .snd { opacity: .4; }
 }
-/* SIM Card, SIM Services: free text (USSD and SIM answers) wraps as sent;
-   the SIM's own text input shows only while its command is the page's;
-   Yes / No side by side; a footer without rows sits under the card */
+/* SIM/USSD: preserve wrapping; show input only for the current command. */
 .tx { white-space: pre-wrap; overflow-wrap: anywhere; }
 .uf { display: flex; align-items: center; gap: .5rem; width: 100%; }
 .uf input[type="text"] { flex: 1; }
@@ -589,7 +614,6 @@ body:has(#srv [value=""]:checked) .go .snd, .bl:not(:has(:checked)) .snd { opaci
 #stk-nav:not(:has(li)) { margin-top: 0; }
 
 /* eSIM Profiles: the app's cards (teal accent), profile rows with a menu */
-.esim { display: grid; gap: .75rem; }
 #esim-dl:empty, .esim.none .econn:not(.esw) { display: none; }
 .ehead, .edl, .emsg, .chip summary, .prow, .pmain, .wifi, .eerr b, .active, .hints li { display: flex; align-items: center; gap: .75rem; }
 .ehead > div, .edl > span, .emsg > div, .ptext, .pmain { flex: 1; min-width: 0; }
@@ -664,9 +688,7 @@ body:has(#esim-conn.busy, #esim-dl.busy) :is(.prow, a[href="/ui/router/esim/add"
 .emsg > div { display: grid; gap: .4rem; }
 .ebytes { display: flex; justify-content: space-between; gap: 1rem; }
 
-/* Add eSIM: the app's entry (one card: the photo inputs, the code) and its
-   download card. The file inputs are their labels' buttons (the chosen
-   file's name shows under the text). */
+/* Add eSIM: photo/code entry and download card; labels wrap file inputs. */
 .ahead { display: grid; gap: .4rem; margin: .25rem .15rem; }
 .ahead h2 { font-size: 1.35rem; }
 .ebig { width: 3.25rem; height: 3.25rem; }
@@ -675,14 +697,12 @@ body:has(#esim-conn.busy, #esim-dl.busy) :is(.prow, a[href="/ui/router/esim/add"
 .ein { padding: 0 .15rem; background: none; color: var(--orange); }
 .enote .i, .ein .i, .eopt .i, .fbtn .i { flex: none; width: 1.25rem; height: 1.25rem; }
 .ein small { display: block; margin-top: .2rem; color: var(--muted); }
-.eform, .eprog { display: grid; gap: .75rem; }
 .eadd > *, .eform > *, .eprog > * { min-width: 0; }
 .fbtn { display: grid; justify-items: center; gap: .15rem; margin: 0; padding: .65rem 1rem; border-radius: 12px; background: var(--tint-blue); color: var(--accent); text-align: center; cursor: pointer; }
 .fbtn.prim, .btn.teal { background: #00666b; color: #fff; }
 .fbtn span, .eopt summary { display: flex; align-items: center; gap: .5rem; }
 .fbtn input { min-width: 0; max-width: 100%; font: inherit; font-size: .8rem; font-weight: 400; color: inherit; }
 .fbtn input::file-selector-button { display: none; }
-.fbtn:focus-within { outline: 3px solid var(--accent); outline-offset: 2px; }
 .eopt summary { padding: .4rem 0; color: var(--accent); font-weight: 600; }
 .eopt .fld { display: flex; margin-top: .3rem; }
 .btn-quiet.bad { color: var(--red); }
@@ -690,10 +710,7 @@ body:has(#esim-conn.busy, #esim-dl.busy) :is(.prow, a[href="/ui/router/esim/add"
 .eprog .ehead b { font-size: 1.15rem; }
 .eprog h2 { margin: 0; font-size: 1.05rem; }
 .eprog .det, .eprog .actions { margin-top: 0; }
-/* Router: WiFi, Guest WiFi, APN, LAN, DNS (a radio's fields, the guest
-   network, APN credentials, the DHCP range unless refused, and the DNS
-   sections by the form's choices; without :has() all show), APN rows,
-   DNS cache badges */
+/* Router fields follow form choices; without :has() all remain visible. */
 .ap > a { flex: 1; min-width: 0; color: inherit; text-decoration: none; }
 .dom { overflow-wrap: anywhere; font-size: .9rem; }
 .foot.c-orange { color: var(--orange); }
@@ -702,8 +719,7 @@ body:has(#esim-conn.busy, #esim-dl.busy) :is(.prow, a[href="/ui/router/esim/add"
 .badge.rd { background: var(--tint-red); color: var(--red); }
 .badge.br { background: rgba(162, 132, 94, .2); color: #a2845e; }
 .badge.gy { background: var(--tint-gray); color: var(--muted); }
-/* Firewall: the level's segments in its row, a rule's delete (the app's
-   swipe), the DMZ host while DMZ is on; Telemetry Blocker's Add row */
+/* Firewall levels, rule deletion, conditional DMZ host and telemetry. */
 .lv .seg { flex: none; gap: .3rem; margin: 0; }
 .lv .seg > * { padding: .3rem .7rem; font-size: .9rem; }
 .pf .del { align-self: stretch; margin-right: -.5rem; padding: 0 .5rem 0 .75rem; }
@@ -720,9 +736,7 @@ body:has(#esim-conn.busy, #esim-dl.busy) :is(.prow, a[href="/ui/router/esim/add"
   .dnf:has(#dm-auto:checked) .dm-auto, .dnf:has(#dm-custom:checked) .dm-custom, .dnf:has(#dm-doh:checked) .dm-doh { display: block; }
 }
 
-/* Device Controls (the limits hidden while Charge Limit is off; Reboot and
-   Factory Reset as the app's buttons), the "Rebooting…" page, Settings'
-   Theme (segmented, in its row), the login header (the app's) */
+/* Device controls, reboot, theme segments and login. */
 .th { flex: 1; gap: .3rem; margin: 0; }
 .th > * { padding: .35rem .5rem; font-size: .9rem; }
 .rbt > .i, .lh .i { display: block; width: 3.5rem; height: 3.5rem; margin: 0 auto 1rem; color: var(--accent); }
@@ -734,3 +748,27 @@ body:has(#esim-conn.busy, #esim-dl.busy) :is(.prow, a[href="/ui/router/esim/add"
 @supports selector(:has(*)) {
   .chl:has(#enabled:not(:checked)) .lim { display: none; }
 }
+
+/* Dialogs work without JavaScript. */
+.net-modal { width: min(32rem, calc(100% - 1.5rem)); max-height: 90dvh; overflow: auto; padding: 1.5rem; border: 1px solid var(--sep); border-radius: 20px; background: var(--card); color: var(--fg); box-shadow: 0 20px 70px #0004; }
+.net-modal::backdrop { background: #0007; }
+.net-modal[open]:not(:modal) { position: relative; margin: 1rem auto; }
+.net-modal h2 { margin: .25rem 0 1.5rem; font-size: 1.4rem; letter-spacing: -.025em; }
+.net-eyebrow { font-size: .65rem; letter-spacing: .13em; color: var(--muted); font-weight: 600; }
+.net-modal .actions { justify-content: flex-end; padding-top: 1rem; border-top: 1px solid var(--sep); }
+.net-modal .btn { border-radius: 11px; min-height: 46px; padding: .6rem 1rem; font-size: .9rem; }
+.net-modal .foot { margin: .6rem 0 0; line-height: 1.5; overflow-wrap: anywhere; }
+.net-fields { display: grid; gap: 1.1rem; }
+.net-fields label { font-size: .8rem; margin-bottom: .4rem; }
+.net-modal .net-control { display: block; width: 100%; min-width: 0; min-height: 48px; padding: .75rem; border: 1px solid var(--sep); border-radius: 10px; background: var(--bg); color: var(--fg); font: inherit; text-align: left; resize: vertical; }
+.net-control:focus { outline: 2px solid var(--accent); outline-offset: 2px; }
+.net-select { position: relative; }
+.net-select .net-control { appearance: none; max-width: 100%; padding-right: 2.5rem; cursor: pointer; }
+.net-select::after { content: ""; position: absolute; right: 1rem; top: 1.1rem; width: .45rem; height: .45rem; border: solid var(--muted); border-width: 0 1.5px 1.5px 0; transform: rotate(45deg); pointer-events: none; }
+.net-control::file-selector-button { border: 0; border-radius: 6px; padding: .35rem .5rem; margin-right: .5rem; background: var(--tint-blue); color: var(--accent); font: inherit; }
+.net-spin { flex: none; width: 1em; height: 1em; margin-right: .4rem; vertical-align: -.1em; }
+[aria-busy="true"] { cursor: progress; }
+.sw[aria-busy]::after { opacity: .25; }
+.net-control[name="url"] { resize: none; }
+.net-profile-actions { margin: .6rem 0 0; padding: 0 1rem 1rem; }
+.net-result { margin: 1rem 0; overflow-wrap: anywhere; }

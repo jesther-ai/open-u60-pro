@@ -153,6 +153,8 @@ pub struct PageCtx<'a> {
     /// A heading other than `title` (the operation page's live `#op-title`);
     /// signed out, what replaces the brand.
     pub heading: Option<Markup>,
+    /// Datastar-only enhancements for network forms; never a polling stream.
+    pub network_forms: bool,
 }
 
 /// A live stream URL: `/ui/live/` and then only `[a-z0-9/]`. It is put
@@ -175,9 +177,10 @@ pub fn page(ctx: &PageCtx, body: Markup) -> Markup {
     // A page without a valid stream URL is the plain snapshot. Only live
     // pages carry the nonce in the markup (Datastar reads and removes it).
     let live = ctx.live.filter(|url| is_live_url(url));
+    let reactive = live.is_some() || ctx.network_forms;
     html! {
         (DOCTYPE)
-        html lang="en" data-nonce=[live.map(|_| ctx.nonce)] {
+        html lang="en" data-nonce=[reactive.then_some(ctx.nonce)] {
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover";
@@ -198,7 +201,7 @@ pub fn page(ctx: &PageCtx, body: Markup) -> Markup {
                 @if let Some(url) = ctx.go {
                     meta http-equiv="refresh" content=(format!("0; url={url}"));
                 }
-                @if live.is_some() {
+                @if reactive {
                     script type="module" src=(DATASTAR_JS) nonce=(ctx.nonce) {}
                 }
             }
@@ -220,6 +223,9 @@ pub fn page(ctx: &PageCtx, body: Markup) -> Markup {
                 // background tab) would otherwise stream to nobody.
                 @if let Some(url) = live {
                     div #live hidden data-init=(live_init(url)) {}
+                }
+                @if ctx.network_forms {
+                    div #network-ui hidden data-init=(include_str!("assets/network-ui.js")) {}
                 }
                 main #main { (body) }
                 // After the content in the DOM; CSS places it.

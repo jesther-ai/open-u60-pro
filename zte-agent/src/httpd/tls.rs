@@ -35,7 +35,7 @@ use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use tokio::sync::watch;
 
-use super::{accept_loop_with, listen, Admit, Caps, Ctx, Peer};
+use super::{accept_loop_with, listen, Admit, Caps, ConnectionLifetime, Ctx, Peer};
 use crate::tls::{Keys, Tls};
 
 /// A TLS handshake must be done within this (a stalled one holds a slot).
@@ -93,8 +93,9 @@ impl Wire {
     /// check itself on the blocking pool, at most once a minute), then the
     /// handshake, then HTTP/1.1 with the translations above; all of it
     /// until the listener stops.
-    pub(super) async fn serve(&self, tcp: tokio::net::TcpStream, addr: SocketAddr, router: Router, idle: Duration) {
+    pub(super) async fn serve(&self, tcp: tokio::net::TcpStream, addr: SocketAddr, router: Router, idle: Duration, mut connection: ConnectionLifetime) {
         let mut stop = self.stop.clone();
+        connection.stop = Some(self.stop.clone());
         let setup = async {
             if let Ok(local) = tcp.local_addr() {
                 if self.tls.wants_check(local.ip()) {
@@ -111,6 +112,7 @@ impl Wire {
         let svc = hyper::service::service_fn(move |mut req: axum::http::Request<hyper::body::Incoming>| {
             req.extensions_mut().insert(Peer(addr));
             req.extensions_mut().insert(Secure);
+            req.extensions_mut().insert(connection.clone());
             inbound(req.headers_mut());
             let reply = tower::ServiceExt::oneshot(router.clone(), req.map(Body::new));
             async move {

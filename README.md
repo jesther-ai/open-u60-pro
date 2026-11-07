@@ -297,6 +297,41 @@ Visit [open-u60-pro.vercel.app](https://open-u60-pro.vercel.app), enter your rou
 
 Enables ADB, builds and pushes the agent, creates boot scripts, and optionally sets up SSH for wireless deploys.
 
+For an already ADB-authorized B31, build this checkout as an ARM64 musl **release**
+and use the official admin password without entering or storing it:
+
+```bash
+./setup.sh --build --adb --factory-password --no-ssh
+# Add --serial SERIAL when more than one ADB device is connected.
+```
+
+This stages and verifies the build on the router first (checksum, `--version`,
+on-device `ota-probe`), then installs the [OTA](docs/ota-updates.md) A/B layout:
+the agent in both slots under `/data/open-u60/update`, the boot supervisor
+`/data/local/tmp/zte-agent-supervisor.sh`, the compatibility link `/data/zte-agent`
+and the private launcher `/data/local/tmp/start_zte_agent.sh`. It verifies that the
+console loads, that the API rejects unauthenticated requests and that the
+responding process is the supervisor-started slot A, and adds one boot entry
+before `exit 0` in `/etc/rc.local`. Other boot
+commands are preserved, repeated launcher calls do not create duplicate agents,
+and the script keeps an installation-specific rollback directory under `/data`.
+It does not reboot the router, set up SSH with `--no-ssh` or enable mobile data.
+Updates may leave Mihomo/Relay on: the new agent first recovers owned network
+changes, then attempts to resume the saved owner choices. Mihomo needs its enabled
+marker; Relay needs the last successfully connected remembered/open network.
+Switching Clash off or disconnecting Relay clears the respective resume choice.
+An older installation without these markers cannot supply missing intent; saved
+profiles or Wi-Fi credentials alone do not enable either extension. See
+[restart policy](zte-agent/docs/network-extensions.md#after-a-restart).
+Wi-Fi Relay, Clash / Mihomo and Clash proxies are pages under **Network** in the
+responsive console (`#network/relay`, `#network/mihomo`, `#network/proxies`); the
+same operations remain available through `/api/wifi-relay/*` and `/api/mihomo/*`.
+**Open Zashboard** on the Clash pages opens the pinned dashboard in a new tab,
+already connected to Clash. Old `/ui/relay` and `/ui/router/mihomo` bookmarks open
+the console pages (see [network extensions](zte-agent/docs/network-extensions.md)).
+In factory-password mode, successful login with the actual password is a manual
+check; setup verifies that the factory verifier loaded without reading plaintext.
+
 ### Deploy Agent (subsequent updates)
 
 ```bash

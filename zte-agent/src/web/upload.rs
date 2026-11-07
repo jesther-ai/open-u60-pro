@@ -158,12 +158,17 @@ async fn read_body(headers: &HeaderMap, body: Body, idle: Duration, total: Durat
 /// anything malformed or over the limits.
 #[allow(clippy::type_complexity)]
 fn parse(body: &[u8], boundary: &str) -> Option<(Vec<(String, String)>, Vec<(String, Range<usize>)>)> {
+    parse_with_limits(body, boundary, MAX_TEXT, MAX_PARTS)
+}
+
+#[allow(clippy::type_complexity)]
+fn parse_with_limits(body: &[u8], boundary: &str, max_text: usize, max_parts: usize) -> Option<(Vec<(String, String)>, Vec<(String, Range<usize>)>)> {
     let delim = format!("--{boundary}");
     let d = delim.as_bytes();
     // Browsers send no preamble.
     let mut pos = body.starts_with(d).then_some(d.len())?;
     let (mut text, mut files) = (Vec::new(), Vec::new());
-    for _ in 0..=MAX_PARTS {
+    for _ in 0..=max_parts {
         let rest = &body[pos..];
         if rest.starts_with(b"--") {
             return Some((text, files));
@@ -180,7 +185,7 @@ fn parse(body: &[u8], boundary: &str) -> Option<(Vec<(String, String)>, Vec<(Str
                 files.push((name, content..end));
             }
         } else {
-            if end - content > MAX_TEXT {
+            if end - content > max_text {
                 return None;
             }
             text.push((name, std::str::from_utf8(&body[content..end]).ok()?.to_owned()));
@@ -188,6 +193,45 @@ fn parse(body: &[u8], boundary: &str) -> Option<(Vec<(String, String)>, Vec<(Str
         pos = end + 2 + d.len();
     }
     None
+}
+
+/// The profile editor can carry either pasted YAML or a file; remote URLs and
+/// other controls are still just text. The complete body is independently capped.
+#[allow(clippy::result_large_err)]
+pub async fn read_profile(ctx: &Ctx, headers: &HeaderMap, body: Body, nonce: &str) -> Result<(Form, Option<String>), Response> {
+    let Some(boundary) = boundary(headers) else {
+        return Err(super::session::reply_unread(headers, body, render::bad_request(nonce)).await);
+    };
+    let max = crate::mihomo::MAX_CONFIG;
+    let bytes = api::read_capped(headers, body, max * 2 + 16384, ctx.body_wait).await
+        .map_err(|_| api::close(render::error(413, "Upload refused", "YAML files and pasted configurations are limited to 512 KiB each.", nonce)))?;
+    let (fields, files) = parse_with_limits(&bytes, &boundary, max, 12).ok_or_else(|| render::bad_request(nonce))?;
+    let mut names = std::collections::HashSet::new();
+    if files.len() > 1 || fields.iter().any(|(key,value)| !names.insert(key) || (key != "yaml" && value.len() > 4096)) {
+        return Err(render::bad_request(nonce));
+    }
+    let yaml = if let Some((name, range)) = files.first() {
+        if name != "yaml_file" || range.len() > max { return Err(render::bad_request(nonce)); }
+        Some(std::str::from_utf8(&bytes[range.clone()]).map_err(|_| render::bad_request(nonce))?.to_owned())
+    } else { None };
+    Ok((Form::from_pairs(fields), yaml))
+}
+
+/// Small UTF-8 YAML imports reuse the strict multipart parser, never the
+/// user-supplied filename. No disk write, photo decoder, or JavaScript needed.
+#[allow(clippy::result_large_err)] // Match the existing upload/response interface.
+pub async fn read_config(ctx: &Ctx, headers: &HeaderMap, body: Body, nonce: &str) -> Result<(Form, String), Response> {
+    let Some(boundary) = boundary(headers) else {
+        return Err(super::session::reply_unread(headers, body, render::bad_request(nonce)).await);
+    };
+    let bytes = api::read_capped(headers, body, crate::mihomo::MAX_CONFIG + 8192, ctx.body_wait).await
+        .map_err(|_| api::close(render::error(413, "Upload refused", "Choose a UTF-8 YAML file up to 512 KiB.", nonce)))?;
+    let (fields, files) = parse(&bytes, &boundary).ok_or_else(|| render::bad_request(nonce))?;
+    if files.len() != 1 || files[0].0 != "yaml" || files[0].1.len() > crate::mihomo::MAX_CONFIG {
+        return Err(render::bad_request(nonce));
+    }
+    let yaml = std::str::from_utf8(&bytes[files[0].1.clone()]).map_err(|_| render::bad_request(nonce))?.to_owned();
+    Ok((Form::from_pairs(fields), yaml))
 }
 
 /// Where "\r\n" and the delimiter `d` start in `hay`.

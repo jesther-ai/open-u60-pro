@@ -15,6 +15,7 @@ mod dashboard;
 mod dashboard_extra;
 mod data_usage;
 mod device_ext;
+mod dhcp_reservations;
 mod dns_control;
 pub mod doh;
 mod esim;
@@ -29,6 +30,8 @@ mod key_log;
 mod lan_test;
 mod live_activity;
 mod modem_ext;
+mod mihomo;
+mod net_tools;
 mod network_ext;
 mod oos_policy;
 mod ota;
@@ -58,6 +61,8 @@ mod calendar;
 #[path = "web/qr_decode.rs"]
 mod qr_decode;
 mod wifi;
+mod wifi_relay;
+mod network_clock;
 mod wifi_watchdog;
 mod wireguard;
 
@@ -84,6 +89,22 @@ fn main() {
     if args.get(1).map(String::as_str) == Some("ota-helper") {
         std::process::exit(ota::helper_cli(&args[2..]));
     }
+    if args.get(1).map(String::as_str) == Some("mihomo-script-child") {
+        std::process::exit(mihomo::transform::child());
+    }
+    if std::env::var("U60_RELAY_DHCP").ok().as_deref() == Some("1") {
+        std::process::exit(wifi_relay::dhcp_callback(args.get(1).map(String::as_str).unwrap_or("")));
+    }
+    if std::env::var("U60_RELAY_DHCP6").ok().as_deref() == Some("1") {
+        std::process::exit(wifi_relay::ipv6::callback(args.get(1).map(String::as_str).unwrap_or(""), args.get(2).map(String::as_str).unwrap_or("")));
+    }
+    if args.get(1).map(String::as_str) == Some("network-recover") {
+        let lock = Arc::new(std::sync::Mutex::new(()));
+        let result = mihomo::Mihomo::new(Arc::clone(&lock)).recover()
+            .and_then(|_| wifi_relay::WifiRelay::new(lock).recover());
+        if let Err(e) = result { eprintln!("{e}"); std::process::exit(1); }
+        return;
+    }
     if args.get(1).map(String::as_str) == Some("esim-native") {
         std::process::exit(esim_native::cli(&args[2..]));
     }
@@ -108,9 +129,27 @@ fn main() {
 
     let state = Arc::new(AppState::new());
 
-    // Set password from environment if provided
-    if let Ok(pw) = std::env::var("ZTE_AGENT_PASSWORD") {
-        state.auth.set_password(&pw);
+    // Read the verifier before starting services; never expose an unprotected API.
+    match auth::startup::configure(&state.auth) {
+        Ok(auth::startup::PasswordSource::Explicit) => {
+            eprintln!("[auth] using explicit agent password");
+        }
+        Ok(auth::startup::PasswordSource::FactoryAdmin) => {
+            eprintln!("[auth] using factory admin password (restart agent after changing it)");
+        }
+        Err(error) => {
+            eprintln!("[auth] {error}");
+            std::process::exit(1);
+        }
+    }
+
+    // For scripts run as root on the router (`adb shell`); loopback only.
+    if let Err(error) = auth::startup::write_local_token(&state.auth, std::path::Path::new(auth::startup::LOCAL_TOKEN)) {
+        eprintln!("[auth] local token unavailable: {error}");
+    }
+
+    if let Err(error) = network_clock::restore_floor() {
+        eprintln!("[clock] {error}");
     }
 
     // Event bus: single `ubus listen` process dispatches to subscribers
@@ -163,6 +202,10 @@ fn main() {
         .start(charger_rx, Arc::clone(&state.cache));
     state.sms_forward.start(sms_rx, service_rx, wan_status_rx);
     state.tailscale.auto_start();
+    state.mihomo.start();
+    state.mihomo.start_profiles();
+    state.wifi_relay.start();
+    restore_network(&state);
     state.tailscale.start_wan_watch(ts_wan_rx);
     state.ttl.start(ttl_wan_rx);
     state.wireguard.start(wireguard_wan_rx);
@@ -190,6 +233,42 @@ fn main() {
     wifi_watchdog::start(standby_rx);
 
     server::start(&bind, threads, state);
+}
+
+/// Bring back the relay and Mihomo the owner left on (an update, a crash or
+/// a reboot). The relay's journals are rolled back first: Mihomo started on
+/// a stale relay route would bind to `u60sta0`.
+fn restore_network(state: &Arc<AppState>) {
+    if !state.wifi_relay.wants_restore() && !state.mihomo.wants_restore() {
+        return;
+    }
+    let state = Arc::clone(state);
+    system::spawn_named("net-restore", move || {
+        wait_for_boot();
+        state.wifi_relay.recover_idle();
+        state.mihomo.restore(state.tls.name());
+        state.wifi_relay.restore();
+        // Offline validation may have exhausted the first core attempts. Retry
+        // on the usable uplink, still gated by the latest owner choice.
+        if state.wifi_relay.active() {
+            state.mihomo.restore(state.tls.name());
+        }
+    });
+}
+
+/// Until `zte_topsw_daemon` releases its boot barrier the vendor daemons are
+/// still bringing up Wi-Fi and the firewall. At most 3 minutes; immediate
+/// once the router has booted.
+fn wait_for_boot() {
+    for _ in 0..36 {
+        let synced = ubus::call("zwrt_topsw_daemon.sync", "get_sync_info", Some("{}"))
+            .is_ok_and(|v| v["noSyncModuleName"] == "sync success");
+        if synced {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(5));
+    }
+    eprintln!("[restore] boot barrier still closed after 3 minutes; restoring anyway");
 }
 
 /// Guard shared by the no-service policy and the connectivity watchdog: the

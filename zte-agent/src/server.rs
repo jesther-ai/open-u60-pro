@@ -87,6 +87,7 @@ pub enum Pre {
     Reply(u16, Value),
     /// `POST /api/auth/login`: read at most `LOGIN_BODY_MAX`, needs the peer address.
     Login,
+    Logout { owner: SessionId },
     LanDownload { size: usize },
     LanUpload,
     /// Authenticated JPEG/PNG upload for the bounded eSIM QR decoder.
@@ -94,6 +95,8 @@ pub enum Pre {
     /// `GET /api/events`: a stream for this bearer token.
     Events { owner: SessionId },
     Dashboard,
+    /// `POST /api/mihomo/dashboard`: a Zashboard pass for this console session.
+    DashboardPass { owner: SessionId },
     /// Read at most `body_limit` bytes, then `route()`.
     Dispatch { body_limit: usize },
 }
@@ -105,7 +108,10 @@ pub fn precheck(req: &ReqInfo, env: &PreEnv) -> Pre {
     let has_password = env.auth.has_password();
     let mut principal = None;
     if req.path != "/api/auth/login" && has_password {
-        principal = req.bearer.and_then(|t| env.auth.authenticate(Kind::Bearer, t));
+        // The local token works only from this device (root reads its file).
+        principal = req.bearer.and_then(|t| {
+            env.auth.authenticate(Kind::Bearer, t).or_else(|| req.loopback.then(|| env.auth.authenticate_local(t)).flatten())
+        });
         if principal.is_none() {
             return refuse(401, "unauthorized");
         }
@@ -128,6 +134,12 @@ pub fn precheck(req: &ReqInfo, env: &PreEnv) -> Pre {
     }
     match (req.method, req.path) {
         (Method::Post, "/api/auth/login") => return Pre::Login,
+        (Method::Post, "/api/auth/logout") => {
+            return match principal {
+                Some(p) if !p.is_local() => Pre::Logout { owner: p.id },
+                _ => refuse(403, "logout needs a login token"),
+            };
+        }
         // Answered here, without a hand-off, so the RTT measurement stays honest.
         (Method::Get, "/api/lan/ping") => {
             let (status, body) = lan_test::ping();
@@ -150,8 +162,16 @@ pub fn precheck(req: &ReqInfo, env: &PreEnv) -> Pre {
         (Method::Get, "/api/dashboard/events") => {
             return if principal.is_some() { Pre::Dashboard } else { refuse(403,"agent password required") };
         }
+        (Method::Post, "/api/mihomo/dashboard") => {
+            return match principal {
+                Some(p) if !p.is_local() => Pre::DashboardPass { owner: p.id },
+                Some(_) => refuse(403, "the dashboard needs a login token"),
+                None => refuse(403, "agent password required"),
+            };
+        }
         (Method::Get, "/api/events") => {
             return match principal {
+                Some(p) if p.is_local() => refuse(403, "event streams need a login token"),
                 Some(p) => Pre::Events { owner: p.id },
                 None => refuse(403, "agent password required"),
             };
@@ -159,11 +179,11 @@ pub fn precheck(req: &ReqInfo, env: &PreEnv) -> Pre {
         _ => {}
     }
     let live_activity = req.path.starts_with("/api/live-activity");
-    if live_activity && !has_password {
+    if (live_activity || req.path.starts_with("/api/mihomo/") || req.path.starts_with("/api/wifi-relay/")) && !has_password {
         return refuse(403, "agent password required");
     }
     Pre::Dispatch {
-        body_limit: if live_activity { LIVE_ACTIVITY_BODY_MAX } else { API_BODY_MAX },
+        body_limit: if live_activity { LIVE_ACTIVITY_BODY_MAX } else if matches!(req.path, "/api/mihomo/config" | "/api/mihomo/profiles") { crate::mihomo::MAX_CONFIG * 6 + 8192 } else { API_BODY_MAX },
     }
 }
 
@@ -208,6 +228,10 @@ pub fn encode((status, body): (u16, Value)) -> Encoded {
 pub fn lane(method: Method, path: &str) -> Lane {
     use Method::{Delete, Get, Post, Put};
     let slow = match (method, path) {
+        (Post, "/api/router/reservations") => true,
+        (Get, "/api/mihomo/status" | "/api/mihomo/profiles" | "/api/mihomo/extensions" | "/api/wifi-relay/status") => false,
+        (Get, p) if p.starts_with("/api/mihomo/profiles/") => false,
+        (_, p) if p.starts_with("/api/mihomo/") || p.starts_with("/api/wifi-relay/") => true,
         (Get, "/api/network/client-details") => true,
         (Get, "/api/esim/switch")
         | (Get | Delete, "/api/esim/download")
@@ -259,6 +283,15 @@ fn route_inner(method: &Method, path: &str, state: &AppState, body: &[u8]) -> (u
     if *method != Method::Get {
         crate::httpd::gate::debug_assert_may_change(path);
     }
+    // Vendor firewall writers can reload tables, removing our upstream INPUT
+    // guards. Refuse them while either extension owns live rules.
+    let _network = if *method != Method::Get && (path.starts_with("/api/router/firewall/") || path == "/api/router/domain-filter") {
+        let Ok(lock) = state.network_lock.try_lock() else { return (409, error_body("A network operation is in progress; retry after it finishes")); };
+        if state.wifi_relay.owns_network() || state.mihomo.owns_network() {
+            return (409, error_body("Stop or recover Wi-Fi relay and Mihomo before changing the vendor firewall"));
+        }
+        Some(lock)
+    } else { None };
     match (method, path) {
         (&Method::Get, "/api/live-activity") => state.live_activity.status(),
         (&Method::Put, "/api/live-activity") => state.live_activity.register(body),
@@ -464,6 +497,27 @@ fn route_inner(method: &Method, path: &str, state: &AppState, body: &[u8]) -> (u
         (&Method::Get, "/api/doh/cache") => doh_cache_list(state),
         (&Method::Post, "/api/doh/cache/clear") => doh_cache_clear(state),
         // Tailscale remote management
+        (&Method::Get, "/api/mihomo/status") => crate::mihomo::status(state),
+        (&Method::Get, "/api/router/reservations") => crate::dhcp_reservations::status(state),
+        (&Method::Post, "/api/router/reservations") => crate::dhcp_reservations::change(state, body),
+        (&Method::Get, "/api/mihomo/profiles") => crate::mihomo::profiles::status(state),
+        (&Method::Get, "/api/mihomo/extensions") => crate::mihomo::profiles::extensions(state),
+        (&Method::Get, p) if p.starts_with("/api/mihomo/profiles/") => crate::mihomo::profiles::editor(state, &p["/api/mihomo/profiles/".len()..]),
+        (&Method::Post, "/api/mihomo/profiles") => crate::mihomo::profiles::change(state, body),
+        (&Method::Get, "/api/mihomo/proxies") => crate::mihomo::control::proxies(state),
+        (&Method::Post, "/api/mihomo/proxies/select") => crate::mihomo::control::select(state, body),
+        (&Method::Post, "/api/mihomo/proxies/delay") => crate::mihomo::control::delay(state, body),
+        (&Method::Post, "/api/mihomo/mode") => crate::mihomo::control::mode(state, body),
+        (&Method::Post, "/api/mihomo/install") => crate::mihomo::change(state, "install", body),
+        (&Method::Put, "/api/mihomo/config") => crate::mihomo::change(state, "config", body),
+        (&Method::Post, "/api/mihomo/switch") => crate::mihomo::change(state, "switch", body),
+        (&Method::Get, "/api/wifi-relay/status") => crate::wifi_relay::status(state),
+        (&Method::Post, "/api/wifi-relay/scan") => crate::wifi_relay::change(state, "scan", body),
+        (&Method::Post, "/api/wifi-relay/connect") => crate::wifi_relay::change(state, "connect", body),
+        (&Method::Post, "/api/wifi-relay/disconnect") => crate::wifi_relay::change(state, "disconnect", body),
+        (&Method::Post, "/api/wifi-relay/clock") => crate::wifi_relay::change(state, "clock", body),
+        (&Method::Post, "/api/wifi-relay/tuning") => crate::wifi_relay::change(state, "tuning", body),
+        (&Method::Post, "/api/wifi-relay/forget") => crate::wifi_relay::change(state, "forget", body),
         (&Method::Get, "/api/tailscale/status") => tailscale::status(state),
         // LAN HTTPS (docs/web-ui.md, "LAN HTTPS"): read-only for the apps.
         (&Method::Get, "/api/https") => state.tls.status_json(),
@@ -517,9 +571,13 @@ fn doh_disable(state: &AppState) -> (u16, Value) {
 /// Restore dnsmasq to default DNS resolution (remove DoH forwarding).
 /// Safe to call even if dnsmasq isn't forwarding to DoH.
 pub fn dnsmasq_restore_defaults() {
-    let _ = std::process::Command::new("sh")
-        .args(["-c", "rm -f /tmp/dnsmasq.d/doh.conf; uci delete dhcp.lan_dns.server 2>/dev/null; uci delete dhcp.lan_dns.noresolv 2>/dev/null; uci commit dhcp; /etc/init.d/dnsmasq restart"])
-        .output();
+    let _ = std::fs::remove_file("/tmp/dnsmasq.d/doh.conf");
+    // Cleanup is runtime-only, like the current DoH drop-in. A package-wide
+    // commit would persist unrelated pending edits, including relay LAN RA.
+    for key in ["dhcp.lan_dns.server", "dhcp.lan_dns.noresolv"] {
+        let _ = crate::net_tools::Cmd::new("uci", &["-q", "delete", key]).run();
+    }
+    let _ = crate::net_tools::Cmd::new("/etc/init.d/dnsmasq", &["restart"]).run();
 }
 
 fn doh_cache_list(state: &AppState) -> (u16, Value) {
@@ -660,6 +718,26 @@ mod tests {
     }
 
     #[test]
+    fn local_token_only_from_this_device_and_never_for_streams() {
+        let auth = with_password();
+        let local = auth.issue_local().unwrap();
+        let t = Some(local.expose());
+        let h = host("127.0.0.1:9090");
+        assert_eq!(run(&auth, &info(Method::Post, "/api/wifi-relay/connect", None, t, h)), DISPATCH);
+        assert_eq!(run(&auth, &lan(info(Method::Get, "/api/device", None, t, h))), reply(401, "unauthorized"));
+        assert_eq!(
+            run(&auth, &info(Method::Get, "/api/events", None, t, h)),
+            reply(403, "event streams need a login token")
+        );
+        // A cross-origin page on this device gets no further with it.
+        let cross = ReqHeaders { origin: Some("http://evil.com"), ..h };
+        assert_eq!(
+            run(&auth, &info(Method::Post, "/api/mihomo/switch", None, t, cross)),
+            reply(403, "cross-origin request refused")
+        );
+    }
+
+    #[test]
     fn precheck_with_password_host_checks_browser_requests() {
         let auth = with_password();
         let rebound = ReqHeaders {
@@ -768,5 +846,34 @@ mod tests {
     fn ota_download_uses_the_slow_lane_without_blocking_status() {
         assert_eq!(lane(Method::Post, "/api/update/download"), Lane::Slow);
         assert_eq!(lane(Method::Get, "/api/update/status"), Lane::General);
+    }
+
+    #[test]
+    fn console_reads_of_mihomo_state_stay_quick_and_every_change_is_slow() {
+        for path in ["/api/mihomo/status", "/api/mihomo/profiles", "/api/mihomo/extensions", "/api/mihomo/profiles/0a1b2c3d", "/api/wifi-relay/status"] {
+            assert_eq!(lane(Method::Get, path), Lane::General, "{path}");
+        }
+        for (method, path) in [
+            (Method::Get, "/api/mihomo/proxies"),
+            (Method::Post, "/api/mihomo/proxies/select"),
+            (Method::Post, "/api/mihomo/proxies/delay"),
+            (Method::Post, "/api/mihomo/mode"),
+            (Method::Post, "/api/mihomo/profiles"),
+            (Method::Post, "/api/wifi-relay/connect"),
+            (Method::Post, "/api/wifi-relay/scan"),
+        ] {
+            assert_eq!(lane(method, path), Lane::Slow, "{path}");
+        }
+    }
+
+    #[test]
+    fn mihomo_editors_validate_ids_and_never_serve_other_methods() {
+        let state = AppState::new();
+        for bad in ["", "../etc", "a b", "x%2Fy", &"a".repeat(65)] {
+            let (status, _) = route(&Method::Get, &format!("/api/mihomo/profiles/{bad}"), &state, b"");
+            assert_eq!(status, 400, "{bad:?}");
+        }
+        assert_eq!(route(&Method::Get, "/api/mihomo/profiles/0a1b2c3d4e5f6071", &state, b"").0, 404);
+        assert_eq!(route(&Method::Delete, "/api/mihomo/profiles/0a1b2c3d4e5f6071", &state, b"").0, 404);
     }
 }

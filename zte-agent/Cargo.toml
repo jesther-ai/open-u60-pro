@@ -7,12 +7,16 @@ edition = "2021"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_yaml_ng = "0.10"
+# Profile scripts: bounded QuickJS, with no module loader or host I/O bindings.
+rquickjs = { version = "0.14", default-features = false, features = ["std"] }
+zip = { version = "2.4", default-features = false, features = ["deflate"] }
 sha2 = "0.10"
 ureq = { version = "3", features = ["json"] }
 libc = "0.2"
 base64 = "0.22"
 p256 = { version = "0.13", features = ["ecdsa", "pem"] }
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "http2", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "http2", "rustls-tls", "stream"] }
 httpdate = "1"
 ipnet = { version = "2", features = ["serde"] }
 wireguard-control = "2"
@@ -36,7 +40,7 @@ subtle = { version = "2.6", default-features = false }
 axum = { version = "0.8.9", default-features = false, features = ["tokio"] }
 hyper = { version = "1.11", default-features = false, features = ["server", "http1"] }
 hyper-util = { version = "0.1.20", default-features = false, features = ["tokio"] }
-tokio = { version = "1.50", default-features = false, features = ["rt", "net", "time", "sync"] }
+tokio = { version = "1.50", default-features = false, features = ["rt", "net", "time", "sync", "io-util"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 tower = { version = "0.5", default-features = false, features = ["util"] }
 # Web UI: HTML templates (no "axum" feature; responses are built by hand) and

@@ -29,6 +29,7 @@ pub mod forward;
 pub mod job;
 pub mod kit;
 pub mod live;
+pub mod mihomo;
 pub mod ops;
 pub mod pages;
 pub mod prefs;
@@ -119,6 +120,7 @@ fn text(status: StatusCode, msg: &'static str) -> Response {
 /// Host check, CSP nonce, no-password page and security headers (one layer
 /// instead of three: the same order, less generic code).
 async fn guard(State(ctx): State<Ctx>, mut req: Request, next: Next) -> Response {
+    let dashboard = req.uri().path().starts_with(crate::mihomo::DASHBOARD);
     let page = is_page(req.uri().path());
     // This browser's theme (Settings › Appearance) for its pages.
     let theme = if page { prefs::Prefs::of(req.headers()).theme } else { prefs::Theme::System };
@@ -150,7 +152,13 @@ async fn guard(State(ctx): State<Ctx>, mut req: Request, next: Next) -> Response
         }
         None => next.run(req).await,
     };
-    secure(prefs::themed(resp, theme, nonce.as_deref().unwrap_or("")).await, nonce.as_deref())
+    if dashboard {
+        let mut resp = secure(resp, nonce.as_deref());
+        if session::content_type(&resp).is_some_and(|s| s.starts_with("text/html")) { mihomo::secure_dashboard(&mut resp); }
+        resp
+    } else {
+        secure(prefs::themed(resp, theme, nonce.as_deref().unwrap_or("")).await, nonce.as_deref())
+    }
 }
 
 /// A reply that leaves the request body unread (drained if small, else the

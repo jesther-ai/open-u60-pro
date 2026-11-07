@@ -1,0 +1,316 @@
+--- a/zte-agent/docs/network-extensions.md
++++ b/zte-agent/docs/network-extensions.md
+@@ -181,11 +181,25 @@
+ ### Interception scope
+ 
+ - LAN bridge `br-lan` only, TCP/UDP and IPv4/IPv6 through an owned `u60mh0`
+-  Mihomo TUN with gVisor, MTU 1500. The B31 bridge-netfilter path loses the early
++  Mihomo TUN, MTU 1500. The B31 bridge-netfilter path loses the early
+   TPROXY socket association; a veth only named `br-lan` missed this failure.
+   TUN avoids changing global bridge filters or tracking physical bridge ports.
+-  gVisor also handles fragmented UDP and avoids system-stack internal TCP routes
+-  conflicting with Relay's catch-all table. Its throughput is not benchmarked.
++  The TUN stack is `mixed`: kernel TCP, gVisor UDP (gVisor handles fragmented
++  UDP). The kernel TCP stack answers clients from the TUN subnet; an owned rule
++  at priority `18629` sends `198.18.0.0/30` and `fdfe:dcba:9876::/126` to
++  `main`, ahead of Relay's catch-all table, which otherwise sent those replies
++  out over Wi-Fi. The core injects each intercepted TCP connection on the TUN
++  to its own address, so `U60_MH_IN` accepts exactly TCP from `u60mh0` to
++  `198.18.0.1`/`fdfe:dcba:9876::1` before rejecting all other TUN input and
++  anything else sent to those addresses (without it every TCP connection was
++  rejected). Measured 2026-10-27 through a 5 GHz Relay, flows routed DIRECT,
++  the Mac's own proxy bypassed: gVisor for TCP 66-68 Mbit/s, `mixed` 128-139,
++  no Mihomo 213-246. CPU was not saturated with gVisor; with `mixed` most of
++  the remaining cost is system time copying through the core. Deployed as
++  agent `3d3b91a3` (no manual rules): DIRECT TCP, proxied HTTPS, UDP DNS
++  through the core and AAAA answers checked; 119-131 Mbit/s with the same test.
++  Switching the stack on a running core (`PATCH /configs`) deleted the TUN and
++  left it disabled; the stack only changes through a clean core start.
+ - Dedicated fwmark `0x600/0xff00`, policy-route table `60630`, priority
+   `18630`; owned chains start `U60_MH`. Existing tables/chains/priorities are
+   checked before use. Main default routes are not replaced.
+@@ -278,9 +292,33 @@
+ - Uses the existing `wpa_supplicant`, `wpa_cli`, `hostapd_cli`, `iw`, `ip`,
+   `iptables`, `ip6tables`, `udhcpc` and `uci`; optional IPv6 also uses `odhcp6c`
+   and the existing `odhcpd`. It does not disable vendor daemons.
+-- Temporarily aligns the same-band AP to 20 MHz and the upstream channel;
+-  snapshots/restores runtime geometry without committing wireless UCI changes.
+-  Client reconnection is expected. Both AP client paths need actual acceptance.
++- The radio allows two channels (`iw phy` combinations), one per band, so the
++  STA shares its channel with the same-band AP. For a 2.4 GHz upstream the
++  agent moves `wlan0` to the upstream channel at 20 MHz before associating
++  (runtime `hostapd_cli` disable/set/enable, snapshotted and restored, no UCI
++  commit; client reconnection is expected). A 5 GHz upstream leaves `wlan2`
++  alone: runtime reconfiguration of it is unreliable on B31. Measured
++  2026-10-27 without a connected STA: ch 44 at 20 MHz was refused by
++  `enable`; ch 36/44 at 40 and 80 MHz reached `HT_SCAN`, then `DISABLED`
++  without any `START AP` reaching the driver; ch 36/44 at 160 MHz started (DFS
++  CAC). With a connected STA even 160 MHz failed. The old 5 GHz path (20 MHz) therefore always failed with "Hotspot
++  channel change was not confirmed", and each rollback to 160 MHz cost a 60 s
++  CAC. The driver's own policy (`gWlanMccToSccSwitchMode=3`, force SCC
++  without SAP restart) is left to move the AP to the STA's channel by CSA.
++- Scans go over an attached wpa_supplicant control socket: all enabled 2.4 GHz
++  channels in one request, then each enabled 5 GHz channel alone, each waiting
++  for its completion event (about 3 s in all, instead of a fixed 6 s sleep).
++  Reason, from the B31 `wlan.ko` (qcacld 5.2.1.110D): `scm_scan_start_req`
++  removes from multi-channel STA scans the 5 GHz channels sharing a MAC with an
++  AP that `policy_mgr_is_any_dfs_beaconing_session_present` reports, and any
++  5 GHz AP at 160 MHz counts. With the main hotspot on channel 36 at 160 MHz,
++  channels 36-64 vanished from every full scan and a 36-48-only request was
++  refused (`Reject 0 channel Scan`, `INTERNAL_FAILURE`); 149-165 survive on the
++  other MAC. One-channel requests skip that code. INI `ch_list_trim_conc` and
++  `skip_6g_and_indoor_freq_scan` are 0 and not involved. wpa_supplicant still
++  reports a refused scan as finished, refilled from the kernel's cached BSS
++  table, so only entries whose `age` fits inside the scan are listed. The BSS
++  table is read with `BSS RANGE=` pages, not the 4 KB `SCAN_RESULTS` reply.
+ - WPA2 passphrases become derived hex PSKs, never shell arguments. Credentials
+   live only in the private runtime directory and are removed on disconnect.
+   Scanned BSSIDs are kept internal; page selection uses opaque IDs.
+@@ -352,7 +390,15 @@
+   Cleanup removes only those lines, never restores historical SIM DNS.
+   Existing LAN global addresses
+   remain local/management-reachable. DHCPv6/NDP relay is temporarily disabled.
+-  RA router lifetime is 90 s, intervals 10-30 s, MTU 1280; the LAN ULA address
++  RA router lifetime is 90 s, intervals 10-30 s. Advertised MTU is the smaller
++  of the validated upstream RA MTU and the current `br-lan` link MTU, not a
++  fixed 1280. Missing/invalid upstream MTU retains the conservative 1280
++  fallback; a LAN MTU below IPv6's minimum refuses IPv6 relay. The supervisor
++  rebuilds RA state when either bound changes. Status exposes `upstream_mtu`
++  and `lan_mtu` (the effective advertised value). A hardcoded 1280 broke
++  macOS Hysteria2: its observed 1280-byte UDP handshake needs 1328 bytes with
++  headers and was rejected locally with `EMSGSIZE` when fragmentation was
++  disabled. The LAN ULA address
+   lifetime is refreshed while the upstream lease remains live. Clients may
+   continue preferring IPv4 with ULA; this is not a forced IPv6 preference.
+ - Upstream INPUT permits established return traffic, scoped RA/NDP, essential
+@@ -388,8 +434,9 @@
+   coordinator/dependency-group changes are a plan, not already deployed code.
+ - The active-only watchdog checks link/process/lease state every 3 seconds.
+   Link/process loss or a changed lease removes relay and restores AP settings;
+-  **cellular fallback may consume SIM data**. No internet-down probe, automatic
+-  reconnect, persistent credentials or cold-boot reconnect is claimed yet.
++  **cellular fallback may consume SIM data**. There is no internet-down probe
++  and no reconnect after a dropped link while the agent runs; after an agent
++  restart or a reboot the relay reconnects (see "After a restart").
+ - The existing cellular connectivity watchdog does not count Relay/portal
+   probe failures against SIM. It clears escalation state while Relay owns the
+   upstream or cellular is disabled/unreadable. Agent data-off/airplane requests
+@@ -437,7 +484,14 @@
+ parent-death signal and are spawned by one permanent thread (not a retiring
+ blocking worker). This stops orphans, **not** kernel rules on an agent crash:
+ service restart/recovery is still necessary, and uninterrupted forwarding
+-during an agent crash is not promised.
++during an agent crash is not promised. The kernel clears that signal when an
++exec changes the SELinux domain, which B31 does for `wpa_supplicant`
++(`wpad.subj`) and `odhcp6c` (`odhcp6c.subj`) even in permissive mode, so
++those two survive the agent (seen on every update). Relay recovery therefore
++first stops any `wpa_supplicant`, `odhcp6c` or `udhcpc` on `u60sta0` with the
++relay's private paths that is not its own child (SIGTERM, then SIGKILL after
++1 s); otherwise the old supplicant keeps the control socket, the new one
++exits, and every reconnect fails at association.
+ 
+ Relay journals the roam-mode undo before changing the driver and an association
+ undo before reconfiguring a credentialed supplicant. Reverse recovery first
+@@ -447,6 +501,45 @@
+ An unresponsive owned supplicant is killed/reaped before normal rollback; after
+ a crash, restoring roam mode may use a temporary credential-free supplicant.
+ 
++### After a restart
++
++The relay and Mihomo come back on by themselves when the owner left them on:
++after an update (`setup.sh` no longer asks to turn them off first), a crash
++or a reboot. The owner's choice is all that is kept: Mihomo's
++`/data/zte-agent-mihomo/enabled` marker (written by a successful switch on,
++removed by switching off or by a switch on that failed), and the relay's
++`/data/zte-agent-relay/resume.json` with the network's SSID, security, BSS and
++the IPv6 choice (written by a successful connect whose password is
++remembered, or an open network; removed by Disconnect or by connecting to
++another network). Neither holds a password; a dropped link or a failed
++restore keeps them. An older agent writes neither, so the first update from
++one cannot restore anything.
++
++One `net-restore` thread does it at start. At boot it first waits for the
++vendor sync barrier (`zwrt_topsw_daemon.sync`, at most 3 minutes), as Wi-Fi and
++the firewall are still being brought up before it. Then it rolls back the
++relay's journals, so that Mihomo cannot bind to a stale `u60sta0` route,
++turns Mihomo on (4 tries in 50 s) and finally rejoins the relay network: a
++scan, the same BSS if it is still there or else the strongest one with the
++same SSID and security, with the remembered password (10 tries over about
++17 minutes, for the hotspot's DFS check or an upstream that is also
++restarting). The relay page shows "Reconnecting" meanwhile with a Stop
++button, and "After a restart" on a connected relay says whether it will come
++back. Connecting, disconnecting or switching off in the panel ends a restore
++in progress. A dropped link is not reconnected while the agent runs.
++
++Live (2026-10-28, relay on W at 2.4 GHz with IPv6, Mihomo on). The first
++update failed to restore at association, 6 attempts in a row: the replaced
++agent's `wpa_supplicant` and `odhcp6c` were still running with parent 1 (see
++Recovery for why) and the stale supplicant owned the control socket. With
++stray helpers stopped at recovery, two further `setup.sh` updates with both
++on each logged "stopping 2 helper(s)", restored Mihomo, then rejoined W on the
++first attempt, at the remembered 20 MHz. A cold reboot (`reboot` over ADB):
++agent running by 54 s of uptime with the boot barrier already released,
++Mihomo on at about 60 s, W associated at 69 s, both reported `autostart: true`
++and no error by 94 s; the router reached 223.5.5.5 and HTTP through
++`u60sta0`. Not yet tried: a 5 GHz upstream, an upstream that is down at boot.
++
+ Keep USB ADB available for initial testing. Stop the agent before emergency
+ manual recovery, then run the agent binary's `network-recover` command over
+ USB/SSH. Do not run recovery against a live extension. It does not delete
+@@ -470,13 +563,14 @@
+ | POST | `/api/wifi-relay/scan` | Explicit scan, no background scanning |
+ | POST | `/api/wifi-relay/connect` | `{"network":"opaque scan id","password":"...","confirmed":true,"ipv6":true}`; omitted IPv6 defaults on |
+ | POST | `/api/wifi-relay/disconnect` | Restore runtime hotspot/routes |
++| POST | `/api/wifi-relay/clock` | Explicit fresh HTTPS time check; requires an active relay, never reconnects it |
+ | GET | `/ui/router/mihomo` | Install/configure/status page |
+ | POST | `/ui/router/mihomo/{install,config,switch}` | Authenticated lifecycle forms |
+ | GET | `/ui/router/mihomo/open` | Running-only same-origin Zashboard jump |
+ | GET | `/ui/mihomo/dashboard/` | Running-only local third-party panel |
+ | restricted | `/ui/mihomo/api/*` | Same-origin authenticated HTTP/WebSocket bridge |
+ | GET | `/ui/relay` | Independent Relay tab |
+-| POST | `/ui/relay/{scan,connect,disconnect}` | Authenticated relay forms |
++| POST | `/ui/relay/{scan,connect,disconnect,clock}` | Authenticated relay forms |
+ 
+ ## Validation (updated 2026-10-26)
+ 
+@@ -558,8 +652,9 @@
+    working and no IPv6 traffic may leave rmnet. Check lease refresh, zero-lifetime
+    RA withdrawal, same-boot crash/restart, reboot and original UCI restoration.
+    Test hotel IPv6 authorization separately from its IPv4 portal login.
+-7. Throughput, UDP games/QUIC, power/temperature, long idle, cold boot and a
+-   second B31 device remain unverified. Do not present this as production ready.
++7. Throughput, UDP games/QUIC, power/temperature, long idle, a cold boot with
++   a 5 GHz upstream and a second B31 device remain unverified (cold boot with
++   a 2.4 GHz upstream and Mihomo: see "After a restart"). Do not present this as production ready.
+ 
+ 
+ ### B31 reboot clock and recovery guard
+@@ -571,7 +666,128 @@
+ small requests bind to the selected Wi-Fi STA, never enable or use cellular, do
+ not follow redirects and do not disable certificate checks. A captive portal or
+ failed verification leaves IPv4 Relay active and exposes `clock_error`.
++Relay status reads the latest shared clock result, not the connect-time copy:
++a later successful core-start check clears an earlier warning on the next page
++refresh. While a warning is present, **Recheck time** performs a fresh check
++with success/error feedback, without reconnecting Wi-Fi or restarting Clash.
++The check runs on the blocking Slow lane, serialized with network changes;
++status reads remain responsive. Each new relay connection also checks afresh.
++Core startup may reuse verified UTC for at most five minutes; a failed check
++invalidates that cache. No periodic background clock probes are added, and a
++restored local UTC floor alone never clears a failed-verification warning.
+ 
++Clock warning regression validation (2026-10-27): `cargo test -p zte-agent`
++passes 1090 unit tests plus 1 startup integration test, with 3 ignored tests.
++Coverage includes failure/success replacement across callers, fresh retries,
++nonblocking status, disconnected/busy guards and session/origin/CSRF/single-use
++form checks. Browser fixtures verify the warning, round progress indicator and
++successful return on desktop and narrow layouts without touching the live relay.
++The ARM64 musl release has section Total 8,465,560 bytes and gzip size
++4,330,994 bytes. This records source/build validation, not live deployment.
++
++5 GHz relay scan validation (2026-10-27, one boot, relay on 2.4 GHz, main
++5 GHz hotspot on 36 at 160 MHz with one client, existing association kept
++`COMPLETED` throughout): requests `5180,5220` were refused (`Reject 0 channel
++Scan`) 3/3; `2412,5220` finished with no fresh 5 GHz entry 3/3; `5220` alone
++found the 5220 MHz upstream at age 0 s 3/3. The old full scan with a 6 s sleep
++missed it 2/2. The new sequence (14 requests, run through a one-off
++on-router diagnostic, since removed in favor of the scan API) found it
++fresh 3/3 in 3.04-3.07 s. ARM64 musl release: section Total 8,486,448 bytes,
++gzip -9 4,331,301 bytes, +16,720 and +7,371 bytes over the same tree without
++this change (both measured with the same tool).
++
++Live 5 GHz relay acceptance (2026-10-27, agent `35743a58`, Mihomo off): the
++web scan listed the 5220 MHz upstream; connecting left `wlan2` alone and the
++driver moved it by CSA from 36/160 MHz to 44/80 MHz within 3 s (no restart, no
++CAC). The STA associated at 160 MHz, RX 1297-1921 Mbit/s (HE-MCS 6-9, 2 SS);
++the owner measured 140 Mbit/s through the relay. The same router's 2.4 GHz
++network (seen by the U60 only on 2412 MHz) stays at about 6 Mbit/s through the
++relay, unchanged with the U60's 2.4 GHz AP disabled; under load the router
++gateway RTT rose from 3 ms to 21-33 ms average (peaks 65-195 ms), so that
++limit is on the router's 2.4 GHz side, not in the relay. A Mac reported as
++"directly on W" was associated on 44 at 160 MHz (104 Mbit/s), i.e. 5 GHz.
++
++Association scans (2026-10-27, agent `4f9163de`): the network block has both
++`freq_list` and `scan_freq` set to the upstream frequency. `freq_list` alone
++only restricts selection; the supplicant's own connect scans were full scans
++(1.7 s each), lost 5 GHz while the hotspot ran 160 MHz, and "Wi-Fi association
++failed" followed after 30 s. The first 5 GHz connect had worked only because
++the kernel still cached the page scan. With `scan_freq` the connect scan took
++75 ms and the 5220 MHz upstream associated in about 1 s.
++
++Throughput layers on the 5 GHz upstream (same day, Mihomo off, 6 parallel
++HTTP range downloads from two CN mirrors, 12 s): the U60 itself 249 Mbit/s, a
++Mac directly on that upstream 250 Mbit/s, the Mac behind the relay (hotspot
++44/80 MHz) 213, 219, 241 and 246 Mbit/s. During forwarding CPU0 ran 71-88%
++softirq while CPUs 2-3 stayed about 87% idle. RPS (`rps_cpus=f` on
++`u60sta0`, `wlan2`, `br-lan`) gave 234, 251 and 254 but collapsed to 71 and 51
++Mbit/s in two of five runs with idle CPUs, so it is not used. The kernel has no
++flow offload (`CONFIG_NF_FLOW_TABLE` unset).
++
++2.4 GHz upstream, LAN only (U60 to a host on the same router, no WAN): 5-35
++Mbit/s down, 11-26 up. The router sent to the U60 mostly at HE-MCS 1, 1 SS,
++20 MHz at -34 dBm. Unchanged with STA power save off, with the U60's 2.4 GHz
++AP disabled, and with the 5 GHz AP disabled (DBS off). Cellular coex reported
++no active scheme; Bluetooth is soft-blocked. `pm_cinfo` showed DBS with the
++STA in SCC on MAC 0, no MCC.
++
++Cause (2026-10-28): the driver associated the STA at 40 MHz (ch 1 + 5),
++while a Mac on the same AP used 20 MHz. Same test, same AP: the Mac 82-91
++Mbit/s, the U60 32-36. `iwpriv u60sta0 chwidth 0` (20 MHz, no reassociation)
++gave 92-117; back to 40 MHz 34 and 34; 20 MHz again 104 and 104, with the
++AP's rate to the STA rising from HE-MCS 1 to HE-MCS 9-11, 2 SS.
++
++Upstream width is therefore chosen by measurement on both bands, not a fixed
++rule (`wifi_relay/width.rs`); the hotspots are never changed by it. The STA
++starts at its negotiated width. On relay-watch ticks (3 s) with at least 1
++Mbit/s of downlink, the AP's `rx bitrate` (it already reflects width, MCS and
++streams) is sampled; four samples give a mean per width (a median hid a flaky
++40 MHz link's failures behind its occasional HE-MCS 11 frames). The next
++narrower width (160, 80, 40, 20 MHz) is tried with `iwpriv u60sta0 chwidth`
++(0-3 = 20-160 MHz, no reassociation) and kept only if at least 15% faster;
++the search stops there and returns to the fastest width. Two busy ticks after
++each change are skipped: the AP's rate control took about 5 s to climb. A
++settled choice is measured again from the widest width after 15 minutes,
++doubling up to 4 hours while the wider width keeps losing and back to 15
++minutes once it wins, or at once if the settled rate halves.
++
++Live (agent `cacb3fa7`, first version: median, one skipped tick), W at
++2.4 GHz with downloads running: the tuner tried 20 MHz while 40 MHz was
++briefly good (109 Mbit/s) and kept 40; when 40 MHz collapsed (15 Mbit/s) it
++searched again and moved to 20 MHz. Over the next 75 s: 40 MHz 8 s, mean AP
++rate 80 Mbit/s, throughput 29; 20 MHz 67 s, AP rate 216, throughput 104.
++
++Live (agent `c5cfcc60`, final rules), 5220 MHz upstream negotiated at 160 MHz,
++downloads running: 160 MHz measured, 80 MHz tried at 16 s (mean AP rate 1113
++against 1745 Mbit/s), back to 160 MHz at 36 s. Throughput stayed 249-251
++Mbit/s in all seven 12 s runs, the trial included (the path's limit). If a reassociation widens the link the choice is re-applied; if the
++link narrows or widens beyond the search range, measurement starts again. Idle
++links are not measured and nothing extra is sent. The relay page shows the
++current band and width.
++
++Start and score (2026-10-28): a search starts at the width settled on last
++time for the same network (opaque scan id, newest 32 kept in
++`/data/zte-agent-relay/widths.json`, 0600). Without one, the scan predicts a
++start: every fresh BSS, hidden ones included, is kept with its frequency and
++signal, and the start is the widest block around the primary that no other
++network at -82 dBm or stronger (the 20 MHz CCA preamble threshold) overlaps;
++networks on the primary itself are ignored. Reviews still try wider widths.
++After association the agent enables qcacld link-layer stats on `u60sta0`
++(QCA vendor command 14 `LL_STATS_SET` over nl80211, sent by the agent:
++`iw vendor send` fails because the kernel wants the data flagged nested) and
++scores a busy tick as delivered downlink bits per second of the STA radio's
++`rx_time` from debugfs `ll_stats`. Failed and repeated frames use airtime
++without delivering, which the last frame's `rx bitrate` hid. On W, 10 s per
++width: 40 MHz gave 0 and 10 Mbit/s with 0 and 42 per airtime-second, 20 MHz 59
++and 90 with 101 and 129. If the stats cannot be read, that session restarts
++measurement on `rx bitrate`; the two scores are never compared. Per-peer
++receive counts by rate are not filled by this firmware (`rxmpdu` 0).
++
++Runtime `hostapd_cli` geometry changes on `wlan2` are unreliable on B31: with
++the relay STA connected even the original 160 MHz configuration and ACS ended
++`DISABLED`. `/etc/init.d/hostapd-daemon.init restart wlan2` (the vendor's own
++per-interface restart) brought it back from its unchanged configuration file.
++
+ The optional disruptive connectivity-watchdog ladder is safety-blocked on B31:
+ its vendor API cannot distinguish an external user-off from its own PDN pause.
+ `status.safety_block` and enable responses explain why; manual modem controls

@@ -484,6 +484,7 @@ fn build(
         trail,
         heading,
         go: None,
+        network_forms: matches!(s.path, "/ui/router" | "/ui/router/mihomo" | "/ui/relay"),
     };
     render::html(status, render::page(&ctx, body))
 }

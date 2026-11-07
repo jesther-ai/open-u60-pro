@@ -27,7 +27,8 @@
 //! action back to it; the runtime also ignores
 //! [`ConnWatchdog::set_user_activity`] calls made from its own thread.
 //!
-//! Off by default until rungs 1-3 have been validated by hand.
+//! Off by default. Device effects are also safety-blocked until vendor user
+//! intent can be distinguished from the watchdog's own temporary PDN-off.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -62,8 +63,8 @@ pub const USER_ACTIVITY_GUARD: Duration = Duration::from_secs(120);
 /// Retry delay when a call, USSD session or speed test blocks an action.
 pub const GUARD_RETRY: Duration = Duration::from_secs(60);
 const DAY: Duration = Duration::from_secs(24 * 3600);
-/// Gap between PDN down and up inside rung 1.
-const PDN_TOGGLE_GAP: Duration = Duration::from_secs(2);
+const EXTERNAL_INTENT_UNAVAILABLE: &str =
+    "Automatic modem recovery is unavailable: firmware does not expose authoritative external cellular-off intent";
 /// Gap between LPM and ONLINE inside rung 2 (the firmware uses 5 s).
 const LPM_ONLINE_GAP: Duration = Duration::from_secs(5);
 /// `AT+CFUN=1` attempts inside rung 2: the AT port has no cross-thread lock
@@ -585,6 +586,10 @@ impl Machine {
 // ── Side effects ────────────────────────────────────────────────────
 
 pub trait Effects: Send {
+    /// Internet probes describe the selected upstream, not necessarily SIM.
+    fn recovery_blocked(&self) -> Option<&'static str> {
+        None
+    }
     /// `ubus call zwrt_data set_wwaniface {"cid":1,"enable":0}` then `enable:1`.
     fn pdn_reconnect(&self) -> Result<(), String>;
     /// `nwinfo_set_mode LPM`, then `AT+CFUN=1` sent directly through
@@ -621,6 +626,38 @@ impl DeviceEffects {
     pub fn new(app: Arc<AppState>) -> Self {
         Self { app }
     }
+
+    fn cellular_enabled(&self) -> Result<bool, String> {
+        ubus::call("zwrt_data", "get_wwaniface", Some(r#"{"cid":1}"#))
+            .map(|v| v["enable"].as_u64() == Some(1) || v["enable"].as_str() == Some("1"))
+    }
+
+    fn network_guard(&self) -> Result<std::sync::MutexGuard<'_, ()>, String> {
+        // B31 reports the same enable=0 for our PDN pause and an off request
+        // from the official panel/screen. Do not guess permission to re-enable.
+        automatic_recovery_allowed()?;
+        let guard = self
+            .app
+            .network_lock
+            .try_lock()
+            .map_err(|_| "Network transition in progress")?;
+        if self.app.wifi_relay.owns_network() {
+            return Err("Wi-Fi relay owns the upstream; cellular recovery refused".into());
+        }
+        Ok(guard)
+    }
+
+    fn with_cellular_recovery(
+        &self,
+        action: impl FnOnce() -> Result<(), String>,
+    ) -> Result<(), String> {
+        let _network = self.network_guard()?;
+        let _control = self.app.cellular_control.lock();
+        if !self.cellular_enabled()? {
+            return Err("Cellular data is disabled; automatic recovery refused".into());
+        }
+        action()
+    }
 }
 
 fn handler_result((status, body): (u16, Value), what: &str) -> Result<(), String> {
@@ -634,55 +671,64 @@ fn handler_result((status, body): (u16, Value), what: &str) -> Result<(), String
     }
 }
 
+fn automatic_recovery_allowed() -> Result<(), String> {
+    Err(EXTERNAL_INTENT_UNAVAILABLE.into())
+}
+
 impl Effects for DeviceEffects {
+    fn recovery_blocked(&self) -> Option<&'static str> {
+        if automatic_recovery_allowed().is_err() {
+            return Some(EXTERNAL_INTENT_UNAVAILABLE);
+        }
+        let Ok(_network) = self.network_guard() else {
+            return Some("Wi-Fi relay or network transition");
+        };
+        let _control = self.app.cellular_control.lock();
+        (!self.cellular_enabled().unwrap_or(false))
+            .then_some("cellular data disabled or unavailable")
+    }
+
     fn pdn_reconnect(&self) -> Result<(), String> {
-        ubus::call(
-            "zwrt_data",
-            "set_wwaniface",
-            Some(r#"{"cid":1,"enable":0}"#),
-        )?;
-        std::thread::sleep(PDN_TOGGLE_GAP);
-        ubus::call(
-            "zwrt_data",
-            "set_wwaniface",
-            Some(r#"{"cid":1,"enable":1}"#),
-        )
-        .map(|_| ())
+        automatic_recovery_allowed()
     }
 
     fn lpm_online(&self) -> Result<(), String> {
-        ubus::call(
-            "zte_nwinfo_api",
-            "nwinfo_set_mode",
-            Some(r#"{"operate_mode":"LPM"}"#),
-        )?;
-        std::thread::sleep(LPM_ONLINE_GAP);
-        // Same command as handlers::modem_online, sent directly: going
-        // through the handler would let an instrumented handler report the
-        // watchdog's own action as a user modem change.
-        bring_online(
-            || crate::at_cmd::send(&self.app.at_port, "AT+CFUN=1", 8),
-            || ubus::uci_get(UCI_OPERATE_MODE_KEY).ok(),
-            || {
-                ubus::call(
-                    "zte_nwinfo_api",
-                    "nwinfo_set_mode",
-                    Some(r#"{"operate_mode":"ONLINE"}"#),
-                )
-                .map(|_| ())
-            },
-            ONLINE_VERIFY_WAIT,
-            ONLINE_VERIFY_POLL,
-        )
+        self.with_cellular_recovery(|| {
+            ubus::call(
+                "zte_nwinfo_api",
+                "nwinfo_set_mode",
+                Some(r#"{"operate_mode":"LPM"}"#),
+            )?;
+            std::thread::sleep(LPM_ONLINE_GAP);
+            // Same command as handlers::modem_online, sent directly: going
+            // through the handler would let an instrumented handler report the
+            // watchdog's own action as a user modem change.
+            bring_online(
+                || crate::at_cmd::send(&self.app.at_port, "AT+CFUN=1", 8),
+                || ubus::uci_get(UCI_OPERATE_MODE_KEY).ok(),
+                || {
+                    ubus::call(
+                        "zte_nwinfo_api",
+                        "nwinfo_set_mode",
+                        Some(r#"{"operate_mode":"ONLINE"}"#),
+                    )
+                    .map(|_| ())
+                },
+                ONLINE_VERIFY_WAIT,
+                ONLINE_VERIFY_POLL,
+            )
+        })
     }
 
     fn modem_reset(&self) -> Result<(), String> {
-        let resp = crate::at_cmd::send(&self.app.at_port, "AT+CFUN=1,1", 8)?;
-        if resp.contains("OK") {
-            Ok(())
-        } else {
-            Err(format!("AT+CFUN=1,1 failed: {}", resp.trim()))
-        }
+        self.with_cellular_recovery(|| {
+            let resp = crate::at_cmd::send(&self.app.at_port, "AT+CFUN=1,1", 8)?;
+            if resp.contains("OK") {
+                Ok(())
+            } else {
+                Err(format!("AT+CFUN=1,1 failed: {}", resp.trim()))
+            }
+        })
     }
 
     fn set_fast_boot(&self, on: bool) -> Result<(), String> {
@@ -698,7 +744,9 @@ impl Effects for DeviceEffects {
     }
 
     fn reboot(&self) -> Result<(), String> {
-        handler_result(crate::device_ext::device_reboot(&self.app), "reboot")
+        self.with_cellular_recovery(|| {
+            handler_result(crate::device_ext::device_reboot(&self.app), "reboot")
+        })
     }
 
     fn read_wan_connected(&self) -> Option<bool> {
@@ -1126,6 +1174,17 @@ impl ConnWatchdog {
 
     fn apply(&self, machine: &mut Machine, executor: &Executor, event: Event, now: Instant) {
         machine.set_user_activity(*self.user_activity.lock().unwrap());
+        if machine.config.enabled && executor.effects.recovery_blocked().is_some() {
+            // Do not count Wi-Fi/portal failures against SIM or carry an old
+            // escalation deadline across a change of upstream.
+            machine.state = State::Idle;
+            machine.deadline = None;
+            machine.failures = 0;
+            machine.first_failure = None;
+            if matches!(event, Event::Probe(_) | Event::Timer) {
+                return;
+            }
+        }
         for action in machine.step(event, now) {
             executor.perform(action);
         }
@@ -1201,6 +1260,10 @@ impl ConnWatchdog {
         let mut status = self.status.lock().unwrap().clone();
         if let Some(obj) = status.as_object_mut() {
             obj.insert("probe_source".into(), json!(self.probe_source()));
+            obj.insert(
+                "safety_block".into(),
+                json!(automatic_recovery_allowed().err()),
+            );
         }
         status
     }
@@ -1246,6 +1309,11 @@ pub fn config_set(watchdog: &ConnWatchdog, body: &[u8]) -> (u16, Value) {
                 eprintln!("[conn_watchdog] {NO_PROBE_WARNING}");
                 body["data"]["warning"] = json!(NO_PROBE_WARNING);
             }
+            if config.enabled {
+                if let Err(reason) = automatic_recovery_allowed() {
+                    body["data"]["warning"] = json!(reason);
+                }
+            }
             (200, body)
         }
         Err(e) => (400, json!({"ok": false, "error": e})),
@@ -1264,6 +1332,63 @@ mod tests {
             enabled: true,
             allow_reboot,
         }
+    }
+
+    #[test]
+    fn external_cellular_intent_unknown_never_runs_automatic_modem_effects() {
+        let effects = DeviceEffects::new(Arc::new(AppState::new()));
+        assert_eq!(
+            effects.recovery_blocked(),
+            Some(EXTERNAL_INTENT_UNAVAILABLE)
+        );
+        for result in [
+            effects.pdn_reconnect(),
+            effects.lpm_online(),
+            effects.modem_reset(),
+            effects.reboot(),
+        ] {
+            assert_eq!(result.err().as_deref(), Some(EXTERNAL_INTENT_UNAVAILABLE));
+        }
+        assert!(effects.network_guard().is_err());
+    }
+
+    #[test]
+    fn pending_relay_probe_failures_never_trigger_a_cellular_recovery() {
+        struct Relay;
+        impl Effects for Relay {
+            fn recovery_blocked(&self) -> Option<&'static str> {
+                Some("Wi-Fi relay owns the upstream")
+            }
+            fn pdn_reconnect(&self) -> Result<(), String> {
+                panic!("relay probe must not bounce SIM")
+            }
+            fn lpm_online(&self) -> Result<(), String> {
+                panic!("relay probe must not reset modem")
+            }
+            fn modem_reset(&self) -> Result<(), String> {
+                panic!("relay probe must not reset modem")
+            }
+            fn set_fast_boot(&self, _: bool) -> Result<(), String> {
+                panic!()
+            }
+            fn reboot(&self) -> Result<(), String> {
+                panic!()
+            }
+        }
+        let path = temp_path("relay-guard");
+        let watchdog = ConnWatchdog::with_paths(temp_path("relay-config"), path.clone());
+        let executor = Executor::new(Box::new(Relay), path);
+        let mut m = Machine::new(config(false));
+        let now = Instant::now();
+        watchdog.apply(&mut m, &executor, Event::Wan(true), now);
+        for i in 0..5 {
+            watchdog.apply(&mut m, &executor, Event::Probe(false), now + i * 10 * MIN);
+        }
+        assert_eq!(m.failures, 0);
+        assert_eq!(m.state(), &State::Idle);
+        assert_eq!(m.wan_connected, Some(true));
+        watchdog.apply(&mut m, &executor, Event::Config(Config::default()), now);
+        assert!(!m.config.enabled);
     }
 
     fn acts(actions: Vec<Action>) -> Vec<Rung> {
@@ -1969,9 +2094,7 @@ mod tests {
         assert_eq!(status, 200);
         assert_eq!(body["data"]["enabled"], true);
         assert_eq!(body["data"]["status"]["probe_source"], "none");
-        assert!(body["data"]["warning"]
-            .as_str()
-            .is_some_and(|w| w.contains("no probe source")));
+        assert_eq!(body["data"]["warning"], EXTERNAL_INTENT_UNAVAILABLE);
         // Disabling never warns.
         let (_, body) = config_set(&watchdog, br#"{"enabled": false}"#);
         assert!(body["data"].get("warning").is_none());
@@ -1980,7 +2103,7 @@ mod tests {
         assert_eq!(watchdog.status()["probe_source"], "live_activity");
         let (status, body) = config_set(&watchdog, br#"{"enabled": true}"#);
         assert_eq!(status, 200);
-        assert!(body["data"].get("warning").is_none());
+        assert_eq!(body["data"]["warning"], EXTERNAL_INTENT_UNAVAILABLE);
         assert_eq!(body["data"]["status"]["probe_source"], "live_activity");
 
         // A probe result alone also counts as an attached source.

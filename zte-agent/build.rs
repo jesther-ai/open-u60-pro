@@ -48,6 +48,10 @@ struct Built {
 }
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
+    let epoch = std::env::var("SOURCE_DATE_EPOCH").ok().and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or_else(|| std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs());
+    println!("cargo:rustc-env=ZTE_AGENT_BUILD_EPOCH={epoch}");
     for name in [
         "ZTE_AGENT_VERSION",
         "ZTE_AGENT_COMMIT",

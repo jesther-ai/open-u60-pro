@@ -135,6 +135,19 @@ pub async fn api_entry(State(ctx): State<Ctx>, req: Request) -> Response {
             let resp=crate::dashboard::response(Arc::clone(&ctx.app),parts.uri.to_string(),token);
             finish_early(headers,body.into_data_stream(),0,resp).await
         }
+        Pre::DashboardPass { owner } => {
+            let app = Arc::clone(&ctx.app);
+            let resp = match ctx.gate.run(Lane::General, move || crate::mihomo::dashboard::grant(&app, owner)).await {
+                Ok(reply) => reply,
+                Err(_) => busy(),
+            };
+            finish_early(headers, body.into_data_stream(), 0, resp).await
+        }
+        Pre::Logout { owner } => {
+            ctx.app.auth.logout_id(owner);
+            let resp = crate::mihomo::dashboard::revoke(&ctx.app, owner);
+            finish_early(headers, body.into_data_stream(), 0, resp).await
+        }
         Pre::Dispatch { body_limit } => {
             let body = match read_capped(headers, body, body_limit, ctx.body_wait).await {
                 Ok(body) => body,

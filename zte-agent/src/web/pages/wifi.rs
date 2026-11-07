@@ -6,9 +6,8 @@
 //!   fields, so no key ever reaches the renderer.
 //! - Connected Devices is live from the `clients` topic, inside a
 //!   `<details open>` that sits outside its fragments. Each device shows
-//!   its name and IPv4 address; the MAC address only masked to its last 2
-//!   octets (owner decision; the app shows it whole), also where a name
-//!   carries it, and no IPv6 address.
+//!   its name, full MAC address (owner decision) and IPv4 address, but no
+//!   IPv6 address. The separate Tools list retains its masked identifiers.
 //! - Share Wi-Fi is a page of its own (the app expands a card): network
 //!   name, the password masked until "Show password" (`?show=1`, the only
 //!   way its text reaches the page) and the join QR code. It is never live;
@@ -248,7 +247,7 @@ fn ipv4_key(ip: &str) -> Option<u32> {
     (n == 4).then_some(key)
 }
 
-/// One device: (name, masked MAC, IPv4).
+/// One device: (display name, display MAC, IPv4).
 pub struct Device {
     pub name: String,
     pub mac: String,
@@ -259,6 +258,10 @@ pub struct Device {
 /// else the host-hint name, else the (masked) MAC; sorted by IPv4 address,
 /// devices without one first (the app's string order puts "" first).
 pub fn device_list(c: &Value) -> Vec<Device> {
+    collect_devices(c, false)
+}
+
+fn collect_devices(c: &Value, reveal_mac: bool) -> Vec<Device> {
     let leases = c["dhcp_leases"].as_array().map(Vec::as_slice).unwrap_or_default();
     let hostname = |mac: &str| {
         leases
@@ -275,10 +278,12 @@ pub fn device_list(c: &Value) -> Vec<Device> {
         .filter(|(_, h)| h.is_object())
         .map(|(mac, h)| {
             let ip = h["ipaddrs"].as_array().and_then(|a| a.first()).and_then(Value::as_str).unwrap_or("").to_owned();
-            let masked = mask_mac(mac);
             let hint = h["name"].as_str().filter(|n| !n.is_empty());
-            let name = hostname(mac).or(hint).map_or_else(|| masked.clone(), |n| mask_name(n, mac));
-            (ipv4_key(&ip), Device { name, mac: masked, ip })
+            let display_mac = if reveal_mac { mac.clone() } else { mask_mac(mac) };
+            let name = hostname(mac).or(hint).map_or_else(|| display_mac.clone(), |n| {
+                if reveal_mac { n.to_owned() } else { mask_name(n, mac) }
+            });
+            (ipv4_key(&ip), Device { name, mac: display_mac, ip })
         })
         .collect();
     out.sort_by(|(a, x), (b, y)| a.cmp(b).then_with(|| x.ip.cmp(&y.ip)).then_with(|| x.name.cmp(&y.name)));
@@ -299,10 +304,10 @@ fn device_count(v: &Views) -> Markup {
     }
 }
 
-/// Name (bold), masked MAC and IPv4; nothing when no device is connected
+/// Name (bold), full MAC and IPv4; nothing when no device is connected
 /// (the app's card shows only its count).
 fn devices(v: &Views) -> Markup {
-    let list = v.value(Topic::Clients).map(device_list).unwrap_or_default();
+    let list = v.value(Topic::Clients).map(|c| collect_devices(c, true)).unwrap_or_default();
     html! {
         div #wf-devices {
             @if !list.is_empty() {
@@ -519,7 +524,7 @@ mod tests {
     }
 
     #[test]
-    fn devices_list_names_ipv4_and_masked_macs() {
+    fn wifi_lists_full_macs_while_other_device_lists_keep_masking() {
         let c = json!({
             "hosts": {
                 "AA:BB:CC:DD:EE:01": {"name": "hint-one", "ipaddrs": ["192.168.0.10"], "ip6addrs": ["2001:db8::1"]},
@@ -529,16 +534,18 @@ mod tests {
             },
             "dhcp_leases": [{"macaddr": "aa:bb:cc:dd:ee:01", "hostname": "alice-laptop"}],
         });
+        let masked = device_list(&c);
+        assert!(masked.iter().all(|d| d.mac.starts_with("••:••:••:••:")));
         let v = views(c);
         let s = devices(&v).into_string();
-        // The DHCP name wins; a nameless device is its masked MAC; no IPv6.
+        // The DHCP name wins; a nameless device is its full MAC; no IPv6.
         let rows: Vec<&str> = s.split("<li>").skip(1).collect();
         assert_eq!(rows.len(), 4, "{s}");
-        assert!(rows[0].starts_with("<b>&lt;script&gt;x&lt;/script&gt;</b><div class=\"row\"><span class=\"mono\">••:••:••:••:EE:03</span></div>"), "{s}");
-        assert!(rows[1].starts_with("<b>••:••:••:••:EE:02</b>") && rows[1].contains(">192.168.0.9<"), "{s}");
-        assert!(rows[2].starts_with("<b>alice-laptop</b><div class=\"row\"><span class=\"mono\">••:••:••:••:EE:01</span><span class=\"mono\">192.168.0.10</span>"), "{s}");
-        assert!(rows[3].contains(">192.168.0.100<") && rows[3].starts_with("<b>••:••:••:••:EE:04</b>"), "{s}");
-        for gone in ["AA:BB:CC", "aa:bb:cc", "2001:db8", "hint-one", "<script"] {
+        assert!(rows[0].starts_with("<b>&lt;script&gt;x&lt;/script&gt;</b><div class=\"row\"><span class=\"mono\">AA:BB:CC:DD:EE:03</span></div>"), "{s}");
+        assert!(rows[1].starts_with("<b>AA:BB:CC:DD:EE:02</b>") && rows[1].contains(">192.168.0.9<"), "{s}");
+        assert!(rows[2].starts_with("<b>alice-laptop</b><div class=\"row\"><span class=\"mono\">AA:BB:CC:DD:EE:01</span><span class=\"mono\">192.168.0.10</span>"), "{s}");
+        assert!(rows[3].contains(">192.168.0.100<") && rows[3].starts_with("<b>AA:BB:CC:DD:EE:04</b>"), "{s}");
+        for gone in ["••:••", "2001:db8", "hint-one", "<script"] {
             assert!(!s.contains(gone), "{gone} in {s}");
         }
         assert_eq!(device_count(&v).into_string(), "<b class=\"big\" id=\"wf-count\">4</b>");

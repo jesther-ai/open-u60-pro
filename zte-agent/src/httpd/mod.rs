@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::Router;
-use tokio::sync::Semaphore;
+use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 
 use crate::handlers::AppState;
 use crate::tailscale::TailscaleManager;
@@ -64,6 +64,27 @@ const MAX_BUF: usize = 64 * 1024;
 /// The client's socket address, as a request extension.
 #[derive(Copy, Clone, Debug)]
 pub struct Peer(pub std::net::SocketAddr);
+
+/// An upgraded socket outlives Hyper's HTTP connection future. Its owner must
+/// retain these listener slots and observe the HTTPS listener's Reset signal.
+#[derive(Clone)]
+pub(crate) struct ConnectionLifetime {
+    held: Arc<(OwnedSemaphorePermit, PeerSlot)>,
+    stop: Option<watch::Receiver<()>>,
+}
+
+impl ConnectionLifetime {
+    pub(crate) async fn until_stopped(self, work: impl std::future::Future<Output = ()>) {
+        let _held = self.held;
+        match self.stop {
+            Some(mut stop) => {
+                let ended = async move { let _ = stop.changed().await; };
+                let _ = futures_util::future::select(std::pin::pin!(work), std::pin::pin!(ended)).await;
+            }
+            None => work.await,
+        }
+    }
+}
 
 /// Shared by every request.
 #[derive(Clone)]
@@ -298,7 +319,8 @@ where
         .timer(hyper_util::rt::TokioTimer::new())
         .header_read_timeout(idle)
         .max_buf_size(MAX_BUF)
-        .serve_connection(io, svc);
+        .serve_connection(io, svc)
+        .with_upgrades();
     let mut conn = std::pin::pin!(conn);
     let stopped = matches!(futures_util::future::select(conn.as_mut(), std::pin::pin!(stop)).await, futures_util::future::Either::Right(_));
     if stopped {
@@ -365,25 +387,24 @@ async fn accept_loop_with(listener: std::net::TcpListener, ctx: Ctx, caps: Caps,
         let _ = tcp.set_nodelay(true);
         set_tcp_user_timeout(&tcp);
         let router = router.clone();
-        let held = (permit, slot);
+        let connection = ConnectionLifetime { held: Arc::new((permit, slot)), stop: None };
         match &wire {
             Wire::Plain => {
                 let svc = hyper::service::service_fn(
                     move |mut req: axum::http::Request<hyper::body::Incoming>| {
                         req.extensions_mut().insert(Peer(addr));
+                        req.extensions_mut().insert(connection.clone());
                         tower::ServiceExt::oneshot(router.clone(), req.map(Body::new))
                     },
                 );
                 tokio::spawn(async move {
-                    let _held = held;
                     serve_http1(hyper_util::rt::TokioIo::new(tcp), svc, limits.idle, std::future::pending()).await;
                 });
             }
             Wire::Tls(w) => {
                 let w = Arc::clone(w);
                 tokio::spawn(async move {
-                    let _held = held;
-                    w.serve(tcp, addr, router, limits.idle).await;
+                    w.serve(tcp, addr, router, limits.idle, connection).await;
                 });
             }
         }
@@ -438,7 +459,28 @@ impl Drop for PeerSlot {
 /// API fallback (no per-route registration, so there is no automatic 405
 /// and no HEAD-to-GET routing for `/api`).
 pub fn app(ctx: Ctx) -> Router {
-    Router::new().merge(crate::console::router()).fallback(api::api_entry).with_state(ctx)
+    let router = Router::new().merge(crate::console::router()).merge(crate::mihomo::dashboard::router()).fallback(api::api_entry).with_state(ctx);
+    #[cfg(test)]
+    let router = router.route("/test-upgrade", axum::routing::get(test_upgrade));
+    router
+}
+
+#[cfg(test)]
+async fn test_upgrade(mut req: axum::extract::Request) -> axum::response::Response {
+    let lifetime = req.extensions().get::<ConnectionLifetime>().unwrap().clone();
+    let upgrade = hyper::upgrade::on(&mut req);
+    tokio::spawn(lifetime.until_stopped(async move {
+        let Ok(io) = upgrade.await else { return };
+        let mut io = hyper_util::rt::TokioIo::new(io);
+        let mut sink = tokio::io::sink();
+        let _ = tokio::io::copy(&mut io, &mut sink).await;
+    }));
+    axum::response::Response::builder()
+        .status(101)
+        .header("connection", "upgrade")
+        .header("upgrade", "u60-test")
+        .body(Body::empty())
+        .unwrap()
 }
 
 /// SO_KEEPALIVE with a 5 min idle / 60 s interval / 3 probes: a dead peer is
@@ -981,6 +1023,24 @@ mod wire_tests {
             let mut c = Conn::open(addr);
             c.raw("GET /api/lan/ping HTTP/1.1\r\nHost: 127.0.0.1", b"").is_ok_and(|r| r.status == 200)
         });
+    }
+
+    #[test]
+    fn upgraded_sockets_keep_total_and_per_peer_slots_until_closed() {
+        for (conns, per_peer) in [(1, 8), (8, 1)] {
+            let addr = start_with(Ctx::new(Arc::new(state(None)), 2), lan_limits(conns, per_peer, 0));
+            let mut upgraded = Conn::open(addr);
+            upgraded.stream.write_all(b"GET /test-upgrade HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: Upgrade\r\nUpgrade: u60-test\r\n\r\n").unwrap();
+            assert_eq!(upgraded.reply(true).unwrap().status, 101);
+            // The accepted HTTP future has finished, but its upgraded socket
+            // still occupies both listener limits.
+            std::thread::sleep(Duration::from_millis(30));
+            assert!(refused(addr));
+            drop(upgraded);
+            eventually("upgrade did not release its listener slots", || {
+                Conn::open(addr).raw("GET /api/lan/ping HTTP/1.1\r\nHost: 127.0.0.1", b"").is_ok_and(|r| r.status == 200)
+            });
+        }
     }
 
     #[test]

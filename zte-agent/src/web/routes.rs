@@ -8,13 +8,16 @@ use axum::http::Method;
 use axum::response::Response;
 
 use super::action::{self, Action};
-use super::pages::{at, automations, confirm, devctl, esim, esim_add, forward as forward_page, https, netcfg, op, services, sim, sms as sms_page};
+use super::pages::{at, automations, confirm, devctl, esim, esim_add, forward as forward_page, https, netcfg, network, op, services, sim, sms as sms_page};
 use super::screen::{self, Screen, Search};
-use super::tabs::{dashboard, router, settings, sms, tools};
+use super::tabs::{dashboard, relay, router, settings, sms, tools};
 use super::{live, prefs, render, session, CspNonce};
 use crate::httpd::{Ctx, Peer};
 
-pub static SCREENS: [&Screen; 75] = [
+pub static SCREENS: [&Screen; 78] = [
+    &router::RESERVATIONS,
+    &router::MIHOMO,
+    &relay::RELAY,
     &dashboard::DASHBOARD,
     &dashboard::SIGNAL,
     &dashboard::TRAFFIC,
@@ -92,7 +95,11 @@ pub static SCREENS: [&Screen; 75] = [
     &settings::INSTALL,
 ];
 
-pub static ACTIONS: [&Action; 25] = [
+pub static ACTIONS: [&Action; 29] = [
+    &router::MIHOMO_SWITCH,
+    &router::MIHOMO_INSTALL,
+    &relay::SCAN,
+    &relay::DISCONNECT,
     &dashboard::POWERBANK,
     &dashboard::USB_DISMISS,
     &router::MOBILE_DATA,
@@ -140,6 +147,8 @@ fn searched(path: &str) -> Option<&'static Screen> {
 
 /// The screen showing the form that posts to `path`, if it is an action.
 pub fn form_page(path: &str) -> Option<&'static str> {
+    if [super::pages::mihomo_profiles::CHANGE, super::pages::mihomo_profiles::FILE, super::pages::mihomo_profiles::EDITOR].contains(&path) { return Some(network::MIHOMO); }
+    if network::custom_post(path) { return Some(if path == network::CONNECT { network::RELAY } else { network::MIHOMO }); }
     action(path)
         .map(|a| a.screen.path)
         .or_else(|| searched(path).map(|s| s.path))
@@ -178,12 +187,18 @@ enum Get {
     NetDone(netcfg::Kind),
     /// Turn On, Renew or Reset HTTPS: the question.
     Https(https::Post),
+    MihomoOpen,
 }
 
 /// `/ui/` and `/ui/{*rest}`.
 pub async fn dispatch(State(ctx): State<Ctx>, req: Request) -> Response {
     let path = req.uri().path();
+    if super::mihomo::is_path(path) { return super::mihomo::dispatch(ctx, req).await; }
     if req.method() == Method::POST {
+        if [super::pages::mihomo_profiles::CHANGE, super::pages::mihomo_profiles::FILE, super::pages::mihomo_profiles::EDITOR].contains(&path) {
+            return super::pages::mihomo_profiles::post(ctx, req).await;
+        }
+        if network::custom_post(path) { return network::post(ctx, req).await; }
         if let Some(a) = action(path) {
             return action::post(ctx, req, a).await;
         }
@@ -261,7 +276,7 @@ pub async fn dispatch(State(ctx): State<Ctx>, req: Request) -> Response {
         let (parts, body) = req.into_parts();
         return session::reply_unread(&parts.headers, body, resp).await;
     }
-    let target = if let Some(s) = screen(path) {
+    let target = if path == network::OPEN { Some(Get::MihomoOpen) } else if let Some(s) = screen(path) {
         Some(Get::Screen(s))
     } else if let Some(page) = sms_page::Page::of(path) {
         Some(Get::Sms(page))
@@ -300,6 +315,7 @@ pub async fn dispatch(State(ctx): State<Ctx>, req: Request) -> Response {
         return clean;
     }
     match target {
+        Get::MihomoOpen => network::open(&ctx),
         Get::Screen(s) => {
             // A Router settings form with `?t=`: as typed (its draft).
             let mut r = screen::Req::of(&ctx, &req);

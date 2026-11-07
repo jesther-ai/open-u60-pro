@@ -940,6 +940,7 @@ async fn every_screen_marks_its_tab() {
         Tab::Sms => "/ui/sms",
         Tab::Tools => "/ui/tools",
         Tab::Router => "/ui/router",
+        Tab::Relay => "/ui/relay",
         Tab::Settings => "/ui/settings",
     };
     for s in super::routes::SCREENS {
@@ -1018,13 +1019,14 @@ async fn tab_roots_follow_the_app() {
     assert!(html.contains("<h1>Messages</h1><div class=\"trail\"><a class=\"nl ic\" href=\"/ui/sms/new\" aria-label=\"New Message\">"));
     let html = get_with(&c, "/ui/sms/forward", peer(27, 5), &cookie).await.text();
     assert!(html.contains("<h2>Settings</h2>") && html.contains("href=\"/ui/sms\">Messages</a>"));
-    // Static screens (and New Message, New Rule) read nothing: they render even with every permit taken.
+    // Static screens (and New Message, New Rule) read nothing. Router now
+    // reads the optional Mihomo status through the gate.
     let mut busy = c.clone();
     busy.gate = Arc::new(Gate::new(0, 0, Duration::from_millis(20)));
-    for uri in ["/ui/tools", "/ui/router", "/ui/settings", "/ui/sms/new", "/ui/tools/sms-forward/rules/new"] {
+    for uri in ["/ui/tools", "/ui/settings", "/ui/sms/new", "/ui/tools/sms-forward/rules/new"] {
         assert_eq!(get_with(&busy, uri, peer(27, 6), &cookie).await.status, 200, "{uri}");
     }
-    for uri in [MN, "/ui/sms", "/ui/sms/forward", "/ui/sms/forward/rules/1"] {
+    for uri in [MN, "/ui/router", "/ui/sms", "/ui/sms/forward", "/ui/sms/forward/rules/1"] {
         assert_eq!(get_with(&busy, uri, peer(27, 6), &cookie).await.status, 503, "{uri}");
     }
 }
@@ -1805,8 +1807,8 @@ async fn every_live_screen_streams_its_fragments_as_in_the_page() {
 
 /// No identifier, key or host data reaches any screen or its first stream
 /// frame, whatever the hub holds and page loads read: device names and
-/// IPv4 addresses only on Wi-Fi & devices (MACs masked there, also inside
-/// a name), the Wi-Fi password only on Share Wi-Fi after "Show password".
+/// IPv4 addresses only on device lists, full MACs only on Wi-Fi & devices,
+/// the Wi-Fi password only on Share Wi-Fi after "Show password".
 #[tokio::test]
 async fn no_identifier_reaches_any_screen_or_stream() {
     let (c, cookie, _) = signed_in(41).await;
@@ -1829,8 +1831,8 @@ async fn no_identifier_reaches_any_screen_or_stream() {
     offer_all(&c, &hostile);
     let _fake = super::pages::fake::set(&c.app, hostile.clone());
     let secrets = [
-        "000000000000042", "001019999911111", "8900100000009998877", "9998877", "10000000042", "aa:bb:cc:dd:ee:4",
-        "AA:BB:CC", "aabbccddee4", "AABBCCDDEE4", "WIFIKEY-", "<script>x", "<b>usb",
+        "000000000000042", "001019999911111", "8900100000009998877", "9998877", "10000000042",
+        "WIFIKEY-", "<script>x", "<b>usb",
     ];
     // Allowed on Wi-Fi & devices and Connected Devices only.
     let devices = ["alice-laptop-42", "192.168.0.42", "shellyplus-"];
@@ -1847,14 +1849,17 @@ async fn no_identifier_reaches_any_screen_or_stream() {
         for x in secrets {
             assert!(!text.contains(x), "{} has {x}", s.path);
         }
+        for x in ["aa:bb:cc:dd:ee:42", "AABBCCDDEE43"] {
+            assert_eq!(text.contains(x), s.path == "/ui/wifi", "{} has {x}", s.path);
+        }
         for x in devices {
             assert_eq!(text.contains(x), lists.contains(&s.path), "{} {x}", s.path);
         }
     }
-    // The data did reach the pages: the devices with masked MACs, the
+    // The data did reach the pages: the devices with full MACs, the
     // Wi-Fi card, and the password after "Show password" only.
     let wifi = get_with(&c, "/ui/wifi", peer(41, 4), &cookie).await.text();
-    for want in ["<b>alice-laptop-42</b>", "••:••:••:••:ee:42", "<b>shellyplus-••••••••••••</b>", "<b>Net-42</b>", ">On<"] {
+    for want in ["<b>alice-laptop-42</b>", "aa:bb:cc:dd:ee:42", "<b>shellyplus-AABBCCDDEE43</b>", "<b>Net-42</b>", ">On<"] {
         assert!(wifi.contains(want), "{want} in {wifi}");
     }
     assert!(get_with(&c, "/ui/wifi/share", peer(41, 4), &cookie).await.text().contains("<b>Net-42</b>"));
@@ -1865,7 +1870,7 @@ async fn no_identifier_reaches_any_screen_or_stream() {
 /// Every live fragment of every screen, rendered from hostile data in
 /// every topic (a page load on the build machine may replace the hub's
 /// value): no identifier or key anywhere; device names and IPv4 addresses
-/// only on Wi-Fi & devices, whose MAC addresses keep their last 2 octets.
+/// only on device lists; full MAC addresses only on Wi-Fi & devices.
 #[test]
 fn fragments_show_identifiers_only_where_allowed() {
     use crate::boottime::{BootClock, Clock};
@@ -1882,10 +1887,12 @@ fn fragments_show_identifiers_only_where_allowed() {
     let v = super::render::Views::new(now, Topic::ALL.iter().map(|t| (*t, slot.clone())).collect());
     for s in super::routes::SCREENS {
         let html: String = s.live.iter().map(|f| (f.render)(&v).into_string()).collect();
-        for x in ["000000000000042", "8900100000009998877", "10000000042", "WIFIKEY", "aa:bb:cc", "AA:BB:CC", "2001:db8", "<script"] {
+        for x in ["000000000000042", "8900100000009998877", "10000000042", "WIFIKEY", "2001:db8", "<script"] {
             assert!(!html.contains(x), "{} has {x}", s.path);
         }
-        let devices = html.contains("alice-laptop-42") && html.contains("192.168.0.42") && html.contains("••:••:••:••:ee:42");
+        assert_eq!(html.contains("aa:bb:cc:dd:ee:42"), s.path == "/ui/wifi", "{}", s.path);
+        let mac = if s.path == "/ui/wifi" { "aa:bb:cc:dd:ee:42" } else { "••:••:••:••:ee:42" };
+        let devices = html.contains("alice-laptop-42") && html.contains("192.168.0.42") && html.contains(mac);
         assert_eq!(devices, ["/ui/wifi", "/ui/tools/devices"].contains(&s.path), "{}", s.path);
     }
 }
@@ -1986,6 +1993,7 @@ mod firewall;
 mod forward;
 mod https;
 mod netcfg;
+mod network;
 mod router;
 mod sim;
 mod sms;

@@ -1,0 +1,14 @@
+{
+  "rootfs": {
+    "url": "https://downloads.openwrt.org/releases/23.05.5/targets/armsr/armv8/openwrt-23.05.5-armsr-armv8-rootfs.tar.gz",
+    "sha256": "bfce31bd8c9806c953b07d968e19779884bc39255d639bfd52859cad0ce43e79"
+  },
+  "base_url": "https://downloads.openwrt.org/releases/23.05.5/packages/aarch64_generic/base/",
+  "packages": {
+    "ip-full_6.3.0-1_aarch64_generic.ipk": "0402fc399e5cac48f22c660e0e5c6dfb87df7347198c516926d988d105d104a1",
+    "libbpf1_1.2.2-1_aarch64_generic.ipk": "f52f941c686669fef33c4647b1a9c62af09917d6323a0bbb0dc19c56a920ee48",
+    "libelf1_0.189-1_aarch64_generic.ipk": "6d31b4065667dcb86ba388e0635b9debe78a82cee6ec50126c023225564ebdf6",
+    "libmnl0_1.0.5-1_aarch64_generic.ipk": "693d1f7b8125a3339f0a2b32ed8e898a5d3b9aad0d5bffc96da55ef2d5332d5a",
+    "zlib_1.2.13-1_aarch64_generic.ipk": "54e98799f7b46e32a65f1f6f973019e1a6ba18390bd5d86a8622e56fcf2a9821"
+  }
+}

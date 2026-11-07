@@ -28,7 +28,7 @@ use crate::server::Method;
 use crate::web::action::{Action, After, Again, Confirm, Field, Kind, Need};
 use crate::web::kit::{Icon, Tab};
 use crate::web::ops::{AIRPLANE_OFF, AIRPLANE_ON, DATA_OFF, DATA_ON};
-use crate::web::pages::{apn, cell, devctl, dns, esim, esim_add, firewall, lan, mobile, services, sim, telemetry, vpnqos, wlan};
+use crate::web::pages::{apn, cell, devctl, dns, esim, esim_add, firewall, lan, mobile, network, services, sim, telemetry, vpnqos, wlan};
 use crate::web::screen::{Bar, Block, Item, Read, Screen, Search};
 
 const fn to(href: &'static str, label: &'static str, icon: Icon) -> Item {
@@ -40,7 +40,9 @@ pub static ROUTER: Screen = Screen {
     id: "router",
     title: "Router",
     tab: Tab::Router,
+    reads: &[Read::Api("/api/mihomo/status")],
     blocks: &[
+        Block::Custom(network::mihomo_card),
         Block::Links(
             "Cellular",
             &[
@@ -80,6 +82,34 @@ pub static ROUTER: Screen = Screen {
 
 const BACK: Bar = Bar::Back("/ui/router", "Router");
 const PUSHED: Screen = Screen { tab: Tab::Router, bar: BACK, ..Screen::BLANK };
+
+pub static MIHOMO: Screen = Screen {
+    path: network::MIHOMO, id: "mihomo", title: "Mihomo / Clash",
+    reads: &[Read::Api("/api/mihomo/status"), Read::Api("/api/mihomo/profiles"), Read::Fn(crate::web::pages::mihomo_profiles::editor_read), Read::Fn(crate::web::pages::mihomo_profiles::extensions_read)], blocks: &[Block::Custom(network::mihomo_page)],
+    ..PUSHED
+};
+
+pub static RESERVATIONS: Screen = Screen {
+    path: crate::web::pages::reservations::PATH, id: "reservations", title: "Fixed client IPs",
+    reads: &[Read::Api("/api/router/reservations")], blocks: &[Block::Custom(crate::web::pages::reservations::page)],
+    ..PUSHED
+};
+
+pub static MIHOMO_SWITCH: Action = Action {
+    path: network::SWITCH, screen: &ROUTER,
+    fields: &[Field { name: "enable", kind: Kind::Choice(&["0", "1"]) }],
+    confirm: &[], confirm_at: None, unchanged: None, reads: &[],
+    call: (Method::Post, "/api/mihomo/switch"), body: |v,_| Some(json!({"enabled":v.get("enable") == "1"})),
+    after: After::Back(|_| String::new()), again: None, once: true,
+};
+
+pub static MIHOMO_INSTALL: Action = Action {
+    path: network::INSTALL, screen: &MIHOMO,
+    fields: &[Field { name: "install", kind: Kind::Choice(&["1"]) }],
+    confirm: crate::web::tabs::relay::INSTALL_CONFIRM, confirm_at: None, unchanged: None, reads: &[],
+    call: (Method::Post, "/api/mihomo/install"), body: |_,_| Some(json!({})),
+    after: After::Flash(|_,_| (Some(true), "Mihomo and Zashboard installed. Save your configuration next; proxy remains off.".into())), again: None, once: true,
+};
 
 /// Read at page load (the app reads once): the data call, the modem's
 /// mode, the selection mode (`signal`) and, coming back from a scan, the

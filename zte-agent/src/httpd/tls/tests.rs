@@ -5,6 +5,7 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::sync::atomic::Ordering;
+use std::sync::Mutex;
 use std::time::Instant;
 
 use rustls::pki_types::{CertificateDer, ServerName};
@@ -37,11 +38,16 @@ fn start(name: &str, conns: usize) -> Server {
 
 /// `start` in `world`, the HTTPS listener's peers checked by `side()`.
 fn start_with<A: Admit + 'static>(world: World, conns: usize, side: impl Fn() -> A + Send + 'static) -> Server {
+    start_with_state(world, conns, side, |_| {})
+}
+
+fn start_with_state<A: Admit + 'static>(world: World, conns: usize, side: impl Fn() -> A + Send + 'static, configure: impl FnOnce(&mut AppState)) -> Server {
     world.wall.store(now(), Ordering::SeqCst);
     let tls = Arc::new(world.tls());
     let mut state = AppState::new();
     state.tls = Arc::clone(&tls);
     state.auth.set_password(PW);
+    configure(&mut state);
     let app = Arc::new(state);
     let ctx = Ctx::new(Arc::clone(&app), 2);
     let caps = Caps::new(Limits { conns, per_peer: conns, idle: IDLE_TIMEOUT, reserved: 0, shared: IpAddr::is_loopback });
@@ -55,6 +61,82 @@ fn start_with<A: Admit + 'static>(world: World, conns: usize, side: impl Fn() ->
         })
     });
     Server { world, tls, plain, app }
+}
+
+/// Native mock of the loopback controller. The requests still traverse the
+/// real listener, session/origin checks, Rust bridge and upgrade machinery.
+struct CoreMock {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    requests: Arc<Mutex<Vec<String>>>,
+    accept: Option<std::thread::JoinHandle<()>>,
+}
+
+impl CoreMock {
+    fn start() -> Self {
+        let listener = std::net::TcpListener::bind(crate::mihomo::CONTROLLER).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (end, seen) = (Arc::clone(&stop), Arc::clone(&requests));
+        let accept = std::thread::spawn(move || {
+            while !end.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut io, _)) => {
+                        let (end, seen) = (Arc::clone(&end), Arc::clone(&seen));
+                        std::thread::spawn(move || {
+                            io.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                            let mut reader = BufReader::new(io.try_clone().unwrap());
+                            let mut head = String::new();
+                            loop {
+                                let mut line = String::new();
+                                if !reader.read_line(&mut line).is_ok_and(|n| n > 0) { return; }
+                                let done = line == "\r\n";
+                                head.push_str(&line);
+                                if done { break; }
+                            }
+                            let length = head.lines().find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().unwrap())
+                            }).unwrap_or(0);
+                            let mut body = vec![0u8; length];
+                            if reader.read_exact(&mut body).is_err() { return; }
+                            seen.lock().unwrap().push(head.clone());
+                            if !head.to_ascii_lowercase().contains("authorization: bearer private-mock-core-key\r\n") {
+                                let _ = io.write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                                return;
+                            }
+                            if head.to_ascii_lowercase().contains("upgrade: websocket\r\n") {
+                                let reply = b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n";
+                                if io.write_all(reply).is_err() { return; }
+                                while !end.load(Ordering::SeqCst) {
+                                    std::thread::sleep(Duration::from_millis(20));
+                                    if io.write_all(b"\x81\x02{}").is_err() { break; }
+                                }
+                            } else {
+                                let body = if head.starts_with("GET /configs ") {
+                                    r#"{"mode":"rule","secret":"private-mock-core-key","external-controller":"127.0.0.1:19090","external-controller-tls":"invalid","external-ui":"private","authentication":["private"]}"#
+                                } else if head.starts_with("GET /version ") {
+                                    r#"{"meta":true,"version":"v1.19.33"}"#
+                                } else { "{}" };
+                                let reply = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                                let _ = io.write_all(reply.as_bytes());
+                            }
+                        });
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => std::thread::sleep(Duration::from_millis(5)),
+                    Err(e) => panic!("core mock accept: {e}"),
+                }
+            }
+        });
+        Self { stop, requests, accept: Some(accept) }
+    }
+}
+
+impl Drop for CoreMock {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        self.accept.take().unwrap().join().unwrap();
+    }
 }
 
 /// Turn HTTPS on and wait for the listener.
@@ -303,6 +385,132 @@ fn connection_caps_are_shared_with_the_plain_listener() {
         assert!(Instant::now() < deadline, "no slot after a connection closed");
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+#[test]
+fn upgraded_tls_socket_keeps_shared_cap_and_ends_immediately_on_reset() {
+    let s = start("https-reset-upgrade", 1);
+    let addr = on(&s);
+    let cfg = client(&s.tls.ca_der().unwrap(), &[&rustls::version::TLS13]);
+    let mut upgraded = connect(addr, Arc::clone(&cfg), "u60.home.arpa").unwrap();
+    upgraded.sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let head = format!("GET /test-upgrade HTTP/1.1\r\nHost: u60.home.arpa:{}\r\nConnection: Upgrade\r\nUpgrade: u60-test", addr.port());
+    assert_eq!(request(&mut upgraded, &head, "").status, 101);
+    std::thread::sleep(Duration::from_millis(30));
+    let mut plain = TcpStream::connect(s.plain).unwrap();
+    plain.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let _ = plain.write_all(b"GET /api/lan/ping HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+    let mut buf = [0u8; 1];
+    match plain.read(&mut buf) {
+        Ok(0) => {}
+        Err(e) => assert!(!matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock), "{e}"),
+        other => panic!("upgraded connection escaped the shared cap: {other:?}"),
+    }
+    // Reset must interrupt the upgraded read, not wait for its 15-second
+    // authentication tick (or the HTTP keep-alive timeout).
+    let before = Instant::now();
+    s.tls.reset().unwrap();
+    match upgraded.read(&mut buf) {
+        Ok(0) => {}
+        Err(e) => assert!(!matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock), "{e}"),
+        other => panic!("upgraded socket survived Reset: {other:?}"),
+    }
+    assert!(before.elapsed() < Duration::from_secs(2));
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let mut c = TcpStream::connect(s.plain).unwrap();
+        c.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+        let sent = c.write_all(b"GET /ui/login HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+        if sent.is_ok() && c.read(&mut buf).is_ok_and(|n| n > 0) { break; }
+        assert!(Instant::now() < deadline, "Reset did not release the upgraded cap");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn actual_mihomo_bridge_checks_auth_origin_redacts_configs_and_upgrades_over_tls() {
+    use crate::auth::{Kind, PeerKey};
+    let core = CoreMock::start();
+    let world = World::new("https-mihomo-bridge");
+    let root = world.dir().join("mihomo-test");
+    let s = start_with_state(world, 8, || |_: SocketAddr, _: &tokio::net::TcpStream| true, |state| {
+        state.mihomo = Arc::new(crate::mihomo::Mihomo::for_bridge(root, Arc::clone(&state.network_lock), "private-mock-core-key".into()));
+    });
+    let addr = on(&s);
+    let cfg = client(&s.tls.ca_der().unwrap(), &[&rustls::version::TLS13]);
+    let host = format!("u60.home.arpa:{}", addr.port());
+    let origin = format!("https://{host}");
+    let bearer = s.app.auth.login(PW, Kind::Bearer, PeerKey::from(addr), &[]).unwrap();
+    let mut c = connect(addr, Arc::clone(&cfg), "u60.home.arpa").unwrap();
+    let grant = request(&mut c, &format!("POST /api/mihomo/dashboard HTTP/1.1\r\nHost: {host}\r\nOrigin: {origin}\r\nAuthorization: Bearer {}", bearer.token.expose()), "");
+    assert_eq!(grant.status, 200);
+    let set = grant.header("set-cookie").expect("pass cookie").to_owned();
+    assert!(set.starts_with("__Host-zte_ui_zashboard=") && set.contains("; Path=/;") && set.ends_with("Secure"), "{set}");
+    let cookie = format!("Cookie: {}", set.split(';').next().unwrap());
+    let before = core.requests.lock().unwrap().len();
+    assert_eq!(request(&mut c, &format!("GET /ui/mihomo/api/version HTTP/1.1\r\nHost: {host}\r\nOrigin: {origin}"), "").status, 401);
+    for extra in ["Origin: https://evil.invalid".to_owned(), String::new(), "Origin: http://u60.home.arpa".to_owned()] {
+        let extra = if extra.is_empty() { extra } else { format!("\r\n{extra}") };
+        assert_eq!(request(&mut c, &format!("GET /ui/mihomo/api/version HTTP/1.1\r\nHost: {host}\r\n{cookie}{extra}"), "").status, 403);
+    }
+    assert_eq!(core.requests.lock().unwrap().len(), before, "refused requests must not reach the controller");
+    let head = format!("Host: {host}\r\n{cookie}\r\nOrigin: {origin}");
+    let config = request(&mut c, &format!("GET /ui/mihomo/api/configs HTTP/1.1\r\n{head}"), "");
+    assert_eq!(config.status, 200);
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&config.body).unwrap(), serde_json::json!({"mode":"rule"}));
+    assert!(!config.body.contains("private"));
+    assert_eq!(config.header("cache-control"), Some("no-store"));
+    assert_eq!(request(&mut c, &format!("GET /ui/mihomo/api/version HTTP/1.1\r\nHost: {host}\r\n{cookie}\r\nReferer: {origin}/ui/mihomo/dashboard/"), "").status, 200);
+    assert_eq!(request(&mut c, &format!("PATCH /ui/mihomo/api/configs HTTP/1.1\r\n{head}\r\nContent-Type: application/json"), r#"{"mode":"global"}"#).status, 200);
+    let before = core.requests.lock().unwrap().len();
+    for (method, path, body) in [
+        ("PATCH", "configs", r#"{"external-controller":"0.0.0.0:9090"}"#),
+        ("PUT", "configs", "{}"),
+        ("POST", "upgrade", "{}"),
+    ] {
+        assert_eq!(request(&mut c, &format!("{method} /ui/mihomo/api/{path} HTTP/1.1\r\n{head}\r\nContent-Type: application/json"), body).status, 403);
+    }
+    assert_eq!(core.requests.lock().unwrap().len(), before);
+    let mut ws = connect(addr, Arc::clone(&cfg), "u60.home.arpa").unwrap();
+    let upgrade = format!("GET /ui/mihomo/api/traffic?token=old-browser-token&%74oken=also-old HTTP/1.1\r\n{head}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==");
+    let r = request(&mut ws, &upgrade, "");
+    assert_eq!((r.status, r.header("sec-websocket-accept")), (101, Some("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")));
+    assert!(core.requests.lock().unwrap().iter().any(|h| h.starts_with("GET /traffic HTTP/1.1")));
+    assert!(core.requests.lock().unwrap().iter().all(|h| !h.contains("old-browser-token") && !h.contains("also-old")));
+    // Replacing a pass ends the old stream without waiting for the 15s heartbeat.
+    let grant = request(&mut c, &format!("POST /api/mihomo/dashboard HTTP/1.1\r\nHost: {host}\r\nOrigin: {origin}\r\nAuthorization: Bearer {}", bearer.token.expose()), "");
+    assert_eq!(grant.status, 200);
+    ws.sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let before = Instant::now();
+    let mut buf = [0u8; 256];
+    loop {
+        match ws.read(&mut buf) {
+            Ok(0) => break,
+            Ok(_) => assert!(before.elapsed() < Duration::from_secs(2), "revoked pass still streaming"),
+            Err(e) => { assert!(!matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock), "{e}"); break; }
+        }
+    }
+    let cookie = format!("Cookie: {}", grant.header("set-cookie").unwrap().split(';').next().unwrap());
+    let mut ws = connect(addr, Arc::clone(&cfg), "u60.home.arpa").unwrap();
+    let upgrade = format!("GET /ui/mihomo/api/traffic HTTP/1.1\r\nHost: {host}\r\nOrigin: {origin}\r\n{cookie}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==");
+    assert_eq!(request(&mut ws, &upgrade, "").status, 101);
+    // Real bridged frames stop immediately when HTTPS is reset.
+    ws.sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    s.tls.reset().unwrap();
+    let before = Instant::now();
+    let mut buf = [0u8; 256];
+    loop {
+        match ws.read(&mut buf) {
+            Ok(0) => break,
+            Ok(_) => assert!(before.elapsed() < Duration::from_secs(2)),
+            Err(e) => {
+                assert!(!matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock), "{e}");
+                break;
+            }
+        }
+    }
+    assert!(before.elapsed() < Duration::from_secs(2));
+    drop(bearer);
 }
 
 /// The translations on their own.

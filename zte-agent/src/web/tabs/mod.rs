@@ -3,6 +3,7 @@
 
 pub mod dashboard;
 pub mod router;
+pub mod relay;
 pub mod settings;
 pub mod sms;
 pub mod tools;

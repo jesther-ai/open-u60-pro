@@ -58,7 +58,7 @@ impl StkService {
     /// What `GET /api/stk/session` answers, from memory: the worker's last
     /// published state (no worker yet: no session). Never starts the worker
     /// or waits for it (the live hub's `stk` topic reads this).
-    #[allow(dead_code)] // the stk_probe example has no hub
+    #[allow(dead_code)]
     pub fn session_view(&self) -> Reply {
         self.shown.lock().unwrap_or_else(PoisonError::into_inner).clone().unwrap_or_else(|| error(503, ""))
     }
@@ -66,7 +66,7 @@ impl StkService {
     /// Tell `f` (the live hub's `stk` topic) whenever the session's state changes: a SIM
     /// command, a reply, the session ending. A status read changes nothing, so it never calls.
     /// Set once, before the first request.
-    #[allow(dead_code)] // the stk_probe example has no hub
+    #[allow(dead_code)]
     pub fn on_change(&self, f: OnChange) {
         let _ = self.on_change.set(f);
     }
